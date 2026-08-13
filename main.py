@@ -27,11 +27,14 @@ SOURCE_CHANNELS = [
 ]
 
 # --- Target Group (Add To) ---
-TARGET_GROUP = "agriquizworld"  # 🔥 अपना @username डालें (बिना @ के)
+TARGET_GROUP = "agriquizworld"  # बिना @ के
 
 # --- Telegram API Credentials ---
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
+
+# --- 🔥 NEW: Phone Number from Environment Variable ---
+PHONE_NUMBER = os.getenv('PHONE_NUMBER')  # e.g., +918009180726
 
 # --- MongoDB Connection ---
 MONGO_URI = os.getenv('MONGO_URI')
@@ -39,24 +42,21 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client['telegram_scraper_safe']
 
 # Collections
-all_members = db['all_members']          # All scraped members
-global_added = db['global_added']        # Globally added members
-channel_status = db['channel_status']    # Channel progress
-daily_stats = db['daily_stats']          # Daily add count
+all_members = db['all_members']
+global_added = db['global_added']
+channel_status = db['channel_status']
+daily_stats = db['daily_stats']
 
 # --- Helper Functions ---
 def is_already_added(user_id):
-    """Check if user has been added to ANY target group globally"""
     return global_added.find_one({"user_id": user_id}) is not None
 
 def get_today_adds():
-    """Check how many adds done today"""
     today = datetime.datetime.now().date().isoformat()
     stats = daily_stats.find_one({"date": today})
     return stats.get("count", 0) if stats else 0
 
 def update_today_adds():
-    """Increment today's add count"""
     today = datetime.datetime.now().date().isoformat()
     daily_stats.update_one(
         {"date": today},
@@ -107,7 +107,6 @@ async def scrape_and_add_safely(client):
                     if all_members.find_one({"user_id": user.id, "channel": source_channel}):
                         continue
                     
-                    # Save to all_members
                     all_members.insert_one({
                         "user_id": user.id,
                         "username": user.username or "",
@@ -115,7 +114,6 @@ async def scrape_and_add_safely(client):
                         "scraped_at": datetime.datetime.now()
                     })
                     
-                    # Try to add to target group
                     added = False
                     for retry in range(MAX_RETRIES):
                         try:
@@ -161,7 +159,6 @@ async def scrape_and_add_safely(client):
                     if not added:
                         print(f"❌ Failed after retries: {user.id}")
                     
-                    # 5-10 seconds gap
                     gap = random.randint(MEMBER_GAP_MIN, MEMBER_GAP_MAX)
                     await asyncio.sleep(gap)
                 
@@ -172,7 +169,6 @@ async def scrape_and_add_safely(client):
                     upsert=True
                 )
                 
-                # 30 seconds batch gap
                 print(f"⏳ Batch complete. {BATCH_GAP}s break...")
                 await asyncio.sleep(BATCH_GAP)
                 
@@ -203,8 +199,14 @@ app = FastAPI()
 @app.post("/start-scraping")
 async def start_scraping(background_tasks: BackgroundTasks):
     async def run():
+        # 🔥 FIX: Non-Interactive Login with Phone Number from .env
+        if not PHONE_NUMBER:
+            print("❌ PHONE_NUMBER not set in environment variables!")
+            return
+        
         async with TelegramClient('session_safe', API_ID, API_HASH) as client:
-            await client.start()
+            # यह Render पर बिना OTP मांगे लॉगिन करेगा
+            await client.start(phone=lambda: PHONE_NUMBER)
             result = await scrape_and_add_safely(client)
             print(f"✅ {result}")
     
