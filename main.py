@@ -8,7 +8,7 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import InviteToChannelRequest  # 🔥 THE FIX: Correct Telethon Import
+from telethon.tl.functions.channels import InviteToChannelRequest
 
 # --- Setup Professional Logging ---
 logging.basicConfig(
@@ -21,20 +21,32 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # --- Configuration (Ultra Safe & Professional Mode) ---
-DAILY_LIMIT = 40               # 🔒 Maximum adds per day to prevent bans
-BATCH_SIZE = 20                # Process 20 members per batch
-MEMBER_GAP_MIN = 30            # Min seconds gap between user adds
-MEMBER_GAP_MAX = 60            # Max seconds gap between user adds
-BATCH_GAP = 120                # Rest time after every batch completion
-MAX_RETRIES = 2                # Max retry attempts for network issues
+DAILY_LIMIT = 40               # 🔒 Maximum direct adds per day
+MAX_DMS_PER_DAY = 15           # 🔒 Maximum Invite DMs per day (High Risk if increased)
+HISTORY_LIMIT = 500            # How many past messages to read per batch
+MEMBER_GAP_MIN = 30            
+MEMBER_GAP_MAX = 60            
+BATCH_GAP = 120                
+MAX_RETRIES = 2                
 
+# 🔥 NEW: Updated Source Groups
 SOURCE_CHANNELS = [
-    "hitechagro",
-    "AGRI_IBPS_AFO",
-    "agricoaching",
-    "agriculture_competitive_exams"
+    "Dream_Agri",
+    "AGLAERT",
+    "afo2023interview",
+    "Gen_Agriculture",
+    "IBPSSO25"
 ]
 TARGET_GROUP = "agriquizworld"
+
+# ✉️ The Invite Message for Privacy-Restricted Users
+INVITE_MESSAGE = (
+    "Hello! 🌾\n\n"
+    "I noticed you are highly active and preparing for agriculture competitive exams. "
+    "We are building an active community for agriculture students to share "
+    "premium study materials and conduct daily live evaluation tests.\n\n"
+    "We would love to have you practice with us! Join here: @agriquizworld 📚🚜"
+)
 
 # --- Telegram API Credentials ---
 API_ID = int(os.getenv('API_ID', 0))
@@ -44,10 +56,8 @@ SESSION_STRING = os.getenv('SESSION_STRING', '')
 # --- Database Initialization ---
 MONGO_URI = os.getenv('MONGO_URI')
 if not MONGO_URI:
-    logger.error("MONGO_URI is missing in environment variables!")
     raise ValueError("❌ MONGO_URI not found!")
 
-# Use Motor for Async MongoDB operations
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client['telegram_scraper_safe']
 
@@ -56,102 +66,99 @@ global_added = db['global_added']
 channel_status = db['channel_status']
 daily_stats = db['daily_stats']
 
-# --- Global Concurrency Lock ---
 scraping_lock = asyncio.Lock()
 is_scraping_running = False
 
 # --- Core Async Helpers ---
-async def is_already_added(user_id: int) -> bool:
-    """Check if the user was already added previously."""
+async def is_already_processed(user_id: int) -> bool:
+    """Checks if user is already added or messaged."""
     return await global_added.find_one({"user_id": user_id}) is not None
 
-async def get_today_adds() -> int:
-    """Fetch total successful adds for the current day."""
+async def get_daily_stats(stat_type: str) -> int:
     today = datetime.now(timezone.utc).date().isoformat()
     stats = await daily_stats.find_one({"date": today})
-    return stats.get("count", 0) if stats else 0
+    return stats.get(stat_type, 0) if stats else 0
 
-async def update_today_adds():
-    """Increment the daily adds counter safely."""
+async def increment_daily_stat(stat_type: str):
     today = datetime.now(timezone.utc).date().isoformat()
     await daily_stats.update_one(
         {"date": today},
-        {"$inc": {"count": 1}, "$set": {"last_updated": datetime.now(timezone.utc)}},
+        {"$inc": {stat_type: 1}, "$set": {"last_updated": datetime.now(timezone.utc)}},
         upsert=True
     )
 
-# --- The Advanced Scraper Engine ---
+# --- The Advanced Chat History Scraper Engine ---
 async def scrape_and_add_safely(client: TelegramClient):
     global is_scraping_running
     
     try:
-        today_adds = await get_today_adds()
-        if today_adds >= DAILY_LIMIT:
-            logger.warning(f"Daily limit ({DAILY_LIMIT}) reached. Hibernating.")
+        today_adds = await get_daily_stats("adds")
+        today_dms = await get_daily_stats("dms")
+        
+        if today_adds >= DAILY_LIMIT and today_dms >= MAX_DMS_PER_DAY:
+            logger.warning(f"All daily limits reached (Adds: {today_adds}, DMs: {today_dms}). Hibernating.")
             return
         
         for source_channel in SOURCE_CHANNELS:
-            today_adds = await get_today_adds()
-            if today_adds >= DAILY_LIMIT:
-                logger.info("Daily limit reached. Stopping cross-channel scraping.")
-                break
-            
-            # Resume from last offset
             status = await channel_status.find_one({"username": source_channel})
-            offset = status.get("last_offset", 0) if status else 0
+            # offset_id keeps track of the last message read (so we don't read the same history twice)
+            offset_id = status.get("last_offset_id", 0) if status else 0 
             
-            logger.info(f"🔄 Initializing target: {source_channel} | Starting offset: {offset}")
+            logger.info(f"🔄 Reading chat history for target: {source_channel}")
+            
+            extracted_users = {} # Dictionary to ensure unique users in this batch
             
             try:
-                # Fetch all members efficiently, then slice them locally
-                all_participants = await client.get_participants(source_channel)
-                total_members = len(all_participants)
+                # 🔥 SMART LOGIC: Extract users directly from chat history/messages
+                async for message in client.iter_messages(source_channel, limit=HISTORY_LIMIT, offset_id=offset_id):
+                    # Check if the message has a valid human sender (not a channel sending anonymously)
+                    if message.sender_id and message.sender:
+                        user = message.sender
+                        # Ignore Bots and Groups/Channels
+                        if getattr(user, 'bot', False) or not getattr(user, 'username', None) and not getattr(user, 'first_name', None):
+                            continue
+                        
+                        # Store unique users based on sender ID
+                        if user.id not in extracted_users:
+                            extracted_users[user.id] = user
+                            
+                    # Save the lowest message ID to continue from here next time
+                    offset_id = message.id 
                 
-                if offset >= total_members:
-                    logger.info(f"✅ {source_channel} is fully scraped. Moving to next.")
-                    await channel_status.update_one(
-                        {"username": source_channel},
-                        {"$set": {"status": "completed", "total": total_members}}
-                    )
+                users_to_process = list(extracted_users.values())
+                logger.info(f"📦 Successfully extracted {len(users_to_process)} active users from {source_channel}'s history.")
+                
+                if not users_to_process:
+                    logger.info(f"✅ No new active users found in recent history of {source_channel}.")
                     continue
 
-                # Process the group in calculated batches
-                while today_adds < DAILY_LIMIT and offset < total_members:
-                    chunk = all_participants[offset : offset + BATCH_SIZE]
-                    if not chunk:
+                for user in users_to_process:
+                    # Daily Limit Check
+                    if (await get_daily_stats("adds") >= DAILY_LIMIT) and (await get_daily_stats("dms") >= MAX_DMS_PER_DAY):
+                        logger.info("✅ Daily limits reached mid-process.")
                         break
+
+                    # Skip if already in our database
+                    if await is_already_processed(user.id):
+                        continue
                     
-                    logger.info(f"📦 Processing batch of {len(chunk)} users from offset {offset}...")
+                    await all_members.insert_one({
+                        "user_id": user.id,
+                        "username": user.username or "",
+                        "first_name": user.first_name or "",
+                        "channel": source_channel,
+                        "scraped_at": datetime.now(timezone.utc)
+                    })
                     
-                    for user in chunk:
-                        today_adds = await get_today_adds()
-                        if today_adds >= DAILY_LIMIT:
-                            logger.info("✅ Daily limit reached mid-batch.")
-                            break
-                        
-                        # Data validation & Anti-duplicate checks
-                        if await is_already_added(user.id):
-                            continue
-                        if await all_members.find_one({"user_id": user.id, "channel": source_channel}):
-                            continue
-                        
-                        # Log to master database
-                        await all_members.insert_one({
-                            "user_id": user.id,
-                            "username": user.username or "",
-                            "channel": source_channel,
-                            "scraped_at": datetime.now(timezone.utc)
-                        })
-                        
-                        # Addition Logic with Retries
-                        added = False
+                    handled = False
+                    current_adds = await get_daily_stats("adds")
+                    
+                    # 1️⃣ First Try: Add Directly to Group
+                    if current_adds < DAILY_LIMIT:
                         for attempt in range(1, MAX_RETRIES + 1):
                             try:
-                                # 🔥 THE FIX: Using correct Telethon method to add users
                                 await client(InviteToChannelRequest(TARGET_GROUP, [user.id]))
-                                
-                                await update_today_adds()
-                                today_adds += 1
+                                await increment_daily_stat("adds")
                                 
                                 await global_added.insert_one({
                                     "user_id": user.id,
@@ -159,65 +166,86 @@ async def scrape_and_add_safely(client: TelegramClient):
                                     "added_at": datetime.now(timezone.utc),
                                     "target_group": TARGET_GROUP,
                                     "source_channel": source_channel,
-                                    "status": "success"
+                                    "status": "added"
                                 })
                                 
-                                logger.info(f"✅ [{today_adds}/{DAILY_LIMIT}] Successfully injected user: {user.username or user.id}")
-                                added = True
+                                logger.info(f"✅ [ADD: {current_adds+1}/{DAILY_LIMIT}] Injected Active User: {user.first_name or user.username}")
+                                handled = True
                                 break
                                 
                             except errors.FloodWaitError as e:
                                 wait_time = e.seconds + random.randint(15, 30)
-                                logger.warning(f"⚠️ FloodWait triggered. Cooling down for {wait_time}s...")
+                                logger.warning(f"⚠️ FloodWait. Cooling down {wait_time}s...")
                                 await asyncio.sleep(wait_time)
                                 
-                            except (errors.UserPrivacyRestrictedError, 
-                                    errors.UserNotMutualContactError,
-                                    errors.UserChannelsTooMuchError) as e:
-                                logger.debug(f"⏭️ Skipped {user.id} - Privacy/Limitation ({type(e).__name__})")
-                                await global_added.insert_one({
-                                    "user_id": user.id,
-                                    "status": "privacy_restricted_or_banned"
-                                })
-                                added = True # Mark handled
-                                break
+                            except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError, errors.UserChannelsTooMuchError) as e:
+                                logger.debug(f"🔒 Privacy restriction for {user.first_name}. Switching to DM invite...")
+                                break # Exit add loop, move to DM
                                 
                             except Exception as e:
-                                logger.error(f"❌ Attempt {attempt} failed for {user.id}: {str(e)}")
+                                logger.error(f"❌ Add Error for {user.id}: {str(e)}")
                                 await asyncio.sleep(random.randint(5, 10))
-                        
-                        if not added:
-                            logger.error(f"❌ Dropped {user.id} after {MAX_RETRIES} failed attempts.")
-                        
-                        # Stealth Engine: Variable human-like delays
+                    
+                    # 2️⃣ Second Try: Send DM if Adding Failed (Privacy Enabled)
+                    if not handled:
+                        current_dms = await get_daily_stats("dms")
+                        if current_dms < MAX_DMS_PER_DAY:
+                            try:
+                                await client.send_message(user.id, INVITE_MESSAGE)
+                                await increment_daily_stat("dms")
+                                
+                                await global_added.insert_one({
+                                    "user_id": user.id,
+                                    "username": user.username or "",
+                                    "added_at": datetime.now(timezone.utc),
+                                    "target_group": TARGET_GROUP,
+                                    "source_channel": source_channel,
+                                    "status": "dm_sent"
+                                })
+                                
+                                logger.info(f"✉️ [DM: {current_dms+1}/{MAX_DMS_PER_DAY}] Sent invite to {user.first_name or user.username}")
+                                handled = True
+                                
+                                # Long delay after DM to avoid Spam filter
+                                await asyncio.sleep(random.randint(45, 90)) 
+                                
+                            except Exception as e:
+                                logger.error(f"❌ DM Error for {user.id}: {str(e)}")
+                                await global_added.insert_one({
+                                    "user_id": user.id,
+                                    "status": "failed_all"
+                                })
+                                handled = True
+                        else:
+                            logger.info(f"⏭️ Skipped {user.first_name} - Privacy restricted and daily DM limit reached.")
+
+                    if handled:
                         stealth_gap = random.randint(MEMBER_GAP_MIN, MEMBER_GAP_MAX)
                         await asyncio.sleep(stealth_gap)
+                
+                # Update progress marker so we read older messages next time
+                await channel_status.update_one(
+                    {"username": source_channel},
+                    {"$set": {"last_offset_id": offset_id, "status": "in_progress"}},
+                    upsert=True
+                )
+                
+                logger.info(f"⏳ Batch finalized. Cooldown phase for {BATCH_GAP}s...")
+                await asyncio.sleep(BATCH_GAP)
                     
-                    # Update progress marker
-                    offset += len(chunk)
-                    await channel_status.update_one(
-                        {"username": source_channel},
-                        {"$set": {"last_offset": offset, "total": total_members, "status": "in_progress"}},
-                        upsert=True
-                    )
-                    
-                    if today_adds < DAILY_LIMIT:
-                        logger.info(f"⏳ Batch finalized. Entering cooldown phase for {BATCH_GAP}s...")
-                        await asyncio.sleep(BATCH_GAP)
-                        
             except errors.FloodWaitError as e:
                 critical_wait = e.seconds + random.randint(30, 60)
-                logger.critical(f"🛑 CRITICAL FLOOD WAIT! Halting operations for {critical_wait}s...")
+                logger.critical(f"🛑 CRITICAL FLOOD WAIT! Halting for {critical_wait}s...")
                 await asyncio.sleep(critical_wait)
             except Exception as e:
-                logger.error(f"💥 Fatal error while processing {source_channel}: {str(e)}")
+                logger.error(f"💥 Fatal error while processing history of {source_channel}: {str(e)}")
                 await asyncio.sleep(30)
                 
     finally:
         is_scraping_running = False
-        logger.info("🏁 Scraper engine execution completed and unlocked.")
+        logger.info("🏁 Chat History Scraper engine completed and unlocked.")
         
-    return {"status": "completed", "today_adds": await get_today_adds()}
+    return {"status": "completed", "today_adds": await get_daily_stats("adds"), "today_dms": await get_daily_stats("dms")}
 
 
 # --- Background Task Orchestrator ---
@@ -233,13 +261,13 @@ async def run_scraper():
     except Exception as e:
         global is_scraping_running
         is_scraping_running = False
-        logger.error(f"🔥 Session Authentication/Connection Failure: {str(e)}")
+        logger.error(f"🔥 Session Connection Failure: {str(e)}")
 
 
 # --- RESTful API Endpoints ---
-app = FastAPI(title="Nexus Scraper Pro", version="2.0.0")
+app = FastAPI(title="Nexus History Scraper Pro", version="4.0.0")
 
-@app.post("/start-scraping", summary="Initialize the automated scraping sequence")
+@app.post("/start-scraping")
 async def start_scraping(background_tasks: BackgroundTasks):
     global is_scraping_running
     
@@ -249,45 +277,26 @@ async def start_scraping(background_tasks: BackgroundTasks):
         is_scraping_running = True
         
     background_tasks.add_task(run_scraper)
-    logger.info("🚀 API Request: Scraping sequence initiated.")
+    logger.info("🚀 API Request: History Scraping sequence initiated.")
     
     return {
         "status": "active",
-        "message": "Ultra-safe scraping protocol deployed in the background.",
+        "message": "Chat history scraping protocol deployed.",
         "config": {
-            "daily_limit": DAILY_LIMIT,
-            "stealth_gap": f"{MEMBER_GAP_MIN}s - {MEMBER_GAP_MAX}s",
-            "batch_rest": f"{BATCH_GAP}s"
+            "daily_adds_limit": DAILY_LIMIT,
+            "daily_dms_limit": MAX_DMS_PER_DAY
         }
     }
 
-@app.get("/status", summary="Retrieve live telemetry and metrics")
+@app.get("/status")
 async def get_status():
-    channels_info = []
-    for ch in SOURCE_CHANNELS:
-        ch_data = await channel_status.find_one({"username": ch})
-        if ch_data:
-            channels_info.append({
-                "username": ch, 
-                "status": ch_data.get("status", "pending"),
-                "processed": ch_data.get("last_offset", 0),
-                "total_members": ch_data.get("total", 0)
-            })
-        else:
-            channels_info.append({"username": ch, "status": "pending", "processed": 0, "total_members": 0})
-
     return {
         "system_status": "ONLINE",
         "engine_running": is_scraping_running,
         "metrics": {
-            "adds_today": await get_today_adds(),
-            "daily_quota": DAILY_LIMIT,
-            "lifetime_scraped": await all_members.count_documents({}),
-            "lifetime_added": await global_added.count_documents({})
-        },
-        "channel_telemetry": channels_info
+            "adds_today": await get_daily_stats("adds"),
+            "dms_today": await get_daily_stats("dms"),
+            "daily_add_quota": DAILY_LIMIT,
+            "daily_dm_quota": MAX_DMS_PER_DAY
+        }
     }
-
-@app.get("/", include_in_schema=False)
-async def health_check():
-    return {"nexus_engine": "operational", "version": "2.0.0", "mode": "stealth"}
