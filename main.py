@@ -27,7 +27,7 @@ SOURCE_CHANNELS = [
 ]
 
 # --- Target Group (Add To) ---
-TARGET_GROUP = "your_target_group_username"  # 🔥 अपना @username डालें (बिना @ के)
+TARGET_GROUP = "agriquizworld"  # 🔥 अपना @username डालें (बिना @ के)
 
 # --- Telegram API Credentials ---
 API_ID = int(os.getenv('API_ID'))
