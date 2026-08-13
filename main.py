@@ -9,6 +9,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import InviteToChannelRequest
+from telethon.tl.types import User  # 🔥 NEW: To verify real users
 
 # --- Setup Professional Logging ---
 logging.basicConfig(
@@ -21,15 +22,14 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # --- Configuration (Ultra Safe & Professional Mode) ---
-DAILY_LIMIT = 40               # 🔒 Maximum direct adds per day
-MAX_DMS_PER_DAY = 15           # 🔒 Maximum Invite DMs per day (High Risk if increased)
-HISTORY_LIMIT = 500            # How many past messages to read per batch
+DAILY_LIMIT = 40               
+MAX_DMS_PER_DAY = 15           
+HISTORY_LIMIT = 500            
 MEMBER_GAP_MIN = 30            
 MEMBER_GAP_MAX = 60            
 BATCH_GAP = 120                
 MAX_RETRIES = 2                
 
-# 🔥 NEW: Updated Source Groups
 SOURCE_CHANNELS = [
     "Dream_Agri",
     "AGLAERT",
@@ -71,7 +71,6 @@ is_scraping_running = False
 
 # --- Core Async Helpers ---
 async def is_already_processed(user_id: int) -> bool:
-    """Checks if user is already added or messaged."""
     return await global_added.find_one({"user_id": user_id}) is not None
 
 async def get_daily_stats(stat_type: str) -> int:
@@ -101,51 +100,43 @@ async def scrape_and_add_safely(client: TelegramClient):
         
         for source_channel in SOURCE_CHANNELS:
             status = await channel_status.find_one({"username": source_channel})
-            # offset_id keeps track of the last message read (so we don't read the same history twice)
             offset_id = status.get("last_offset_id", 0) if status else 0 
             
             logger.info(f"🔄 Reading chat history for target: {source_channel}")
-            
-            extracted_users = {} # Dictionary to ensure unique users in this batch
+            extracted_users = {} 
             
             try:
-                # 🔥 SMART LOGIC: Extract users directly from chat history/messages
                 async for message in client.iter_messages(source_channel, limit=HISTORY_LIMIT, offset_id=offset_id):
-                    # Check if the message has a valid human sender (not a channel sending anonymously)
                     if message.sender_id and message.sender:
                         user = message.sender
-                        # Ignore Bots and Groups/Channels
-                        if getattr(user, 'bot', False) or not getattr(user, 'username', None) and not getattr(user, 'first_name', None):
+                        
+                        # 🔥 FIX 1: Ignore Bots and ensure sender is a real 'User' (Not a Channel)
+                        if not isinstance(user, User) or getattr(user, 'bot', False):
                             continue
                         
                         # Store unique users based on sender ID
                         if user.id not in extracted_users:
                             extracted_users[user.id] = user
                             
-                    # Save the lowest message ID to continue from here next time
                     offset_id = message.id 
                 
                 users_to_process = list(extracted_users.values())
                 logger.info(f"📦 Successfully extracted {len(users_to_process)} active users from {source_channel}'s history.")
                 
                 if not users_to_process:
-                    logger.info(f"✅ No new active users found in recent history of {source_channel}.")
                     continue
 
                 for user in users_to_process:
-                    # Daily Limit Check
                     if (await get_daily_stats("adds") >= DAILY_LIMIT) and (await get_daily_stats("dms") >= MAX_DMS_PER_DAY):
-                        logger.info("✅ Daily limits reached mid-process.")
                         break
 
-                    # Skip if already in our database
                     if await is_already_processed(user.id):
                         continue
                     
                     await all_members.insert_one({
                         "user_id": user.id,
-                        "username": user.username or "",
-                        "first_name": user.first_name or "",
+                        "username": getattr(user, 'username', ""),
+                        "first_name": getattr(user, 'first_name', ""),
                         "channel": source_channel,
                         "scraped_at": datetime.now(timezone.utc)
                     })
@@ -162,31 +153,31 @@ async def scrape_and_add_safely(client: TelegramClient):
                                 
                                 await global_added.insert_one({
                                     "user_id": user.id,
-                                    "username": user.username or "",
+                                    "username": getattr(user, 'username', ""),
                                     "added_at": datetime.now(timezone.utc),
                                     "target_group": TARGET_GROUP,
                                     "source_channel": source_channel,
                                     "status": "added"
                                 })
                                 
-                                logger.info(f"✅ [ADD: {current_adds+1}/{DAILY_LIMIT}] Injected Active User: {user.first_name or user.username}")
+                                logger.info(f"✅ [ADD: {current_adds+1}/{DAILY_LIMIT}] Injected Active User: {getattr(user, 'first_name', user.id)}")
                                 handled = True
                                 break
                                 
                             except errors.FloodWaitError as e:
                                 wait_time = e.seconds + random.randint(15, 30)
-                                logger.warning(f"⚠️ FloodWait. Cooling down {wait_time}s...")
+                                logger.warning(f"⚠️ FloodWait (ADD). Cooling down {wait_time}s...")
                                 await asyncio.sleep(wait_time)
                                 
-                            except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError, errors.UserChannelsTooMuchError) as e:
-                                logger.debug(f"🔒 Privacy restriction for {user.first_name}. Switching to DM invite...")
-                                break # Exit add loop, move to DM
+                            except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError, errors.UserChannelsTooMuchError):
+                                logger.debug(f"🔒 Privacy restriction for {getattr(user, 'first_name', user.id)}. Switching to DM...")
+                                break 
                                 
                             except Exception as e:
                                 logger.error(f"❌ Add Error for {user.id}: {str(e)}")
                                 await asyncio.sleep(random.randint(5, 10))
                     
-                    # 2️⃣ Second Try: Send DM if Adding Failed (Privacy Enabled)
+                    # 2️⃣ Second Try: Send DM if Adding Failed
                     if not handled:
                         current_dms = await get_daily_stats("dms")
                         if current_dms < MAX_DMS_PER_DAY:
@@ -196,34 +187,35 @@ async def scrape_and_add_safely(client: TelegramClient):
                                 
                                 await global_added.insert_one({
                                     "user_id": user.id,
-                                    "username": user.username or "",
+                                    "username": getattr(user, 'username', ""),
                                     "added_at": datetime.now(timezone.utc),
                                     "target_group": TARGET_GROUP,
                                     "source_channel": source_channel,
                                     "status": "dm_sent"
                                 })
                                 
-                                logger.info(f"✉️ [DM: {current_dms+1}/{MAX_DMS_PER_DAY}] Sent invite to {user.first_name or user.username}")
+                                logger.info(f"✉️ [DM: {current_dms+1}/{MAX_DMS_PER_DAY}] Sent invite to {getattr(user, 'first_name', user.id)}")
                                 handled = True
-                                
-                                # Long delay after DM to avoid Spam filter
                                 await asyncio.sleep(random.randint(45, 90)) 
+                                
+                            # 🔥 FIX 2: Proper DM FloodWait Handling
+                            except errors.FloodWaitError as e:
+                                wait_time = e.seconds + random.randint(30, 60)
+                                logger.warning(f"⚠️ Telegram Spam Filter (DM)! Pausing for {wait_time}s...")
+                                await asyncio.sleep(wait_time)
+                                handled = True # Stop trying this user
                                 
                             except Exception as e:
                                 logger.error(f"❌ DM Error for {user.id}: {str(e)}")
-                                await global_added.insert_one({
-                                    "user_id": user.id,
-                                    "status": "failed_all"
-                                })
+                                await global_added.insert_one({"user_id": user.id, "status": "failed_all"})
                                 handled = True
                         else:
-                            logger.info(f"⏭️ Skipped {user.first_name} - Privacy restricted and daily DM limit reached.")
+                            logger.info(f"⏭️ Skipped {getattr(user, 'first_name', user.id)} - Daily DM limit reached.")
 
                     if handled:
                         stealth_gap = random.randint(MEMBER_GAP_MIN, MEMBER_GAP_MAX)
                         await asyncio.sleep(stealth_gap)
                 
-                # Update progress marker so we read older messages next time
                 await channel_status.update_one(
                     {"username": source_channel},
                     {"$set": {"last_offset_id": offset_id, "status": "in_progress"}},
@@ -265,7 +257,7 @@ async def run_scraper():
 
 
 # --- RESTful API Endpoints ---
-app = FastAPI(title="Nexus History Scraper Pro", version="4.0.0")
+app = FastAPI(title="Nexus History Scraper Pro", version="4.1.0")
 
 @app.post("/start-scraping")
 async def start_scraping(background_tasks: BackgroundTasks):
