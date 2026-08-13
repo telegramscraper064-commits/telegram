@@ -1,6 +1,7 @@
 import os
 import asyncio
 import random
+import logging
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from fastapi import FastAPI, BackgroundTasks, HTTPException
@@ -8,16 +9,23 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
+# --- Setup Professional Logging ---
+logging.basicConfig(
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # --- Load Environment Variables ---
 load_dotenv()
 
-# --- Configuration (Ultra Safe Mode) ---
-DAILY_LIMIT = 40               # 🔒 Maximum 40 adds per day (Highly Recommended)
-BATCH_SIZE = 20                # 20 members per fetch
-MEMBER_GAP_MIN = 30            # Min gap between adds (seconds) - Increased for safety
-MEMBER_GAP_MAX = 60            # Max gap between adds (seconds) - Increased for safety
-BATCH_GAP = 120                # Gap after every batch (seconds)
-MAX_RETRIES = 2                # Max retries per member
+# --- Configuration (Ultra Safe & Professional Mode) ---
+DAILY_LIMIT = 40               # 🔒 Maximum adds per day to prevent bans
+BATCH_SIZE = 20                # Process 20 members per batch
+MEMBER_GAP_MIN = 30            # Min seconds gap between user adds
+MEMBER_GAP_MAX = 60            # Max seconds gap between user adds
+BATCH_GAP = 120                # Rest time after every batch completion
+MAX_RETRIES = 2                # Max retry attempts for network issues
 
 SOURCE_CHANNELS = [
     "hitechagro",
@@ -25,43 +33,45 @@ SOURCE_CHANNELS = [
     "agricoaching",
     "agriculture_competitive_exams"
 ]
-TARGET_GROUP = "agriquizworld" # Or use full link/ID
+TARGET_GROUP = "agriquizworld"
 
 # --- Telegram API Credentials ---
 API_ID = int(os.getenv('API_ID', 0))
 API_HASH = os.getenv('API_HASH', '')
-SESSION_STRING = os.getenv('SESSION_STRING', '')  # 🔥 No more phone/OTP required on server
+SESSION_STRING = os.getenv('SESSION_STRING', '')
 
-# --- MongoDB Connection (Async Motor) ---
+# --- Database Initialization ---
 MONGO_URI = os.getenv('MONGO_URI')
 if not MONGO_URI:
-    raise ValueError("❌ MONGO_URI not found in environment variables!")
+    logger.error("MONGO_URI is missing in environment variables!")
+    raise ValueError("❌ MONGO_URI not found!")
 
+# Use Motor for Async MongoDB operations
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client['telegram_scraper_safe']
 
-# Collections
 all_members = db['all_members']
 global_added = db['global_added']
 channel_status = db['channel_status']
 daily_stats = db['daily_stats']
 
-# --- Global State Lock ---
-# Prevents starting multiple scraping tasks simultaneously
+# --- Global Concurrency Lock ---
 scraping_lock = asyncio.Lock()
 is_scraping_running = False
 
-# --- Async Helper Functions ---
+# --- Core Async Helpers ---
 async def is_already_added(user_id: int) -> bool:
-    user = await global_added.find_one({"user_id": user_id})
-    return user is not None
+    """Check if the user was already added previously."""
+    return await global_added.find_one({"user_id": user_id}) is not None
 
 async def get_today_adds() -> int:
+    """Fetch total successful adds for the current day."""
     today = datetime.now(timezone.utc).date().isoformat()
     stats = await daily_stats.find_one({"date": today})
     return stats.get("count", 0) if stats else 0
 
 async def update_today_adds():
+    """Increment the daily adds counter safely."""
     today = datetime.now(timezone.utc).date().isoformat()
     await daily_stats.update_one(
         {"date": today},
@@ -69,56 +79,63 @@ async def update_today_adds():
         upsert=True
     )
 
-# --- Main Scraper Logic ---
+# --- The Advanced Scraper Engine ---
 async def scrape_and_add_safely(client: TelegramClient):
     global is_scraping_running
     
     try:
         today_adds = await get_today_adds()
         if today_adds >= DAILY_LIMIT:
-            print(f"⏳ Daily limit ({DAILY_LIMIT}) already reached today. Stopping.")
-            return {"status": "limit_reached", "today_adds": today_adds}
+            logger.warning(f"Daily limit ({DAILY_LIMIT}) reached. Hibernating.")
+            return
         
         for source_channel in SOURCE_CHANNELS:
             today_adds = await get_today_adds()
             if today_adds >= DAILY_LIMIT:
+                logger.info("Daily limit reached. Stopping cross-channel scraping.")
                 break
             
+            # Resume from last offset
             status = await channel_status.find_one({"username": source_channel})
             offset = status.get("last_offset", 0) if status else 0
             
-            print(f"🔄 Processing {source_channel} from offset {offset}")
+            logger.info(f"🔄 Initializing target: {source_channel} | Starting offset: {offset}")
             
-            while today_adds < DAILY_LIMIT:
-                try:
-                    chunk = await client.get_participants(
-                        source_channel,
-                        limit=BATCH_SIZE,
-                        offset=offset
+            try:
+                # 🔥 THE FIX: Fetch all members efficiently, then slice them locally
+                # This prevents the 'offset' argument error in newer Telethon versions
+                all_participants = await client.get_participants(source_channel)
+                total_members = len(all_participants)
+                
+                if offset >= total_members:
+                    logger.info(f"✅ {source_channel} is fully scraped. Moving to next.")
+                    await channel_status.update_one(
+                        {"username": source_channel},
+                        {"$set": {"status": "completed", "total": total_members}}
                     )
-                    
+                    continue
+
+                # Process the group in calculated batches
+                while today_adds < DAILY_LIMIT and offset < total_members:
+                    chunk = all_participants[offset : offset + BATCH_SIZE]
                     if not chunk:
-                        print(f"✅ {source_channel} fully scraped.")
-                        await channel_status.update_one(
-                            {"username": source_channel},
-                            {"$set": {"status": "completed"}}
-                        )
                         break
+                    
+                    logger.info(f"📦 Processing batch of {len(chunk)} users from offset {offset}...")
                     
                     for user in chunk:
                         today_adds = await get_today_adds()
                         if today_adds >= DAILY_LIMIT:
-                            print(f"✅ Daily limit reached.")
+                            logger.info("✅ Daily limit reached mid-batch.")
                             break
                         
-                        # Skip if already added or exists in our target DB
+                        # Data validation & Anti-duplicate checks
                         if await is_already_added(user.id):
                             continue
-                        
                         if await all_members.find_one({"user_id": user.id, "channel": source_channel}):
                             continue
                         
-                        # Save to scraped members
+                        # Log to master database
                         await all_members.insert_one({
                             "user_id": user.id,
                             "username": user.username or "",
@@ -126,9 +143,9 @@ async def scrape_and_add_safely(client: TelegramClient):
                             "scraped_at": datetime.now(timezone.utc)
                         })
                         
-                        # Logic to add user
+                        # Addition Logic with Retries
                         added = False
-                        for retry in range(MAX_RETRIES):
+                        for attempt in range(1, MAX_RETRIES + 1):
                             try:
                                 await client.add_participants(TARGET_GROUP, [user.id])
                                 await update_today_adds()
@@ -143,99 +160,107 @@ async def scrape_and_add_safely(client: TelegramClient):
                                     "status": "success"
                                 })
                                 
-                                print(f"✅ [{today_adds}/{DAILY_LIMIT}] Added {user.username or user.id}")
+                                logger.info(f"✅ [{today_adds}/{DAILY_LIMIT}] Successfully injected user: {user.username or user.id}")
                                 added = True
                                 break
                                 
                             except errors.FloodWaitError as e:
-                                wait = e.seconds + random.randint(10, 20)
-                                print(f"⚠️ FloodWait! Sleeping for {wait}s...")
-                                await asyncio.sleep(wait)
+                                wait_time = e.seconds + random.randint(15, 30)
+                                logger.warning(f"⚠️ FloodWait triggered. Cooling down for {wait_time}s...")
+                                await asyncio.sleep(wait_time)
                                 
                             except (errors.UserPrivacyRestrictedError, 
                                     errors.UserNotMutualContactError,
                                     errors.UserChannelsTooMuchError) as e:
-                                print(f"❌ Cannot add user {user.id} due to privacy/limits: {type(e).__name__}")
+                                logger.debug(f"⏭️ Skipped {user.id} - Privacy/Limitation ({type(e).__name__})")
                                 await global_added.insert_one({
                                     "user_id": user.id,
                                     "status": "privacy_restricted_or_banned"
                                 })
-                                added = True # Mark as resolved so we don't retry this specific user
+                                added = True # Mark handled
                                 break
                                 
                             except Exception as e:
-                                print(f"❌ Unexpected Error adding {user.id}: {e}")
+                                logger.error(f"❌ Attempt {attempt} failed for {user.id}: {str(e)}")
                                 await asyncio.sleep(random.randint(5, 10))
                         
                         if not added:
-                            print(f"❌ Failed to add {user.id} after {MAX_RETRIES} retries.")
+                            logger.error(f"❌ Dropped {user.id} after {MAX_RETRIES} failed attempts.")
                         
-                        # Safe gap between each user addition
-                        gap = random.randint(MEMBER_GAP_MIN, MEMBER_GAP_MAX)
-                        await asyncio.sleep(gap)
+                        # Stealth Engine: Variable human-like delays
+                        stealth_gap = random.randint(MEMBER_GAP_MIN, MEMBER_GAP_MAX)
+                        await asyncio.sleep(stealth_gap)
                     
+                    # Update progress marker
                     offset += len(chunk)
                     await channel_status.update_one(
                         {"username": source_channel},
-                        {"$set": {"last_offset": offset, "total": offset, "status": "in_progress"}},
+                        {"$set": {"last_offset": offset, "total": total_members, "status": "in_progress"}},
                         upsert=True
                     )
                     
-                    print(f"⏳ Batch complete. Resting for {BATCH_GAP}s...")
-                    await asyncio.sleep(BATCH_GAP)
-                    
-                except errors.FloodWaitError as e:
-                    wait = e.seconds + random.randint(30, 60)
-                    print(f"⚠️ BIG FloodWait! Sleeping {wait}s...")
-                    await asyncio.sleep(wait)
-                except Exception as e:
-                    print(f"❌ Critical Error in chunk processing: {e}")
-                    await asyncio.sleep(60)
-                    
+                    if today_adds < DAILY_LIMIT:
+                        logger.info(f"⏳ Batch finalized. Entering cooldown phase for {BATCH_GAP}s...")
+                        await asyncio.sleep(BATCH_GAP)
+                        
+            except errors.FloodWaitError as e:
+                critical_wait = e.seconds + random.randint(30, 60)
+                logger.critical(f"🛑 CRITICAL FLOOD WAIT! Halting operations for {critical_wait}s...")
+                await asyncio.sleep(critical_wait)
+            except Exception as e:
+                logger.error(f"💥 Fatal error while processing {source_channel}: {str(e)}")
+                await asyncio.sleep(30)
+                
     finally:
         is_scraping_running = False
-        print("🛑 Scraping Task Finished/Stopped.")
-        return {"status": "completed", "today_adds": await get_today_adds()}
+        logger.info("🏁 Scraper engine execution completed and unlocked.")
+        
+    # ✅ Fixed SyntaxWarning (moved return outside finally block)
+    return {"status": "completed", "today_adds": await get_today_adds()}
 
 
-# --- Background Runner ---
+# --- Background Task Orchestrator ---
 async def run_scraper():
     if not SESSION_STRING:
-        print("❌ SESSION_STRING not set in .env! Cannot login.")
+        logger.critical("SESSION_STRING is missing! Authenticated access denied.")
         return
         
     try:
+        logger.info("🔌 Establishing secure connection to Telegram servers...")
         async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
             await scrape_and_add_safely(client)
     except Exception as e:
         global is_scraping_running
         is_scraping_running = False
-        print(f"❌ Telegram Client Error: {e}")
+        logger.error(f"🔥 Session Authentication/Connection Failure: {str(e)}")
 
 
-# --- FastAPI Routes ---
-app = FastAPI(title="Telegram Safe Scraper API")
+# --- RESTful API Endpoints ---
+app = FastAPI(title="Nexus Scraper Pro", version="2.0.0")
 
-@app.post("/start-scraping")
+@app.post("/start-scraping", summary="Initialize the automated scraping sequence")
 async def start_scraping(background_tasks: BackgroundTasks):
     global is_scraping_running
     
     async with scraping_lock:
         if is_scraping_running:
-            raise HTTPException(status_code=400, detail="Scraping is already running in the background.")
+            raise HTTPException(status_code=409, detail="A scraping instance is already active.")
         is_scraping_running = True
         
     background_tasks.add_task(run_scraper)
+    logger.info("🚀 API Request: Scraping sequence initiated.")
+    
     return {
-        "status": "Ultra-safe scraping started in background",
+        "status": "active",
+        "message": "Ultra-safe scraping protocol deployed in the background.",
         "config": {
             "daily_limit": DAILY_LIMIT,
-            "member_gap": f"{MEMBER_GAP_MIN}-{MEMBER_GAP_MAX} sec",
-            "batch_gap": f"{BATCH_GAP} sec"
+            "stealth_gap": f"{MEMBER_GAP_MIN}s - {MEMBER_GAP_MAX}s",
+            "batch_rest": f"{BATCH_GAP}s"
         }
     }
 
-@app.get("/status")
+@app.get("/status", summary="Retrieve live telemetry and metrics")
 async def get_status():
     channels_info = []
     for ch in SOURCE_CHANNELS:
@@ -244,20 +269,24 @@ async def get_status():
             channels_info.append({
                 "username": ch, 
                 "status": ch_data.get("status", "pending"),
-                "total_scraped": ch_data.get("total", 0)
+                "processed": ch_data.get("last_offset", 0),
+                "total_members": ch_data.get("total", 0)
             })
         else:
-            channels_info.append({"username": ch, "status": "pending", "total_scraped": 0})
+            channels_info.append({"username": ch, "status": "pending", "processed": 0, "total_members": 0})
 
     return {
-        "is_running": is_scraping_running,
-        "today_adds": await get_today_adds(),
-        "daily_limit": DAILY_LIMIT,
-        "total_scraped_ever": await all_members.count_documents({}),
-        "total_added_ever": await global_added.count_documents({}),
-        "channels": channels_info
+        "system_status": "ONLINE",
+        "engine_running": is_scraping_running,
+        "metrics": {
+            "adds_today": await get_today_adds(),
+            "daily_quota": DAILY_LIMIT,
+            "lifetime_scraped": await all_members.count_documents({}),
+            "lifetime_added": await global_added.count_documents({})
+        },
+        "channel_telemetry": channels_info
     }
 
-@app.get("/")
+@app.get("/", include_in_schema=False)
 async def health_check():
-    return {"status": "alive", "mode": "ultra_safe_async", "limit": DAILY_LIMIT}
+    return {"nexus_engine": "operational", "version": "2.0.0", "mode": "stealth"}
