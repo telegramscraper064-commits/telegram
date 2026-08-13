@@ -8,6 +8,7 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import InviteToChannelRequest  # 🔥 THE FIX: Correct Telethon Import
 
 # --- Setup Professional Logging ---
 logging.basicConfig(
@@ -102,8 +103,7 @@ async def scrape_and_add_safely(client: TelegramClient):
             logger.info(f"🔄 Initializing target: {source_channel} | Starting offset: {offset}")
             
             try:
-                # 🔥 THE FIX: Fetch all members efficiently, then slice them locally
-                # This prevents the 'offset' argument error in newer Telethon versions
+                # Fetch all members efficiently, then slice them locally
                 all_participants = await client.get_participants(source_channel)
                 total_members = len(all_participants)
                 
@@ -147,7 +147,9 @@ async def scrape_and_add_safely(client: TelegramClient):
                         added = False
                         for attempt in range(1, MAX_RETRIES + 1):
                             try:
-                                await client.add_participants(TARGET_GROUP, [user.id])
+                                # 🔥 THE FIX: Using correct Telethon method to add users
+                                await client(InviteToChannelRequest(TARGET_GROUP, [user.id]))
+                                
                                 await update_today_adds()
                                 today_adds += 1
                                 
@@ -215,7 +217,6 @@ async def scrape_and_add_safely(client: TelegramClient):
         is_scraping_running = False
         logger.info("🏁 Scraper engine execution completed and unlocked.")
         
-    # ✅ Fixed SyntaxWarning (moved return outside finally block)
     return {"status": "completed", "today_adds": await get_today_adds()}
 
 
