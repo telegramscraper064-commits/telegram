@@ -69,11 +69,15 @@ async def ai_auto_heal(error_message, account_id):
                     nums = re.findall(r'\d+', response.text)
                     if len(nums) >= 3:
                         new_max, new_min, new_max_d = int(nums[0]), int(nums[1]), int(nums[2])
+                        
+                        # 🚨 STRICT LIMIT ENFORCEMENT (MIN 20, MAX 40)
+                        new_max = max(20, min(40, new_max))
+                        
                         await system_config.update_one(
                             {"_id": "core_limits"}, 
                             {"$set": {"max_adds": new_max, "min_delay": new_min, "max_delay": new_max_d}}
                         )
-                        return f"🤖 AI Self-Healing Triggered: Limits updated to {new_max} adds, {new_min}-{new_max_d}s delay."
+                        return f"🤖 AI Self-Healing Triggered: Limits forcefully balanced to {new_max} adds, {new_min}-{new_max_d}s delay."
                     break
             except Exception as e:
                 logger.warning(f"Healing model {model_name} failed: {e}")
@@ -101,44 +105,60 @@ admin_cache = {}
 # Initialize Admin Bot Client
 admin_bot = TelegramClient('admin_bot_session', API_ID, API_HASH)
 
-# --- 🔄 2. SEED ACCOUNTS POOL ---
+# --- 🔄 2. SEED ACCOUNTS POOL (ALL 7 ACCOUNTS) ---
 async def seed_accounts_if_empty():
-    count = await accounts_pool.count_documents({})
-    if count == 0:
-        initial_accounts = [
-            {
-                "account_id": "8787291649",
-                "session_string": "1BVtsOJABu2KfNbcYM0PuNc2W5X4KRKHWn6PoLtNYaJjkKhCqM2cwnIrpCy1A71InQNhEIwaygzQlXB1RPIwVQAque3oEfQtKTgn3Mw56RzyPF0FKjAgIjcL8b_l5kgFaQUxwBjBvirhbEWWeKfqbdpau3O6PoKKEJjaOXqaiXpNaP7CU-Mn2sIwqkuCSDkkw9aDYTQzPq46YL2AVQbOw72wbRwt1piaLKWanNrSJ9DUFHOKdqCkA-sP9PJANiJDyKsmWp6Z0tX-ntLBVqMphkVB03oaNVDFzWaFnUsOewqMU_Y0n42TsxBD6-MFvDxgdvVr-T_if3A-lhomb5E9D7Uk0JdcdgoI=",
-                "proxy": "31.59.20.176:6754:obekiuxk:c2itxr9847ac",
-                "status": "ready", "cooldown_until": 0
-            },
-            {
-                "account_id": "7985169157",
-                "session_string": "1BVtsOKwBu01UNwz8ZrH7jP8KM3g_BDq-D1lKVbGc2h6KlxWiVhP7s_svdezBCMFcU0YoZ1NXz2M-7TY7UCf4CsuAi_KG2AML6O83ktDcNvcQEzn-qg1MXJcrUhv6x4-I6poP8A1GBXTYnupGYAfr1s-uypFH5zPYvlnFZC2dS8FfhSMnwmRR3cxtlkTRwsesqFWw6TI_Pvobbjmddy_mByDmNPwHa0bfMgR9j49JhU8140cPTQUxogKm9f4UqR76y7Texect_JVMabP2_zN_ZGoDNSYubThSpdgbff9BAMNc5qXZlw8lsMz6q8v6Gro-TWG4BkU-Tl1r8qZU5k0qYxojVcI8Gzc=",
-                "proxy": "45.38.107.97:6014:obekiuxk:c2itxr9847ac",
-                "status": "ready", "cooldown_until": 0
-            },
-            {
-                "account_id": "9569579629_didi",
-                "session_string": "1BVtsOH4Bu1fZsOCOnXedYiLJvSUzowlvpMxdDTaMvLnD0zqzg4dPtlFoeqfZsmsydOQuOKN0lGuVvO99iY7HK5s0TrT1eOAFwxMrj1zWY2vPkchvE8KrTQzmfAgxoOLfjAkQTj9B5zFh70gYgd0hwJvwn75v3fYstXt-ulLgDT_UzmHyXEp59sXU1jGFmqtSk88jGZ6taDmZpU7iwrUXwQXXGkwGnjOlu9VLtTW85-RcCG5vcZkzeaKvHS-yK_4U_FRaVwBpGtwGadCkbrjNu0asCp5ELm4Jy3x-ZMCFNniDqbLANge03Qr1FA_CBJOgP8WSP-5_O5mseL8oeJOXyYz__5AmTpE=",
-                "proxy": "198.105.121.200:6462:obekiuxk:c2itxr9847ac",
-                "status": "ready", "cooldown_until": 0
-            },
-            {
-                "account_id": "9303815860_sudha",
-                "session_string": "1BVtsOH4Bu5pkBe4mqH3Q6wspEUzTNVaowvi844eM7mbxl__XdK4a_qvmfCyR0n0RA4HFmHZhT92t3oMxvMuUABOXrvbE5MtUyaOgaODa2O-Yz6Kn5PzWPqpeLWppbBsMGdswqvwjdXjCVzi0NjpY1vNh4uBWcn-Ky7AdGe7dXq-JC-AUIWhySfcuU-M-R_Hwup6m1mgEJ-aLFYTQ8rzy08O-pRs3lO8n_viIvyAbGTmMfa1VTcye6eIFIhhA_AcuOCwDsnN4-2R2w3-Q9N6rAjV8K1-bu7pPviQ-pJ1qktoUCLUzl7R6p4QTgqEsIO4LCu_9sOMrzzeu_tzbCQhoCIljJdTHmc4=",
-                "proxy": "64.137.96.74:6641:obekiuxk:c2itxr9847ac",
-                "status": "ready", "cooldown_until": 0
-            },
-            {
-                "account_id": "Account_5",
-                "session_string": "1BVtsOH4BuwM9jPFW8r1AII2WR1-ANOlOqE95k1GPl4D09Ynx3Emf_Yr4dqxX6IZ0h30XvlD3ANbxd4Vd5ceP11sYmxSS33zMyxmhgYLJxOZIU-To3PCIXC_xEzf8gT5eu8MPaAvZbNjxypEcstYK5aNerpmmABizYnBix6ZUSMESiTEh9X-R5E17OffHPzojONVAY2bwAAOvYV4Cd4PCEAkW-sac8_Yjm66eNg-nu6sCbhekqxO3exkZgBMmPDZ3qLzjbS29toYHZq7MfSO3MvmjBWnY611s-kPVXWWJrH4knGBig8lxzrtyT6QVdaG6uJU2TO3iRPgHc1To-OaISry-lNdQeoU=",
-                "proxy": "142.111.67.146:5611:obekiuxk:c2itxr9847ac",
-                "status": "ready", "cooldown_until": 0
-            }
-        ]
-        await accounts_pool.insert_many(initial_accounts)
-        logger.info("✅ Successfully seeded 5 accounts into MongoDB pool.")
+    initial_accounts = [
+        {
+            "account_id": "8787291649",
+            "session_string": "1BVtsOJABu2KfNbcYM0PuNc2W5X4KRKHWn6PoLtNYaJjkKhCqM2cwnIrpCy1A71InQNhEIwaygzQlXB1RPIwVQAque3oEfQtKTgn3Mw56RzyPF0FKjAgIjcL8b_l5kgFaQUxwBjBvirhbEWWeKfqbdpau3O6PoKKEJjaOXqaiXpNaP7CU-Mn2sIwqkuCSDkkw9aDYTQzPq46YL2AVQbOw72wbRwt1piaLKWanNrSJ9DUFHOKdqCkA-sP9PJANiJDyKsmWp6Z0tX-ntLBVqMphkVB03oaNVDFzWaFnUsOewqMU_Y0n42TsxBD6-MFvDxgdvVr-T_if3A-lhomb5E9D7Uk0JdcdgoI=",
+            "proxy": "31.59.20.176:6754:obekiuxk:c2itxr9847ac",
+            "status": "ready", "cooldown_until": 0
+        },
+        {
+            "account_id": "7985169157",
+            "session_string": "1BVtsOKwBu01UNwz8ZrH7jP8KM3g_BDq-D1lKVbGc2h6KlxWiVhP7s_svdezBCMFcU0YoZ1NXz2M-7TY7UCf4CsuAi_KG2AML6O83ktDcNvcQEzn-qg1MXJcrUhv6x4-I6poP8A1GBXTYnupGYAfr1s-uypFH5zPYvlnFZC2dS8FfhSMnwmRR3cxtlkTRwsesqFWw6TI_Pvobbjmddy_mByDmNPwHa0bfMgR9j49JhU8140cPTQUxogKm9f4UqR76y7Texect_JVMabP2_zN_ZGoDNSYubThSpdgbff9BAMNc5qXZlw8lsMz6q8v6Gro-TWG4BkU-Tl1r8qZU5k0qYxojVcI8Gzc=",
+            "proxy": "45.38.107.97:6014:obekiuxk:c2itxr9847ac",
+            "status": "ready", "cooldown_until": 0
+        },
+        {
+            "account_id": "9569579629_didi",
+            "session_string": "1BVtsOH4Bu1fZsOCOnXedYiLJvSUzowlvpMxdDTaMvLnD0zqzg4dPtlFoeqfZsmsydOQuOKN0lGuVvO99iY7HK5s0TrT1eOAFwxMrj1zWY2vPkchvE8KrTQzmfAgxoOLfjAkQTj9B5zFh70gYgd0hwJvwn75v3fYstXt-ulLgDT_UzmHyXEp59sXU1jGFmqtSk88jGZ6taDmZpU7iwrUXwQXXGkwGnjOlu9VLtTW85-RcCG5vcZkzeaKvHS-yK_4U_FRaVwBpGtwGadCkbrjNu0asCp5ELm4Jy3x-ZMCFNniDqbLANge03Qr1FA_CBJOgP8WSP-5_O5mseL8oeJOXyYz__5AmTpE=",
+            "proxy": "198.105.121.200:6462:obekiuxk:c2itxr9847ac",
+            "status": "ready", "cooldown_until": 0
+        },
+        {
+            "account_id": "9303815860_sudha",
+            "session_string": "1BVtsOH4Bu5pkBe4mqH3Q6wspEUzTNVaowvi844eM7mbxl__XdK4a_qvmfCyR0n0RA4HFmHZhT92t3oMxvMuUABOXrvbE5MtUyaOgaODa2O-Yz6Kn5PzWPqpeLWppbBsMGdswqvwjdXjCVzi0NjpY1vNh4uBWcn-Ky7AdGe7dXq-JC-AUIWhySfcuU-M-R_Hwup6m1mgEJ-aLFYTQ8rzy08O-pRs3lO8n_viIvyAbGTmMfa1VTcye6eIFIhhA_AcuOCwDsnN4-2R2w3-Q9N6rAjV8K1-bu7pPviQ-pJ1qktoUCLUzl7R6p4QTgqEsIO4LCu_9sOMrzzeu_tzbCQhoCIljJdTHmc4=",
+            "proxy": "64.137.96.74:6641:obekiuxk:c2itxr9847ac",
+            "status": "ready", "cooldown_until": 0
+        },
+        {
+            "account_id": "Account_5",
+            "session_string": "1BVtsOH4BuwM9jPFW8r1AII2WR1-ANOlOqE95k1GPl4D09Ynx3Emf_Yr4dqxX6IZ0h30XvlD3ANbxd4Vd5ceP11sYmxSS33zMyxmhgYLJxOZIU-To3PCIXC_xEzf8gT5eu8MPaAvZbNjxypEcstYK5aNerpmmABizYnBix6ZUSMESiTEh9X-R5E17OffHPzojONVAY2bwAAOvYV4Cd4PCEAkW-sac8_Yjm66eNg-nu6sCbhekqxO3exkZgBMmPDZ3qLzjbS29toYHZq7MfSO3MvmjBWnY611s-kPVXWWJrH4knGBig8lxzrtyT6QVdaG6uJU2TO3iRPgHc1To-OaISry-lNdQeoU=",
+            "proxy": "142.111.67.146:5611:obekiuxk:c2itxr9847ac",
+            "status": "ready", "cooldown_until": 0
+        },
+        {
+            "account_id": "9455647843",
+            "session_string": "1BVtsOJABuxUEaaZDmKad8UsvHgNwmLjJWfrhMeiWoVtkFV-vJdZ5OQ5YOPgx834tdZcd4N6Z8MYakGuLHjH-yl49Pw0yvOp0rv0OjXgeJvWXTvUiMJlx5KESD_uOuA2qH28A3fPsxauAN1axu2DmMug6BOwpNCAgZOWWpZpRlEhwbLHX_feHyUAVOPu4zj-69t8owdoZR9S1J5mV3qB1AfwaUbcb_acJUBfANjbMGpXxudDGhh3KlxeUiKflrYkYmEuLSumclYClzs5ShW1tpn1sssWWCGoJxigZ9wAi8YNH_sXDeOTjBtTsqIrXa2pfewzVkW88XjN7WuO_Jd0bENSIqR6gklg=",
+            "proxy": "31.56.127.193:7684:obekiuxk:c2itxr9847ac",
+            "status": "ready", "cooldown_until": 0
+        },
+        {
+            "account_id": "6392166529",
+            "session_string": "1BVtsOJABu5IumbJNN3MCHtXRdhQGiShx-3Xy_3vZ4_hH3Y8M9j7yCLcMN_DX0v3ObCq0ZLBHnTUhvYgrqduhYjV_V2PsRKVjNcTTADnWoQkTMdxcz9rd6BtRd2eiM3AJGZimDMHiVOeD0ukI8uhVCY9Pkq0NcWERS7NjLH_OwtbEygR7j6JuAbStwKz2m3l0FoisOYdCa7Qji6i8KYQQG1U2WmbPPDnU2Cmr1B23Y1sOOgXOssSQA78lCdq8Q7CXtJvqMUUqGcbNtFTOCaTkZNvgRTudc1ZTmDwOfY_ZjvJQ3uY6ks_l19uOsx-dsddZXiR3q91-S00PoB-mfNQJCVnqY2mlSZY=",
+            "proxy": "198.23.243.226:6361:obekiuxk:c2itxr9847ac",
+            "status": "ready", "cooldown_until": 0
+        }
+    ]
+    
+    for acc in initial_accounts:
+        await accounts_pool.update_one(
+            {"account_id": acc["account_id"]},
+            {"$setOnInsert": acc},
+            upsert=True
+        )
+    logger.info("✅ Verified 7 accounts in MongoDB pool.")
 
 # --- 🧠 3. SYSTEM CONFIG UTILITIES ---
 async def get_system_config():
@@ -201,13 +221,19 @@ async def admin_chat_handler(event):
             ready = await accounts_pool.count_documents({"status": "ready"})
             cooling = await accounts_pool.count_documents({"status": "cooling"})
             queue = await scraped_queue.count_documents({"status": "pending"})
+            
             total_added = await master_blacklist.count_documents({})
+            dm_sent = await master_blacklist.count_documents({"add_method": "dm"})
+            direct_add = total_added - dm_sent 
+            
             config = await get_system_config()
             sources = await get_source_channels()
             
             reply = (
                 f"📊 **System Performance & Status Report** 📊\n\n"
-                f"✅ **Total DB Students Added:** {total_added}\n"
+                f"✅ **Total Processed:** {total_added}\n"
+                f" ├ 🎯 **Direct Added:** {direct_add}\n"
+                f" └ 📩 **DM / Link Sent:** {dm_sent}\n\n"
                 f"📥 **Pending Queue:** {queue}\n"
                 f"🟢 **Ready IDs:** {ready} | 🔴 **Cooling IDs:** {cooling}\n"
                 f"⚙️ **Active Limits:** {config['max_adds']} max adds, {config['min_delay']}-{config['max_delay']}s delay.\n"
@@ -304,7 +330,7 @@ async def harvester_task():
                         logger.warning(f"Could not fetch admins for {channel}: {e}")
                         admin_ids = []
 
-                    # 🚀 STRATEGY 1: Fetch Direct Participants (If public)
+                    # 🚀 STRATEGY 1: Fetch Direct Participants
                     try:
                         logger.info(f"🔍 Fetching direct member list from {channel}...")
                         participant_count = 0
@@ -346,7 +372,7 @@ async def harvester_task():
                             if message.action and isinstance(message.action, MessageActionChatAddUser):
                                 users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [])
                             
-                            # B. Leaderboard & Text Mentions (@usernames extraction)
+                            # B. Leaderboard & Text Mentions
                             if message.text:
                                 mentions = re.findall(r'@([a-zA-Z0-9_]{5,32})', message.text)
                                 for username in mentions:
@@ -362,7 +388,7 @@ async def harvester_task():
                                         if mention_count % 50 == 0:
                                             logger.info(f"📝 Found {mention_count} mentions from {channel}")
 
-                            # C. Public Polls (View Votes) - Safely wrapped & Fixed ✅
+                            # C. Public Polls (View Votes)
                             if getattr(message, 'poll', None) and hasattr(message.poll, 'poll') and message.poll.poll.public_voters:
                                 try:
                                     poll_votes = await client(functions.messages.GetPollVotesRequest(
@@ -375,7 +401,7 @@ async def harvester_task():
                                 except Exception as e:
                                     logger.debug(f"Poll votes fetch failed: {e}")
 
-                            # D. Message Reactions (❤️, 👍, etc.) - Safely wrapped
+                            # D. Message Reactions
                             if message.reactions:
                                 try:
                                     reactions = await client(functions.messages.GetMessageReactionsListRequest(
@@ -411,7 +437,6 @@ async def harvester_task():
                                 logger.warning(f"Error processing user: {e}")
                                 continue
                         
-                        # Log progress every 500 messages
                         if message_count % 500 == 0:
                             logger.info(f"📊 Scanned {message_count} messages in {channel}")
                     
@@ -430,11 +455,10 @@ async def harvester_task():
         except Exception as e:
             logger.error(f"Harvester main loop error: {e}")
         
-        # Take a long rest before starting the deep scan cycle again
         logger.info("💤 Deep Harvester cycle complete. Resting for 15 minutes...")
         await asyncio.sleep(900)
 
-# --- 💉 6. INJECTOR ENGINE (With Entity Fix & Smart Counter) ---
+# --- 💉 6. INJECTOR ENGINE (With Add Method & Smart Counter) ---
 async def injector_task():
     logger.info("💉 Injector Engine Started...")
     while is_engine_running:
@@ -502,9 +526,9 @@ async def injector_task():
                         logger.info(f"🔍 Extracted username: {target_user} from link")
 
                     add_successful = False
+                    add_method = "direct"
                     
                     try:
-                        # Pehle globally entity resolve karne ka try karo
                         try:
                             user_entity = await client.get_input_entity(target_user)
                             logger.info(f"✅ Entity resolved for {target_user}")
@@ -516,6 +540,7 @@ async def injector_task():
                         await client(functions.channels.InviteToChannelRequest(target_entity, [user_entity]))
                         logger.info(f"✅ SUCCESS: Added user {user_name} ({user_id}) to group!")
                         add_successful = True
+                        add_method = "direct"
                         
                     except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError) as e:
                         logger.info(f"🔒 Privacy ON for {user_name} ({user_id}). Sending DM...")
@@ -530,6 +555,7 @@ async def injector_task():
                                 await client.send_message(user_id, invite_msg)
                             logger.info(f"📨 DM Invitation sent to {user_name} ({user_id})")
                             add_successful = True
+                            add_method = "dm"
                         except Exception as dm_err:
                             logger.error(f"❌ Failed to send DM to {user_id}: {dm_err}")
                             add_successful = False
@@ -544,20 +570,22 @@ async def injector_task():
 
                     # Database updates
                     try:
-                        await master_blacklist.insert_one({
-                            "user_id": user_id, 
-                            "name": user_name, 
-                            "tg_link": tg_link
-                        })
+                        if add_successful:
+                            await master_blacklist.insert_one({
+                                "user_id": user_id, 
+                                "name": user_name, 
+                                "tg_link": tg_link,
+                                "add_method": add_method
+                            })
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                     except Exception as db_err:
                         logger.error(f"❌ Database error: {db_err}")
                     
-                    # 🚨 SMART COUNTER: Sirf tabhi count badhao jab sach me add/DM hua ho
+                    # 🚨 SMART COUNTER
                     if add_successful:
                         daily_adds_count += 1
                         delay = random.randint(config.get("min_delay", 8), config.get("max_delay", 16))
-                        logger.info(f"⏳ Sleeping for {delay} seconds... (Added {daily_adds_count}/{config.get('max_adds', 35)})")
+                        logger.info(f"⏳ Sleeping for {delay} seconds... (Processed {daily_adds_count}/{config.get('max_adds', 35)})")
                         await asyncio.sleep(delay)
                     else:
                         logger.info(f"⏭️ Skipping delay for failed user {user_name}, moving to next instantly...")
