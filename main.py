@@ -11,7 +11,8 @@ from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, events, errors, functions
 from telethon.sessions import StringSession
-from telethon.tl.types import User, MessageActionChatAddUser, MessageActionChatJoined, ChannelParticipantsAdmins
+from telethon.tl.types import User, MessageActionChatAddUser, ChannelParticipantsAdmins
+# Remove MessageActionChatJoined from imports - it doesn't exist
 
 # --- 🛠️ 1. SETUP & CONFIGURATIONS ---
 logging.basicConfig(format='%(asctime)s - [%(levelname)s] - %(message)s', level=logging.INFO)
@@ -188,8 +189,12 @@ async def harvester_task():
                 
                 async for message in client.iter_messages(channel, limit=200):
                     users_to_check = []
-                    if isinstance(message.action, (MessageActionChatAddUser, MessageActionChatJoined)):
-                        users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [message.sender])
+                    
+                    # Handle different message types
+                    if message.action:
+                        if isinstance(message.action, MessageActionChatAddUser):
+                            users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [])
+                        # MessageActionChatJoined doesn't exist, skip it
                     elif message.sender:
                         users_to_check.append(message.sender)
                     
