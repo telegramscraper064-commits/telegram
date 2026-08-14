@@ -6,7 +6,7 @@ import re
 import socks
 from datetime import datetime, timedelta
 import pytz
-import google.generativeai as genai
+from google import genai  # ✅ google-genai package ke liye yeh import sahi hai
 from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, events, errors, functions
@@ -28,19 +28,20 @@ ADMIN_USERNAME = "agrikrishna"
 COOLDOWN_HOURS = 36
 IST = pytz.timezone('Asia/Kolkata')
 
-# --- 🧠 AI Configuration ---
-genai.configure(api_key=GEMINI_API_KEY)
+# --- 🧠 AI Client Setup (google-genai package) ---
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# --- 🧠 ROBUST AI FALLBACK WRAPPER (Gemini 3.6 Flash & Gemini 3.1 Pro) ---
+# --- 🧠 ROBUST AI FALLBACK WRAPPER ---
 async def safe_generate_ai_response(prompt_text):
-    # Priority chain: Pehle Gemini 3.6 Flash try karega, fir Gemini 3.1 Pro, aur backup ke liye 1.5 Flash
+    # Priority chain: Gemini 3.6 Flash -> Gemini 3.1 Pro -> Gemini 1.5 Flash
     models_chain = ['gemini-3.6-flash', 'gemini-3.1-pro', 'gemini-1.5-flash']
     
     for model_name in models_chain:
         try:
-            # Using the correct Google Generative AI API
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt_text)
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=prompt_text
+            )
             if response and response.text:
                 return response.text
         except Exception as e:
@@ -55,18 +56,22 @@ async def ai_auto_heal(error_message, account_id):
         prompt = f"A Telegram automation script got this error on account {account_id}: '{error_message}'. " \
                  f"If it's a flood/spam error, give safer limits. Reply strictly with three numbers separated by commas for max_adds,min_delay,max_delay e.g., '25,12,20'"
         
-        # Use light model for healing (faster response)
         healing_models = ['gemini-3.1-flash-lite', 'gemini-1.5-flash']
         
         for model_name in healing_models:
             try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(prompt)
+                response = ai_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
                 if response and response.text:
                     nums = re.findall(r'\d+', response.text)
                     if len(nums) >= 3:
                         new_max, new_min, new_max_d = int(nums[0]), int(nums[1]), int(nums[2])
-                        await system_config.update_one({"_id": "core_limits"}, {"$set": {"max_adds": new_max, "min_delay": new_min, "max_delay": new_max_d}})
+                        await system_config.update_one(
+                            {"_id": "core_limits"}, 
+                            {"$set": {"max_adds": new_max, "min_delay": new_min, "max_delay": new_max_d}}
+                        )
                         return f"🤖 AI Self-Healing Triggered: Limits updated to {new_max} adds, {new_min}-{new_max_d}s delay."
                     break
             except Exception as e:
@@ -161,11 +166,15 @@ async def get_source_channels():
     )
     return default_sources
 
-def get_ist_now(): return datetime.now(IST)
-def is_working_hour(): return 9 <= get_ist_now().hour < 22
+def get_ist_now(): 
+    return datetime.now(IST)
+
+def is_working_hour(): 
+    return 9 <= get_ist_now().hour < 22
 
 def parse_proxy(proxy_str):
-    if not proxy_str: return None
+    if not proxy_str: 
+        return None
     p = proxy_str.split(':')
     return (socks.SOCKS5, p[0], int(p[1]), True, p[2], p[3])
 
@@ -303,7 +312,8 @@ async def harvester_task():
                         try:
                             poll_votes = await client(functions.messages.GetPollVotesRequest(peer=channel, id=message.id, option=b'', limit=100))
                             users_to_check.extend(poll_votes.users)
-                        except: pass
+                        except: 
+                            pass
 
                     for user in users_to_check:
                         if not isinstance(user, User) or user.bot or user.deleted or user.id in admin_ids:
@@ -316,14 +326,17 @@ async def harvester_task():
                         if not await is_blacklisted(user.id) and not await scraped_queue.find_one({"user_id": user.id}):
                             tg_link = f"https://t.me/{user.username}" if user.username else f"tg://user?id={user.id}"
                             await scraped_queue.insert_one({
-                                "user_id": user.id, "name": full_name or "Agri Student", 
-                                "tg_link": tg_link, "status": "pending"
+                                "user_id": user.id, 
+                                "name": full_name or "Agri Student", 
+                                "tg_link": tg_link, 
+                                "status": "pending"
                             })
                 await asyncio.sleep(15)
         except Exception as e:
             logger.error(f"Harvester error: {e}")
         finally:
-            if client.is_connected(): await client.disconnect()
+            if client.is_connected(): 
+                await client.disconnect()
         await asyncio.sleep(300)
 
 # --- 💉 6. INJECTOR ENGINE ---
@@ -336,7 +349,10 @@ async def injector_task():
             continue
 
         now_ts = datetime.now(pytz.utc).timestamp()
-        await accounts_pool.update_many({"status": "cooling", "cooldown_until": {"$lt": now_ts}}, {"$set": {"status": "ready", "cooldown_until": 0}})
+        await accounts_pool.update_many(
+            {"status": "cooling", "cooldown_until": {"$lt": now_ts}}, 
+            {"$set": {"status": "ready", "cooldown_until": 0}}
+        )
 
         account = await accounts_pool.find_one({"status": "ready"})
         if not account:
@@ -344,7 +360,12 @@ async def injector_task():
             continue
             
         acc_id = account['account_id']
-        client = TelegramClient(StringSession(account['session_string']), API_ID, API_HASH, proxy=parse_proxy(account.get("proxy")))
+        client = TelegramClient(
+            StringSession(account['session_string']), 
+            API_ID, 
+            API_HASH, 
+            proxy=parse_proxy(account.get("proxy"))
+        )
         
         daily_adds_count = 0
         try:
@@ -371,7 +392,11 @@ async def injector_task():
                 except errors.PeerFloodError:
                     raise
 
-                await master_blacklist.insert_one({"user_id": user_id, "name": user_doc['name'], "tg_link": user_doc['tg_link']})
+                await master_blacklist.insert_one({
+                    "user_id": user_id, 
+                    "name": user_doc['name'], 
+                    "tg_link": user_doc['tg_link']
+                })
                 await scraped_queue.delete_one({"_id": user_doc['_id']})
                 daily_adds_count += 1
                 
@@ -382,22 +407,31 @@ async def injector_task():
 
         except errors.PeerFloodError as e:
             cooldown_time = (datetime.now(pytz.utc) + timedelta(hours=COOLDOWN_HOURS)).timestamp()
-            await accounts_pool.update_one({"_id": account['_id']}, {"$set": {"status": "cooling", "cooldown_until": cooldown_time}})
+            await accounts_pool.update_one(
+                {"_id": account['_id']}, 
+                {"$set": {"status": "cooling", "cooldown_until": cooldown_time}}
+            )
             
             ai_msg = await ai_auto_heal(str(e), acc_id)
             if ai_msg:
                 try:
                     await admin_bot.send_message(ADMIN_USERNAME, ai_msg)
-                except: pass
+                except: 
+                    pass
             
         except Exception as e:
             if "banned" in str(e).lower() or "deactivated" in str(e).lower():
                 try:
                     await admin_bot.send_message(ADMIN_USERNAME, f"🚨 ID {acc_id} is permanently BANNED!")
-                except: pass
-                await accounts_pool.update_one({"_id": account['_id']}, {"$set": {"status": "banned"}})
+                except: 
+                    pass
+                await accounts_pool.update_one(
+                    {"_id": account['_id']}, 
+                    {"$set": {"status": "banned"}}
+                )
         finally:
-            if client.is_connected(): await client.disconnect()
+            if client.is_connected(): 
+                await client.disconnect()
 
 # --- 🚀 7. FASTAPI & LIFECYCLE ---
 app = FastAPI(title="Agri Mastermind AI Engine")
