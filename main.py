@@ -362,11 +362,14 @@ async def harvester_task():
                                         if mention_count % 50 == 0:
                                             logger.info(f"📝 Found {mention_count} mentions from {channel}")
 
-                            # C. Public Polls (View Votes) - Safely wrapped
-                            if message.poll and message.poll.public_voters:
+                            # C. Public Polls (View Votes) - Safely wrapped & Fixed ✅
+                            if getattr(message, 'poll', None) and hasattr(message.poll, 'poll') and message.poll.poll.public_voters:
                                 try:
                                     poll_votes = await client(functions.messages.GetPollVotesRequest(
-                                        peer=channel, id=message.id, option=b'', limit=100
+                                        peer=channel, 
+                                        id=message.id, 
+                                        option=b'', 
+                                        limit=100
                                     ))
                                     users_to_check.extend(poll_votes.users)
                                 except Exception as e:
@@ -381,6 +384,7 @@ async def harvester_task():
                                     users_to_check.extend(reactions.users)
                                 except Exception as e:
                                     logger.debug(f"Reactions fetch failed: {e}")
+                                    
                         except Exception as e:
                             logger.warning(f"Error processing message {message_count}: {e}")
                             continue
