@@ -272,9 +272,9 @@ async def admin_chat_handler(event):
         logger.error(f"Admin Chat Error: {e}")
         await event.reply(f"🤖 Assistant Error: {str(e)[:150]}")
 
-# --- 🌾 5. HARVESTER ENGINE (100% Crash-Free) ---
+# --- 🌾 5. ULTIMATE DEEP HARVESTER ENGINE ---
 async def harvester_task():
-    logger.info("🌾 Harvester Engine Started with Dynamic Sources...")
+    logger.info("🌾 Ultimate Deep Harvester Started! Hunting for 100k+ Students...")
     while is_engine_running:
         try:
             config = await get_system_config()
@@ -295,56 +295,127 @@ async def harvester_task():
                 source_channels = await get_source_channels()
                 
                 for channel in source_channels:
+                    logger.info(f"🎯 Scanning channel: {channel}")
+                    
                     try:
                         admins = await client.get_participants(channel, filter=ChannelParticipantsAdmins)
                         admin_ids = [a.id for a in admins]
                     except Exception as e:
                         logger.warning(f"Could not fetch admins for {channel}: {e}")
                         admin_ids = []
-                    
-                    try:
-                        async for message in client.iter_messages(channel, limit=200):
-                            users_to_check = []
-                            
-                            try:
-                                if message.action:
-                                    if isinstance(message.action, MessageActionChatAddUser):
-                                        users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [])
-                                elif message.sender:
-                                    users_to_check.append(message.sender)
-                            except Exception as e:
-                                logger.warning(f"Error processing message action: {e}")
-                                continue
 
-                            for user in users_to_check:
-                                try:
-                                    if not isinstance(user, User) or user.bot or user.deleted or user.id in admin_ids:
-                                        continue
-                                    
-                                    full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
-                                    if SPAM_REGEX.search(full_name):
-                                        continue
-                                        
-                                    if not await is_blacklisted(user.id) and not await scraped_queue.find_one({"user_id": user.id}):
-                                        tg_link = f"https://t.me/{user.username}" if user.username else f"tg://user?id={user.id}"
+                    # 🚀 STRATEGY 1: Fetch Direct Participants (If public)
+                    try:
+                        logger.info(f"🔍 Fetching direct member list from {channel}...")
+                        participant_count = 0
+                        async for user in client.iter_participants(channel, limit=3000):
+                            if not isinstance(user, User) or user.bot or user.deleted or user.id in admin_ids:
+                                continue
+                            
+                            full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
+                            if SPAM_REGEX.search(full_name):
+                                continue
+                                
+                            if not await is_blacklisted(user.id) and not await scraped_queue.find_one({"user_id": user.id}):
+                                tg_link = f"https://t.me/{user.username}" if user.username else f"tg://user?id={user.id}"
+                                await scraped_queue.insert_one({
+                                    "user_id": user.id, 
+                                    "name": full_name or "Agri Student", 
+                                    "tg_link": tg_link, 
+                                    "status": "pending"
+                                })
+                                participant_count += 1
+                                if participant_count % 100 == 0:
+                                    logger.info(f"📊 Collected {participant_count} participants from {channel}")
+                    except Exception as e:
+                        logger.info(f"⚠️ Member list hidden for {channel}, relying on deep message scan. Error: {e}")
+
+                    # 🚀 STRATEGY 2: Deep Historical Message Scan
+                    logger.info(f"🕵️‍♂️ Deep Scanning message history in {channel}...")
+                    message_count = 0
+                    mention_count = 0
+                    
+                    async for message in client.iter_messages(channel, limit=5000):
+                        message_count += 1
+                        users_to_check = []
+                        
+                        try:
+                            # A. Normal Senders & Joined Members
+                            if message.sender:
+                                users_to_check.append(message.sender)
+                            if message.action and isinstance(message.action, MessageActionChatAddUser):
+                                users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [])
+                            
+                            # B. Leaderboard & Text Mentions (@usernames extraction)
+                            if message.text:
+                                mentions = re.findall(r'@([a-zA-Z0-9_]{5,32})', message.text)
+                                for username in mentions:
+                                    tg_link = f"https://t.me/{username}"
+                                    if not await scraped_queue.find_one({"tg_link": tg_link}) and not await master_blacklist.find_one({"tg_link": tg_link}):
                                         await scraped_queue.insert_one({
-                                            "user_id": user.id, 
-                                            "name": full_name or "Agri Student", 
+                                            "user_id": f"resolve_{username}",
+                                            "name": username, 
                                             "tg_link": tg_link, 
                                             "status": "pending"
                                         })
-                                        logger.info(f"🌾 Added {full_name} to queue")
+                                        mention_count += 1
+                                        if mention_count % 50 == 0:
+                                            logger.info(f"📝 Found {mention_count} mentions from {channel}")
+
+                            # C. Public Polls (View Votes) - Safely wrapped
+                            if message.poll and message.poll.public_voters:
+                                try:
+                                    poll_votes = await client(functions.messages.GetPollVotesRequest(
+                                        peer=channel, id=message.id, option=b'', limit=100
+                                    ))
+                                    users_to_check.extend(poll_votes.users)
                                 except Exception as e:
-                                    logger.warning(f"Error processing user: {e}")
+                                    logger.debug(f"Poll votes fetch failed: {e}")
+
+                            # D. Message Reactions (❤️, 👍, etc.) - Safely wrapped
+                            if message.reactions:
+                                try:
+                                    reactions = await client(functions.messages.GetMessageReactionsListRequest(
+                                        peer=channel, msg_id=message.id, limit=50
+                                    ))
+                                    users_to_check.extend(reactions.users)
+                                except Exception as e:
+                                    logger.debug(f"Reactions fetch failed: {e}")
+                        except Exception as e:
+                            logger.warning(f"Error processing message {message_count}: {e}")
+                            continue
+
+                        # Process all found user objects
+                        for user in users_to_check:
+                            try:
+                                if not isinstance(user, User) or user.bot or user.deleted or user.id in admin_ids:
+                                    continue
+                                
+                                full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
+                                if SPAM_REGEX.search(full_name):
                                     continue
                                     
-                    except Exception as e:
-                        logger.error(f"Error iterating messages in {channel}: {e}")
+                                if not await is_blacklisted(user.id) and not await scraped_queue.find_one({"user_id": user.id}):
+                                    tg_link = f"https://t.me/{user.username}" if user.username else f"tg://user?id={user.id}"
+                                    await scraped_queue.insert_one({
+                                        "user_id": user.id, 
+                                        "name": full_name or "Agri Student", 
+                                        "tg_link": tg_link, 
+                                        "status": "pending"
+                                    })
+                            except Exception as e:
+                                logger.warning(f"Error processing user: {e}")
+                                continue
                         
-                    await asyncio.sleep(15)
+                        # Log progress every 500 messages
+                        if message_count % 500 == 0:
+                            logger.info(f"📊 Scanned {message_count} messages in {channel}")
+                    
+                    logger.info(f"✅ Channel {channel} complete: {message_count} messages, {mention_count} mentions found")
+                    await asyncio.sleep(20)
                     
             except Exception as e:
-                logger.error(f"Harvester connection error: {e}")
+                logger.error(f"Harvester error on account {cooling_acc.get('account_id')}: {e}")
             finally:
                 try:
                     if client and client.is_connected(): 
@@ -354,8 +425,10 @@ async def harvester_task():
                     
         except Exception as e:
             logger.error(f"Harvester main loop error: {e}")
-            
-        await asyncio.sleep(300)
+        
+        # Take a long rest before starting the deep scan cycle again
+        logger.info("💤 Deep Harvester cycle complete. Resting for 15 minutes...")
+        await asyncio.sleep(900)
 
 # --- 💉 6. INJECTOR ENGINE (With Entity Fix & Smart Counter) ---
 async def injector_task():
@@ -447,7 +520,6 @@ async def injector_task():
                                       f"🔗 https://web.telegram.org/k/#@{TARGET_GROUP}\n"
                                       "👉 सभी Agriculture Students जरूर Join करें। 🌱")
                         try:
-                            # Try sending DM with resolved entity or fallback
                             try:
                                 await client.send_message(user_entity, invite_msg)
                             except:
@@ -485,7 +557,7 @@ async def injector_task():
                         await asyncio.sleep(delay)
                     else:
                         logger.info(f"⏭️ Skipping delay for failed user {user_name}, moving to next instantly...")
-                        await asyncio.sleep(2)  # Fail hone par time waste nahi karega
+                        await asyncio.sleep(2)
 
                 if daily_adds_count >= config.get("max_adds", 35):
                     logger.info(f"📊 Account {acc_id} reached daily limit of {config.get('max_adds', 35)} adds")
@@ -562,12 +634,17 @@ async def root():
 async def health_check():
     config = await get_system_config()
     sources = await get_source_channels()
+    queue_stats = await scraped_queue.aggregate([
+        {"$group": {"_id": "$status", "count": {"$sum": 1}}}
+    ]).to_list(length=None)
+    
     return {
         "status": "healthy",
         "is_paused": config.get("is_paused", False),
         "source_channels": sources,
         "total_added": await master_blacklist.count_documents({}),
-        "pending_queue": await scraped_queue.count_documents({"status": "pending"})
+        "pending_queue": await scraped_queue.count_documents({"status": "pending"}),
+        "queue_stats": queue_stats
     }
 
 @app.get("/logs")
