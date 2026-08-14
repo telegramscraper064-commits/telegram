@@ -12,7 +12,6 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, events, errors, functions
 from telethon.sessions import StringSession
 from telethon.tl.types import User, MessageActionChatAddUser, ChannelParticipantsAdmins
-# Remove MessageActionChatJoined from imports - it doesn't exist
 
 # --- 🛠️ 1. SETUP & CONFIGURATIONS ---
 logging.basicConfig(format='%(asctime)s - [%(levelname)s] - %(message)s', level=logging.INFO)
@@ -25,12 +24,12 @@ API_ID = 33239973
 API_HASH = "81430d577ca915f53c4b2827ba7c723f"
 
 TARGET_GROUP = "agriquizworld"
-ADMIN_USERNAME = "agrikrishna"
+ADMIN_USERNAME = "agrikrishna"  # Case-insensitive matching now
 SOURCE_CHANNELS = ["Dream_Agri", "AGLAERT", "afo2023interview", "Gen_Agriculture", "IBPSSO25"]
 COOLDOWN_HOURS = 36
 IST = pytz.timezone('Asia/Kolkata')
 
-# AI Client Setup (Python 3.14 Compatible)
+# AI Client Setup (Using gemini-1.5-pro for best results)
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 SPAM_REGEX = re.compile(r'crypto|casino|invest|bitcoin|fx|binance|betting|earn', re.IGNORECASE)
@@ -102,7 +101,10 @@ async def ai_auto_heal(error_message, account_id):
     try:
         prompt = f"A Telegram automation script got this error on account {account_id}: '{error_message}'. " \
                  f"If it's a flood/spam error, give safer limits. Reply strictly with three numbers separated by commas for max_adds,min_delay,max_delay e.g., '25,12,20'"
-        response = ai_client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
+        
+        # Using gemini-1.5-pro for best AI intelligence
+        response = ai_client.models.generate_content(model='gemini-1.5-pro', contents=prompt)
+        
         nums = re.findall(r'\d+', response.text)
         if len(nums) >= 3:
             new_max, new_min, new_max_d = int(nums[0]), int(nums[1]), int(nums[2])
@@ -123,11 +125,15 @@ def parse_proxy(proxy_str):
 async def is_blacklisted(user_id: int):
     return await master_blacklist.find_one({"user_id": user_id}) is not None
 
-# --- 🤖 4. CONVERSATIONAL ADMIN BOT ---
+# --- 🤖 4. CONVERSATIONAL ADMIN BOT (Case-Insensitive Fix) ---
 @admin_bot.on(events.NewMessage(incoming=True))
 async def admin_chat_handler(event):
     sender = await event.get_sender()
-    if not sender or sender.username != ADMIN_USERNAME:
+    if not sender or not sender.username:
+        return
+        
+    # 🔥 FIX: Case-insensitive check (Capital/Small letter problem solved)
+    if sender.username.lower() != ADMIN_USERNAME.lower():
         return
         
     text = event.raw_text.lower()
@@ -155,9 +161,10 @@ async def admin_chat_handler(event):
         await event.reply("▶️ System RESUMED successfully.")
         
     else:
+        # Best Active Gemini Model (gemini-1.5-pro) for top-tier intelligence
         response = ai_client.models.generate_content(
-            model='gemini-1.5-flash', 
-            contents=f"You are an AI manager of a Telegram automation system. The admin asked: {text}. Reply politely and concisely."
+            model='gemini-1.5-pro', 
+            contents=f"You are an expert AI manager of a Telegram automation system. The admin asked: {text}. Reply politely and concisely."
         )
         await event.reply(f"🤖 {response.text}")
 
@@ -190,15 +197,14 @@ async def harvester_task():
                 async for message in client.iter_messages(channel, limit=200):
                     users_to_check = []
                     
-                    # Handle different message types
+                    # Handle message actions properly
                     if message.action:
                         if isinstance(message.action, MessageActionChatAddUser):
                             users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [])
-                        # MessageActionChatJoined doesn't exist, skip it
                     elif message.sender:
                         users_to_check.append(message.sender)
                     
-                    # Poll Voters (View Votes extraction)
+                    # Poll Voters extraction
                     if message.poll and message.poll.public_voters:
                         try:
                             poll_votes = await client(functions.messages.GetPollVotesRequest(peer=channel, id=message.id, option=b'', limit=100))
