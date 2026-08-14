@@ -1,6 +1,7 @@
-fastapi
-uvicorn
-telethon
-motor
-python-dotenv
+fastapi==0.104.1
+uvicorn==0.24.0
+Telethon==1.32.1
+motor==3.3.1
+python-dotenv==1.0.0
 PySocks==1.7.1
+pytz==2023.3.post1
