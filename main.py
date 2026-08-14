@@ -357,7 +357,7 @@ async def harvester_task():
             
         await asyncio.sleep(300)
 
-# --- 💉 6. INJECTOR ENGINE (With Auto-Join & Live Logs) ---
+# --- 💉 6. INJECTOR ENGINE (With Entity Fix & Smart Counter) ---
 async def injector_task():
     logger.info("💉 Injector Engine Started...")
     while is_engine_running:
@@ -392,14 +392,13 @@ async def injector_task():
             try:
                 await client.connect()
                 
-                # 🛠️ 1. AUTO-JOIN LOGIC: Account khud target group join karega
+                # 🛠️ 1. AUTO-JOIN LOGIC
                 try:
                     await client(functions.channels.JoinChannelRequest(TARGET_GROUP))
                     logger.info(f"✅ Account {acc_id} auto-joined {TARGET_GROUP}")
                 except Exception as e:
                     logger.warning(f"Auto-join skipped (already member or error): {e}")
                 
-                # Entity resolve karna zaroori hai add karne ke liye
                 target_entity = await client.get_entity(TARGET_GROUP)
                 logger.info(f"🎯 Target entity resolved: {TARGET_GROUP}")
 
@@ -412,58 +411,88 @@ async def injector_task():
                         
                     user_id = user_doc['user_id']
                     user_name = user_doc.get('name', 'Unknown')
+                    tg_link = user_doc.get('tg_link', '')
                     
                     if await is_blacklisted(user_id):
                         logger.info(f"⏭️ User {user_id} already blacklisted. Skipping...")
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                         continue
                     
+                    # 🛠️ 2. ENTITY RESOLUTION FIX
+                    target_user = user_id
+                    if "https://t.me/" in tg_link:
+                        target_user = tg_link.replace("https://t.me/", "")
+                        logger.info(f"🔍 Extracted username: {target_user} from link")
+
+                    add_successful = False
+                    
                     try:
-                        # 🛠️ 2. ADD USER
-                        await client(functions.channels.InviteToChannelRequest(target_entity, [user_id]))
-                        logger.info(f"✅ SUCCESS: Added user {user_name} ({user_id}) directly to group!")
+                        # Pehle globally entity resolve karne ka try karo
+                        try:
+                            user_entity = await client.get_input_entity(target_user)
+                            logger.info(f"✅ Entity resolved for {target_user}")
+                        except Exception as e:
+                            logger.warning(f"Entity resolution failed, using fallback: {e}")
+                            user_entity = target_user
+                            
+                        # Ab add karo
+                        await client(functions.channels.InviteToChannelRequest(target_entity, [user_entity]))
+                        logger.info(f"✅ SUCCESS: Added user {user_name} ({user_id}) to group!")
+                        add_successful = True
                         
-                    except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError):
-                        logger.info(f"🔒 User privacy ON for {user_name} ({user_id}). Sending DM invitation...")
+                    except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError) as e:
+                        logger.info(f"🔒 Privacy ON for {user_name} ({user_id}). Sending DM...")
                         invite_msg = ("🌾 All Agriculture Students के लिए Important Group!\n"
                                       "📚 Agriculture Quiz, MCQs & Exam Updates के लिए अभी Join करें 👇\n"
                                       f"🔗 https://web.telegram.org/k/#@{TARGET_GROUP}\n"
                                       "👉 सभी Agriculture Students जरूर Join करें। 🌱")
                         try:
-                            await client.send_message(user_id, invite_msg)
+                            # Try sending DM with resolved entity or fallback
+                            try:
+                                await client.send_message(user_entity, invite_msg)
+                            except:
+                                await client.send_message(user_id, invite_msg)
                             logger.info(f"📨 DM Invitation sent to {user_name} ({user_id})")
+                            add_successful = True
                         except Exception as dm_err:
                             logger.error(f"❌ Failed to send DM to {user_id}: {dm_err}")
-                            
+                            add_successful = False
+                        
                     except errors.PeerFloodError:
                         logger.warning(f"🚫 Flood limit reached! Account {acc_id} going to cooling...")
-                        raise # Spam limit aa gayi toh account cooling me jayega
+                        raise
                         
                     except Exception as add_err:
-                        # 🚨 Ab agar fail hoga toh silent nahi rahega, log me dikhega
-                        logger.error(f"❌ Failed to process user {user_id}: {add_err}")
-                        # Error aane par bhi blacklist me daalna hai taki loop na ruke
-                        pass
+                        logger.error(f"❌ Failed to process user {user_name} ({user_id}): {add_err}")
+                        add_successful = False
 
-                    # Kaam hone ke baad blacklist me daalo aur queue se hatao
-                    await master_blacklist.insert_one({
-                        "user_id": user_id, 
-                        "name": user_name, 
-                        "tg_link": user_doc.get('tg_link', f"tg://user?id={user_id}")
-                    })
-                    await scraped_queue.delete_one({"_id": user_doc['_id']})
-                    daily_adds_count += 1
+                    # Database updates
+                    try:
+                        await master_blacklist.insert_one({
+                            "user_id": user_id, 
+                            "name": user_name, 
+                            "tg_link": tg_link
+                        })
+                        await scraped_queue.delete_one({"_id": user_doc['_id']})
+                    except Exception as db_err:
+                        logger.error(f"❌ Database error: {db_err}")
                     
-                    delay = random.randint(config.get("min_delay", 8), config.get("max_delay", 16))
-                    logger.info(f"⏳ Sleeping for {delay} seconds to act like human... (Added {daily_adds_count}/{config.get('max_adds', 35)})")
-                    await asyncio.sleep(delay)
+                    # 🚨 SMART COUNTER: Sirf tabhi count badhao jab sach me add/DM hua ho
+                    if add_successful:
+                        daily_adds_count += 1
+                        delay = random.randint(config.get("min_delay", 8), config.get("max_delay", 16))
+                        logger.info(f"⏳ Sleeping for {delay} seconds... (Added {daily_adds_count}/{config.get('max_adds', 35)})")
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.info(f"⏭️ Skipping delay for failed user {user_name}, moving to next instantly...")
+                        await asyncio.sleep(2)  # Fail hone par time waste nahi karega
 
                 if daily_adds_count >= config.get("max_adds", 35):
                     logger.info(f"📊 Account {acc_id} reached daily limit of {config.get('max_adds', 35)} adds")
                     raise errors.PeerFloodError(request=None)
 
             except errors.PeerFloodError as e:
-                logger.warning(f"❄️ Account {acc_id} reached Flood Limit. Going to Cooling.")
+                logger.warning(f"❄️ Account {acc_id} reached limit. Going to Cooling.")
                 cooldown_time = (datetime.now(pytz.utc) + timedelta(hours=COOLDOWN_HOURS)).timestamp()
                 await accounts_pool.update_one(
                     {"_id": account['_id']}, 
@@ -490,7 +519,7 @@ async def injector_task():
                         {"_id": account['_id']}, 
                         {"$set": {"status": "banned"}}
                     )
-                await asyncio.sleep(60) # Prevent infinite fast loop on error
+                await asyncio.sleep(60)
             finally:
                 try:
                     if client and client.is_connected(): 
@@ -543,7 +572,6 @@ async def health_check():
 
 @app.get("/logs")
 async def get_recent_logs():
-    """Get recent logs for debugging"""
     return {
         "message": "Check Render logs for live updates",
         "tip": "Logs are streaming to console"
