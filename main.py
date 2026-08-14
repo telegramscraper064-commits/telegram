@@ -6,7 +6,7 @@ import re
 import socks
 from datetime import datetime, timedelta
 import pytz
-from google import genai  # ✅ google-genai package ke liye yeh import sahi hai
+from google import genai
 from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, events, errors, functions
@@ -28,12 +28,11 @@ ADMIN_USERNAME = "agrikrishna"
 COOLDOWN_HOURS = 36
 IST = pytz.timezone('Asia/Kolkata')
 
-# --- 🧠 AI Client Setup (google-genai package) ---
+# --- 🧠 AI Client Setup ---
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # --- 🧠 ROBUST AI FALLBACK WRAPPER ---
 async def safe_generate_ai_response(prompt_text):
-    # Priority chain: Gemini 3.6 Flash -> Gemini 3.1 Pro -> Gemini 1.5 Flash
     models_chain = ['gemini-3.6-flash', 'gemini-3.1-pro', 'gemini-1.5-flash']
     
     for model_name in models_chain:
@@ -45,12 +44,11 @@ async def safe_generate_ai_response(prompt_text):
             if response and response.text:
                 return response.text
         except Exception as e:
-            logger.warning(f"Model {model_name} failed/busy: {e}. Switching to next model...")
+            logger.warning(f"Model {model_name} failed: {e}")
             continue
             
-    return "⚠️ All AI models are temporarily busy. Please try asking again in a few seconds!"
+    return "⚠️ All AI models are temporarily busy. Please try again in a few seconds!"
 
-# AI Auto-Healing with Fallback
 async def ai_auto_heal(error_message, account_id):
     try:
         prompt = f"A Telegram automation script got this error on account {account_id}: '{error_message}'. " \
@@ -254,7 +252,7 @@ async def admin_chat_handler(event):
             else:
                 await event.reply("⚠️ Please specify the group username to remove, e.g., 'Remove group @Dream_Agri'")
 
-        # 6. GENERAL AI ASSISTANT CHAT (Using Fallback Wrapper)
+        # 6. GENERAL AI ASSISTANT CHAT
         else:
             sources = await get_source_channels()
             system_prompt = (
@@ -271,167 +269,192 @@ async def admin_chat_handler(event):
         logger.error(f"Admin Chat Error: {e}")
         await event.reply(f"🤖 Assistant Error: {str(e)[:150]}")
 
-# --- 🌾 5. HARVESTER ENGINE ---
+# --- 🌾 5. HARVESTER ENGINE (100% Crash-Free) ---
 async def harvester_task():
     logger.info("🌾 Harvester Engine Started with Dynamic Sources...")
     while is_engine_running:
-        config = await get_system_config()
-        if config.get("is_paused"):
-            await asyncio.sleep(60)
-            continue
-            
-        cooling_acc = await accounts_pool.find_one({"status": "cooling"}) or await accounts_pool.find_one({"status": "ready"})
-        if not cooling_acc:
-            await asyncio.sleep(60)
-            continue
-
-        proxy_tuple = parse_proxy(cooling_acc.get("proxy"))
-        client = TelegramClient(StringSession(cooling_acc['session_string']), API_ID, API_HASH, proxy=proxy_tuple)
-        
         try:
-            await client.connect()
-            source_channels = await get_source_channels()
-            
-            for channel in source_channels:
-                try:
-                    admins = await client.get_participants(channel, filter=ChannelParticipantsAdmins)
-                    admin_ids = [a.id for a in admins]
-                except:
-                    admin_ids = []
+            config = await get_system_config()
+            if config.get("is_paused"):
+                await asyncio.sleep(60)
+                continue
                 
-                async for message in client.iter_messages(channel, limit=200):
-                    users_to_check = []
-                    
-                    if message.action:
-                        if isinstance(message.action, MessageActionChatAddUser):
-                            users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [])
-                    elif message.sender:
-                        users_to_check.append(message.sender)
-                    
-                    if message.poll and message.poll.public_voters:
-                        try:
-                            poll_votes = await client(functions.messages.GetPollVotesRequest(peer=channel, id=message.id, option=b'', limit=100))
-                            users_to_check.extend(poll_votes.users)
-                        except: 
-                            pass
+            cooling_acc = await accounts_pool.find_one({"status": "cooling"}) or await accounts_pool.find_one({"status": "ready"})
+            if not cooling_acc:
+                await asyncio.sleep(60)
+                continue
 
-                    for user in users_to_check:
-                        if not isinstance(user, User) or user.bot or user.deleted or user.id in admin_ids:
-                            continue
-                        
-                        full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
-                        if SPAM_REGEX.search(full_name):
-                            continue
+            proxy_tuple = parse_proxy(cooling_acc.get("proxy"))
+            client = TelegramClient(StringSession(cooling_acc['session_string']), API_ID, API_HASH, proxy=proxy_tuple)
+            
+            try:
+                await client.connect()
+                source_channels = await get_source_channels()
+                
+                for channel in source_channels:
+                    try:
+                        admins = await client.get_participants(channel, filter=ChannelParticipantsAdmins)
+                        admin_ids = [a.id for a in admins]
+                    except Exception as e:
+                        logger.warning(f"Could not fetch admins for {channel}: {e}")
+                        admin_ids = []
+                    
+                    try:
+                        async for message in client.iter_messages(channel, limit=200):
+                            users_to_check = []
                             
-                        if not await is_blacklisted(user.id) and not await scraped_queue.find_one({"user_id": user.id}):
-                            tg_link = f"https://t.me/{user.username}" if user.username else f"tg://user?id={user.id}"
-                            await scraped_queue.insert_one({
-                                "user_id": user.id, 
-                                "name": full_name or "Agri Student", 
-                                "tg_link": tg_link, 
-                                "status": "pending"
-                            })
-                await asyncio.sleep(15)
+                            try:
+                                if message.action:
+                                    if isinstance(message.action, MessageActionChatAddUser):
+                                        users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [])
+                                elif message.sender:
+                                    users_to_check.append(message.sender)
+                            except Exception as e:
+                                logger.warning(f"Error processing message action: {e}")
+                                continue
+
+                            for user in users_to_check:
+                                try:
+                                    if not isinstance(user, User) or user.bot or user.deleted or user.id in admin_ids:
+                                        continue
+                                    
+                                    full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
+                                    if SPAM_REGEX.search(full_name):
+                                        continue
+                                        
+                                    if not await is_blacklisted(user.id) and not await scraped_queue.find_one({"user_id": user.id}):
+                                        tg_link = f"https://t.me/{user.username}" if user.username else f"tg://user?id={user.id}"
+                                        await scraped_queue.insert_one({
+                                            "user_id": user.id, 
+                                            "name": full_name or "Agri Student", 
+                                            "tg_link": tg_link, 
+                                            "status": "pending"
+                                        })
+                                except Exception as e:
+                                    logger.warning(f"Error processing user: {e}")
+                                    continue
+                                    
+                    except Exception as e:
+                        logger.error(f"Error iterating messages in {channel}: {e}")
+                        
+                    await asyncio.sleep(15)
+                    
+            except Exception as e:
+                logger.error(f"Harvester connection error: {e}")
+            finally:
+                try:
+                    if client and client.is_connected(): 
+                        await client.disconnect()
+                except:
+                    pass
+                    
         except Exception as e:
-            logger.error(f"Harvester error: {e}")
-        finally:
-            if client.is_connected(): 
-                await client.disconnect()
+            logger.error(f"Harvester main loop error: {e}")
+            
         await asyncio.sleep(300)
 
 # --- 💉 6. INJECTOR ENGINE ---
 async def injector_task():
     logger.info("💉 Injector Engine Started...")
     while is_engine_running:
-        config = await get_system_config()
-        if not is_working_hour() or config.get("is_paused"):
-            await asyncio.sleep(600)
-            continue
-
-        now_ts = datetime.now(pytz.utc).timestamp()
-        await accounts_pool.update_many(
-            {"status": "cooling", "cooldown_until": {"$lt": now_ts}}, 
-            {"$set": {"status": "ready", "cooldown_until": 0}}
-        )
-
-        account = await accounts_pool.find_one({"status": "ready"})
-        if not account:
-            await asyncio.sleep(300)
-            continue
-            
-        acc_id = account['account_id']
-        client = TelegramClient(
-            StringSession(account['session_string']), 
-            API_ID, 
-            API_HASH, 
-            proxy=parse_proxy(account.get("proxy"))
-        )
-        
-        daily_adds_count = 0
         try:
-            await client.connect()
-            while daily_adds_count < config.get("max_adds", 35) and is_working_hour() and not config.get("is_paused"):
-                user_doc = await scraped_queue.find_one({"status": "pending"})
-                if not user_doc:
-                    await asyncio.sleep(60)
-                    break
-                    
-                user_id = user_doc['user_id']
-                if await is_blacklisted(user_id):
-                    await scraped_queue.delete_one({"_id": user_doc['_id']})
-                    continue
+            config = await get_system_config()
+            if not is_working_hour() or config.get("is_paused"):
+                await asyncio.sleep(600)
+                continue
+
+            now_ts = datetime.now(pytz.utc).timestamp()
+            await accounts_pool.update_many(
+                {"status": "cooling", "cooldown_until": {"$lt": now_ts}}, 
+                {"$set": {"status": "ready", "cooldown_until": 0}}
+            )
+
+            account = await accounts_pool.find_one({"status": "ready"})
+            if not account:
+                await asyncio.sleep(300)
+                continue
                 
-                try:
-                    await client(functions.channels.InviteToChannelRequest(TARGET_GROUP, [user_id]))
-                except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError):
-                    invite_msg = ("🌾 All Agriculture Students के लिए Important Group!\n"
-                                  "📚 Agriculture Quiz, MCQs & Exam Updates के लिए अभी Join करें 👇\n"
-                                  f"🔗 https://web.telegram.org/k/#@{TARGET_GROUP}\n"
-                                  "👉 सभी Agriculture Students जरूर Join करें। 🌱")
-                    await client.send_message(user_id, invite_msg)
-                except errors.PeerFloodError:
-                    raise
-
-                await master_blacklist.insert_one({
-                    "user_id": user_id, 
-                    "name": user_doc['name'], 
-                    "tg_link": user_doc['tg_link']
-                })
-                await scraped_queue.delete_one({"_id": user_doc['_id']})
-                daily_adds_count += 1
-                
-                await asyncio.sleep(random.randint(config.get("min_delay", 8), config.get("max_delay", 16)))
-
-            if daily_adds_count >= config.get("max_adds", 35):
-                raise errors.PeerFloodError(request=None)
-
-        except errors.PeerFloodError as e:
-            cooldown_time = (datetime.now(pytz.utc) + timedelta(hours=COOLDOWN_HOURS)).timestamp()
-            await accounts_pool.update_one(
-                {"_id": account['_id']}, 
-                {"$set": {"status": "cooling", "cooldown_until": cooldown_time}}
+            acc_id = account['account_id']
+            client = TelegramClient(
+                StringSession(account['session_string']), 
+                API_ID, 
+                API_HASH, 
+                proxy=parse_proxy(account.get("proxy"))
             )
             
-            ai_msg = await ai_auto_heal(str(e), acc_id)
-            if ai_msg:
-                try:
-                    await admin_bot.send_message(ADMIN_USERNAME, ai_msg)
-                except: 
-                    pass
-            
-        except Exception as e:
-            if "banned" in str(e).lower() or "deactivated" in str(e).lower():
-                try:
-                    await admin_bot.send_message(ADMIN_USERNAME, f"🚨 ID {acc_id} is permanently BANNED!")
-                except: 
-                    pass
+            daily_adds_count = 0
+            try:
+                await client.connect()
+                while daily_adds_count < config.get("max_adds", 35) and is_working_hour() and not config.get("is_paused"):
+                    user_doc = await scraped_queue.find_one({"status": "pending"})
+                    if not user_doc:
+                        await asyncio.sleep(60)
+                        break
+                        
+                    user_id = user_doc['user_id']
+                    if await is_blacklisted(user_id):
+                        await scraped_queue.delete_one({"_id": user_doc['_id']})
+                        continue
+                    
+                    try:
+                        await client(functions.channels.InviteToChannelRequest(TARGET_GROUP, [user_id]))
+                    except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError):
+                        invite_msg = ("🌾 All Agriculture Students के लिए Important Group!\n"
+                                      "📚 Agriculture Quiz, MCQs & Exam Updates के लिए अभी Join करें 👇\n"
+                                      f"🔗 https://web.telegram.org/k/#@{TARGET_GROUP}\n"
+                                      "👉 सभी Agriculture Students जरूर Join करें। 🌱")
+                        await client.send_message(user_id, invite_msg)
+                    except errors.PeerFloodError:
+                        raise
+
+                    await master_blacklist.insert_one({
+                        "user_id": user_id, 
+                        "name": user_doc['name'], 
+                        "tg_link": user_doc['tg_link']
+                    })
+                    await scraped_queue.delete_one({"_id": user_doc['_id']})
+                    daily_adds_count += 1
+                    
+                    await asyncio.sleep(random.randint(config.get("min_delay", 8), config.get("max_delay", 16)))
+
+                if daily_adds_count >= config.get("max_adds", 35):
+                    raise errors.PeerFloodError(request=None)
+
+            except errors.PeerFloodError as e:
+                cooldown_time = (datetime.now(pytz.utc) + timedelta(hours=COOLDOWN_HOURS)).timestamp()
                 await accounts_pool.update_one(
                     {"_id": account['_id']}, 
-                    {"$set": {"status": "banned"}}
+                    {"$set": {"status": "cooling", "cooldown_until": cooldown_time}}
                 )
-        finally:
-            if client.is_connected(): 
-                await client.disconnect()
+                
+                ai_msg = await ai_auto_heal(str(e), acc_id)
+                if ai_msg:
+                    try:
+                        await admin_bot.send_message(ADMIN_USERNAME, ai_msg)
+                    except: 
+                        pass
+                
+            except Exception as e:
+                if "banned" in str(e).lower() or "deactivated" in str(e).lower():
+                    try:
+                        await admin_bot.send_message(ADMIN_USERNAME, f"🚨 ID {acc_id} is permanently BANNED!")
+                    except: 
+                        pass
+                    await accounts_pool.update_one(
+                        {"_id": account['_id']}, 
+                        {"$set": {"status": "banned"}}
+                    )
+            finally:
+                try:
+                    if client and client.is_connected(): 
+                        await client.disconnect()
+                except:
+                    pass
+                    
+        except Exception as e:
+            logger.error(f"Injector main loop error: {e}")
+            
+        await asyncio.sleep(60)
 
 # --- 🚀 7. FASTAPI & LIFECYCLE ---
 app = FastAPI(title="Agri Mastermind AI Engine")
