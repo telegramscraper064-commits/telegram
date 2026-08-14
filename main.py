@@ -24,12 +24,15 @@ API_ID = 33239973
 API_HASH = "81430d577ca915f53c4b2827ba7c723f"
 
 TARGET_GROUP = "agriquizworld"
-ADMIN_USERNAME = "agrikrishna"  # Case-insensitive matching now
-SOURCE_CHANNELS = ["Dream_Agri", "AGLAERT", "afo2023interview", "Gen_Agriculture", "IBPSSO25"]
+ADMIN_USERNAME = "agrikrishna"  # Case-insensitive matching
 COOLDOWN_HOURS = 36
 IST = pytz.timezone('Asia/Kolkata')
 
-# AI Client Setup (Using gemini-1.5-pro for best results)
+# --- 🧠 AI Model Constants ---
+PRIMARY_AI_MODEL = 'gemini-3.6-flash'       # Main conversational & command management model
+LIGHT_AI_MODEL = 'gemini-3.1-flash-lite'     # Fast utility & auto-healing model
+
+# AI Client Setup
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 SPAM_REGEX = re.compile(r'crypto|casino|invest|bitcoin|fx|binance|betting|earn', re.IGNORECASE)
@@ -93,17 +96,40 @@ async def seed_accounts_if_empty():
 async def get_system_config():
     config = await system_config.find_one({"_id": "core_limits"})
     if not config:
-        config = {"_id": "core_limits", "max_adds": 35, "min_delay": 8, "max_delay": 16, "is_paused": False}
+        config = {
+            "_id": "core_limits", 
+            "max_adds": 35, 
+            "min_delay": 8, 
+            "max_delay": 16, 
+            "is_paused": False,
+            "source_channels": ["Dream_Agri", "AGLAERT", "afo2023interview", "Gen_Agriculture", "IBPSSO25"]
+        }
         await system_config.insert_one(config)
     return config
+
+# Helper to manage source channels dynamically in MongoDB
+async def get_source_channels():
+    config = await get_system_config()
+    if "source_channels" in config:
+        return config["source_channels"]
+    default_sources = ["Dream_Agri", "AGLAERT", "afo2023interview", "Gen_Agriculture", "IBPSSO25"]
+    await system_config.update_one(
+        {"_id": "core_limits"},
+        {"$set": {"source_channels": default_sources}},
+        upsert=True
+    )
+    return default_sources
 
 async def ai_auto_heal(error_message, account_id):
     try:
         prompt = f"A Telegram automation script got this error on account {account_id}: '{error_message}'. " \
                  f"If it's a flood/spam error, give safer limits. Reply strictly with three numbers separated by commas for max_adds,min_delay,max_delay e.g., '25,12,20'"
         
-        # Using gemini-1.5-pro for best AI intelligence
-        response = ai_client.models.generate_content(model='gemini-1.5-pro', contents=prompt)
+        # Using light model for faster healing
+        response = ai_client.models.generate_content(
+            model=LIGHT_AI_MODEL, 
+            contents=prompt
+        )
         
         nums = re.findall(r'\d+', response.text)
         if len(nums) >= 3:
@@ -125,52 +151,103 @@ def parse_proxy(proxy_str):
 async def is_blacklisted(user_id: int):
     return await master_blacklist.find_one({"user_id": user_id}) is not None
 
-# --- 🤖 4. CONVERSATIONAL ADMIN BOT (Case-Insensitive Fix) ---
+# --- 🤖 ADVANCED CONVERSATIONAL & COMMAND CENTER BOT ---
 @admin_bot.on(events.NewMessage(incoming=True))
 async def admin_chat_handler(event):
     sender = await event.get_sender()
     if not sender or not sender.username:
         return
         
-    # 🔥 FIX: Case-insensitive check (Capital/Small letter problem solved)
     if sender.username.lower() != ADMIN_USERNAME.lower():
         return
         
-    text = event.raw_text.lower()
+    text = event.raw_text.strip()
+    text_lower = text.lower()
     
-    if "status" in text or "kaisa chal" in text:
-        ready = await accounts_pool.count_documents({"status": "ready"})
-        cooling = await accounts_pool.count_documents({"status": "cooling"})
-        queue = await scraped_queue.count_documents({"status": "pending"})
-        total_added = await master_blacklist.count_documents({})
-        config = await get_system_config()
-        
-        reply = (f"📊 **System Status Report** 📊\n\n"
-                 f"✅ Total DB Students: {total_added}\n"
-                 f"📥 Pending Queue: {queue}\n"
-                 f"🟢 Ready IDs: {ready} | 🔴 Cooling IDs: {cooling}\n"
-                 f"⚙️ Active Limits: {config['max_adds']} max adds, {config['min_delay']}-{config['max_delay']}s delay.")
-        await event.reply(reply)
+    try:
+        # 1. STATUS & PERFORMANCE CHECK
+        if "status" in text_lower or "kaisa chal" in text_lower or "performance" in text_lower or "kaise chal" in text_lower:
+            ready = await accounts_pool.count_documents({"status": "ready"})
+            cooling = await accounts_pool.count_documents({"status": "cooling"})
+            queue = await scraped_queue.count_documents({"status": "pending"})
+            total_added = await master_blacklist.count_documents({})
+            config = await get_system_config()
+            sources = await get_source_channels()
+            
+            reply = (
+                f"📊 **System Performance & Status Report** 📊\n\n"
+                f"✅ **Total DB Students Added:** {total_added}\n"
+                f"📥 **Pending Queue:** {queue}\n"
+                f"🟢 **Ready IDs:** {ready} | 🔴 **Cooling IDs:** {cooling}\n"
+                f"⚙️ **Active Limits:** {config['max_adds']} max adds, {config['min_delay']}-{config['max_delay']}s delay.\n"
+                f"🎯 **Active Source Groups:** {', '.join(sources)}"
+            )
+            await event.reply(reply)
 
-    elif "pause" in text:
-        await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": True}})
-        await event.reply("🛑 System has been PAUSED.")
-        
-    elif "resume" in text or "start" in text:
-        await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": False}})
-        await event.reply("▶️ System RESUMED successfully.")
-        
-    else:
-        # Best Active Gemini Model (gemini-1.5-pro) for top-tier intelligence
-        response = ai_client.models.generate_content(
-            model='gemini-1.5-pro', 
-            contents=f"You are an expert AI manager of a Telegram automation system. The admin asked: {text}. Reply politely and concisely."
-        )
-        await event.reply(f"🤖 {response.text}")
+        # 2. PAUSE SYSTEM
+        elif "pause" in text_lower or "rok do" in text_lower:
+            await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": True}})
+            await event.reply("🛑 System has been securely **PAUSED** via chat command.")
+            
+        # 3. RESUME SYSTEM
+        elif "resume" in text_lower or "start" in text_lower or "chalu karo" in text_lower:
+            await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": False}})
+            await event.reply("▶️ System has been **RESUMED** successfully and is back to work.")
 
-# --- 🌾 5. THE HARVESTER ENGINE (Cooling/Idle IDs) ---
+        # 4. ADD NEW SOURCE GROUP (Dynamic Chat Command)
+        elif "add group" in text_lower or "group add" in text_lower or "jodo" in text_lower:
+            # Extract channel username/link from text using regex
+            match = re.search(r'[@]?([a-zA-Z0-9_]{5,})', text)
+            if match:
+                new_channel = match.group(1).replace('@', '')
+                sources = await get_source_channels()
+                if new_channel not in sources and new_channel.lower() not in ["add", "group", "to"]:
+                    sources.append(new_channel)
+                    await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
+                    await event.reply(f"✅ Success! Source group/channel **`@{new_channel}`** has been added to the harvesting queue.")
+                else:
+                    await event.reply(f"⚠️ Group `@{new_channel}` is already in the source list.")
+            else:
+                await event.reply("⚠️ Please specify a valid group username, e.g., 'Add group @agri_exam'")
+
+        # 5. REMOVE SOURCE GROUP (Dynamic Chat Command)
+        elif "remove group" in text_lower or "hatao" in text_lower or "delete group" in text_lower:
+            match = re.search(r'[@]?([a-zA-Z0-9_]{5,})', text)
+            if match:
+                target_channel = match.group(1).replace('@', '')
+                sources = await get_source_channels()
+                if target_channel in sources:
+                    sources.remove(target_channel)
+                    await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
+                    await event.reply(f"🗑️ Group **`@{target_channel}`** has been removed from the harvesting sources.")
+                else:
+                    await event.reply(f"⚠️ Group `@{target_channel}` was not found in the active source list.")
+            else:
+                await event.reply("⚠️ Please specify the group username you want to remove, e.g., 'Remove group @Dream_Agri'")
+
+        # 6. GENERAL AI ASSISTANT CONVERSATION & INTELLIGENT PARSING
+        else:
+            sources = await get_source_channels()
+            system_prompt = (
+                f"You are an expert AI personal assistant managing a high-performance Telegram automation and scraping system for agriculture students. "
+                f"Current system configuration: Active sources are {sources}. "
+                f"The admin asked: '{text}'. "
+                f"Reply politely, smartly, concisely, and professionally in Hinglish/Hindi as a dedicated technical assistant."
+            )
+            
+            response = ai_client.models.generate_content(
+                model=PRIMARY_AI_MODEL, 
+                contents=system_prompt
+            )
+            await event.reply(f"🤖 {response.text}")
+            
+    except Exception as e:
+        logger.error(f"Admin Chat Error: {e}")
+        await event.reply(f"🤖 Assistant Error detected: {str(e)[:150]}")
+
+# --- 🌾 5. THE HARVESTER ENGINE (Dynamic Sources) ---
 async def harvester_task():
-    logger.info("🌾 Harvester Engine Started...")
+    logger.info("🌾 Harvester Engine Started with Dynamic Sources...")
     while is_engine_running:
         config = await get_system_config()
         if config.get("is_paused"):
@@ -187,11 +264,15 @@ async def harvester_task():
         
         try:
             await client.connect()
-            for channel in SOURCE_CHANNELS:
+            # Get dynamic source channels
+            source_channels = await get_source_channels()
+            
+            for channel in source_channels:
                 try:
                     admins = await client.get_participants(channel, filter=ChannelParticipantsAdmins)
                     admin_ids = [a.id for a in admins]
-                except:
+                except Exception as e:
+                    logger.warning(f"Could not fetch admins for {channel}: {e}")
                     admin_ids = []
                 
                 async for message in client.iter_messages(channel, limit=200):
@@ -314,6 +395,7 @@ async def startup_event():
     is_engine_running = True
     
     await seed_accounts_if_empty()
+    await get_system_config()  # Initialize config with defaults
     
     try:
         await admin_bot.start(bot_token=BOT_TOKEN)
@@ -328,3 +410,15 @@ async def startup_event():
 @app.get("/")
 async def root():
     return {"status": "AI Mastermind Engine is Online and Fully Autonomous"}
+
+@app.get("/health")
+async def health_check():
+    config = await get_system_config()
+    sources = await get_source_channels()
+    return {
+        "status": "healthy",
+        "is_paused": config.get("is_paused", False),
+        "source_channels": sources,
+        "total_added": await master_blacklist.count_documents({}),
+        "pending_queue": await scraped_queue.count_documents({"status": "pending"})
+    }
