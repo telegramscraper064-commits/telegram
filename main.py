@@ -35,7 +35,7 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 SPAM_REGEX = re.compile(r'crypto|casino|invest|bitcoin|fx|binance|betting|earn', re.IGNORECASE)
 
 # Database Setup
-MONGO_URI = os.getenv('MONGO_URI', 'YOUR_MONGO_URI_HERE')
+MONGO_URI = os.getenv('MONGO_URI', 'mongodb+srv://mailforfulltest_db_user:1vmiEQA28y0ok4Fh@cluster0.k85vzmp.mongodb.net/?appName=Cluster0')
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client['telegram_scraper_safe']
 
