@@ -2,293 +2,317 @@ import os
 import asyncio
 import random
 import logging
-from datetime import datetime, timezone
+import re
+import socks
+from datetime import datetime, timedelta
+import pytz
 from dotenv import load_dotenv
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks
 from motor.motor_asyncio import AsyncIOMotorClient
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, functions
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import InviteToChannelRequest
-from telethon.tl.types import User  # 🔥 NEW: To verify real users
+from telethon.tl.types import User, MessageActionChatAddUser, MessageActionChatJoined, ChannelParticipantsAdmins
 
-# --- Setup Professional Logging ---
-logging.basicConfig(
-    format='%(asctime)s - [%(levelname)s] - %(message)s',
-    level=logging.INFO
-)
+# --- 🛠️ 1. SETUP & CONFIGURATIONS ---
+logging.basicConfig(format='%(asctime)s - [%(levelname)s] - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Load Environment Variables ---
 load_dotenv()
 
-# --- Configuration (Ultra Safe & Professional Mode) ---
-DAILY_LIMIT = 40               
-MAX_DMS_PER_DAY = 15           
-HISTORY_LIMIT = 500            
-MEMBER_GAP_MIN = 30            
-MEMBER_GAP_MAX = 60            
-BATCH_GAP = 120                
-MAX_RETRIES = 2                
-
-SOURCE_CHANNELS = [
-    "Dream_Agri",
-    "AGLAERT",
-    "afo2023interview",
-    "Gen_Agriculture",
-    "IBPSSO25"
-]
+# Variables
 TARGET_GROUP = "agriquizworld"
+SOURCE_CHANNELS = ["Dream_Agri", "AGLAERT", "afo2023interview", "Gen_Agriculture", "IBPSSO25"]
+ADMIN_REPORT_USERNAME = "agrikrishna"
+MAX_ADDS_PER_ID = 35           # 35 adds/DMs ke baad account cooling mein jayega
+COOLDOWN_HOURS = 36            # 36 Ghante ka cooling period
+IST = pytz.timezone('Asia/Kolkata')
 
-# ✉️ The Invite Message for Privacy-Restricted Users
-INVITE_MESSAGE = (
-    "Hello! 🌾\n\n"
-    "I noticed you are highly active and preparing for agriculture competitive exams. "
-    "We are building an active community for agriculture students to share "
-    "premium study materials and conduct daily live evaluation tests.\n\n"
-    "We would love to have you practice with us! Join here: @agriquizworld 📚🚜"
-)
+# Spam Filters
+SPAM_REGEX = re.compile(r'crypto|casino|invest|bitcoin|fx|binance|betting|earn', re.IGNORECASE)
 
-# --- Telegram API Credentials ---
-API_ID = int(os.getenv('API_ID', 0))
-API_HASH = os.getenv('API_HASH', '')
-SESSION_STRING = os.getenv('SESSION_STRING', '')
-
-# --- Database Initialization ---
+# Database
 MONGO_URI = os.getenv('MONGO_URI')
-if not MONGO_URI:
-    raise ValueError("❌ MONGO_URI not found!")
-
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client['telegram_scraper_safe']
 
-all_members = db['all_members']
-global_added = db['global_added']
-channel_status = db['channel_status']
-daily_stats = db['daily_stats']
+accounts_pool = db['accounts_pool']
+scraped_queue = db['scraped_queue']
+master_blacklist = db['global_added']  # Permanent list
+analytics_db = db['daily_analytics']
 
-scraping_lock = asyncio.Lock()
-is_scraping_running = False
+API_ID = int(os.getenv('API_ID', 33239973))
+API_HASH = os.getenv('API_HASH', '81430d577ca915f53c4b2827ba7c723f')
 
-# --- Core Async Helpers ---
-async def is_already_processed(user_id: int) -> bool:
-    return await global_added.find_one({"user_id": user_id}) is not None
+is_engine_running = False
+admin_cache = {} # To store group admins so we don't fetch repeatedly
 
-async def get_daily_stats(stat_type: str) -> int:
-    today = datetime.now(timezone.utc).date().isoformat()
-    stats = await daily_stats.find_one({"date": today})
-    return stats.get(stat_type, 0) if stats else 0
+# --- 🛡️ 2. UTILITY & SECURITY FUNCTIONS ---
+def get_ist_now():
+    return datetime.now(IST)
 
-async def increment_daily_stat(stat_type: str):
-    today = datetime.now(timezone.utc).date().isoformat()
-    await daily_stats.update_one(
-        {"date": today},
-        {"$inc": {stat_type: 1}, "$set": {"last_updated": datetime.now(timezone.utc)}},
-        upsert=True
-    )
+def is_working_hour():
+    """Checks if current time is between 9:00 AM and 10:00 PM IST"""
+    hour = get_ist_now().hour
+    return 9 <= hour < 22
 
-# --- The Advanced Chat History Scraper Engine ---
-async def scrape_and_add_safely(client: TelegramClient):
-    global is_scraping_running
-    
+def parse_proxy(proxy_str):
+    if not proxy_str: return None
+    p = proxy_str.split(':')
+    return (socks.SOCKS5, p[0], int(p[1]), True, p[2], p[3])
+
+async def is_blacklisted(user_id: int):
+    """Double Filter System - Checks if user is already processed"""
+    in_blacklist = await master_blacklist.find_one({"user_id": user_id})
+    return in_blacklist is not None
+
+async def send_sos_alert(client: TelegramClient, message: str):
+    """Sends Emergency/Daily alerts to @agrikrishna"""
     try:
-        today_adds = await get_daily_stats("adds")
-        today_dms = await get_daily_stats("dms")
-        
-        if today_adds >= DAILY_LIMIT and today_dms >= MAX_DMS_PER_DAY:
-            logger.warning(f"All daily limits reached (Adds: {today_adds}, DMs: {today_dms}). Hibernating.")
-            return
-        
-        for source_channel in SOURCE_CHANNELS:
-            status = await channel_status.find_one({"username": source_channel})
-            offset_id = status.get("last_offset_id", 0) if status else 0 
-            
-            logger.info(f"🔄 Reading chat history for target: {source_channel}")
-            extracted_users = {} 
-            
-            try:
-                async for message in client.iter_messages(source_channel, limit=HISTORY_LIMIT, offset_id=offset_id):
-                    if message.sender_id and message.sender:
-                        user = message.sender
-                        
-                        # 🔥 FIX 1: Ignore Bots and ensure sender is a real 'User' (Not a Channel)
-                        if not isinstance(user, User) or getattr(user, 'bot', False):
-                            continue
-                        
-                        # Store unique users based on sender ID
-                        if user.id not in extracted_users:
-                            extracted_users[user.id] = user
-                            
-                    offset_id = message.id 
-                
-                users_to_process = list(extracted_users.values())
-                logger.info(f"📦 Successfully extracted {len(users_to_process)} active users from {source_channel}'s history.")
-                
-                if not users_to_process:
-                    continue
-
-                for user in users_to_process:
-                    if (await get_daily_stats("adds") >= DAILY_LIMIT) and (await get_daily_stats("dms") >= MAX_DMS_PER_DAY):
-                        break
-
-                    if await is_already_processed(user.id):
-                        continue
-                    
-                    await all_members.insert_one({
-                        "user_id": user.id,
-                        "username": getattr(user, 'username', ""),
-                        "first_name": getattr(user, 'first_name', ""),
-                        "channel": source_channel,
-                        "scraped_at": datetime.now(timezone.utc)
-                    })
-                    
-                    handled = False
-                    current_adds = await get_daily_stats("adds")
-                    
-                    # 1️⃣ First Try: Add Directly to Group
-                    if current_adds < DAILY_LIMIT:
-                        for attempt in range(1, MAX_RETRIES + 1):
-                            try:
-                                await client(InviteToChannelRequest(TARGET_GROUP, [user.id]))
-                                await increment_daily_stat("adds")
-                                
-                                await global_added.insert_one({
-                                    "user_id": user.id,
-                                    "username": getattr(user, 'username', ""),
-                                    "added_at": datetime.now(timezone.utc),
-                                    "target_group": TARGET_GROUP,
-                                    "source_channel": source_channel,
-                                    "status": "added"
-                                })
-                                
-                                logger.info(f"✅ [ADD: {current_adds+1}/{DAILY_LIMIT}] Injected Active User: {getattr(user, 'first_name', user.id)}")
-                                handled = True
-                                break
-                                
-                            except errors.FloodWaitError as e:
-                                wait_time = e.seconds + random.randint(15, 30)
-                                logger.warning(f"⚠️ FloodWait (ADD). Cooling down {wait_time}s...")
-                                await asyncio.sleep(wait_time)
-                                
-                            except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError, errors.UserChannelsTooMuchError):
-                                logger.debug(f"🔒 Privacy restriction for {getattr(user, 'first_name', user.id)}. Switching to DM...")
-                                break 
-                                
-                            except Exception as e:
-                                logger.error(f"❌ Add Error for {user.id}: {str(e)}")
-                                await asyncio.sleep(random.randint(5, 10))
-                    
-                    # 2️⃣ Second Try: Send DM if Adding Failed
-                    if not handled:
-                        current_dms = await get_daily_stats("dms")
-                        if current_dms < MAX_DMS_PER_DAY:
-                            try:
-                                await client.send_message(user.id, INVITE_MESSAGE)
-                                await increment_daily_stat("dms")
-                                
-                                await global_added.insert_one({
-                                    "user_id": user.id,
-                                    "username": getattr(user, 'username', ""),
-                                    "added_at": datetime.now(timezone.utc),
-                                    "target_group": TARGET_GROUP,
-                                    "source_channel": source_channel,
-                                    "status": "dm_sent"
-                                })
-                                
-                                logger.info(f"✉️ [DM: {current_dms+1}/{MAX_DMS_PER_DAY}] Sent invite to {getattr(user, 'first_name', user.id)}")
-                                handled = True
-                                await asyncio.sleep(random.randint(45, 90)) 
-                                
-                            # 🔥 FIX 2: Proper DM FloodWait Handling
-                            except errors.FloodWaitError as e:
-                                wait_time = e.seconds + random.randint(30, 60)
-                                logger.warning(f"⚠️ Telegram Spam Filter (DM)! Pausing for {wait_time}s...")
-                                await asyncio.sleep(wait_time)
-                                handled = True # Stop trying this user
-                                
-                            except Exception as e:
-                                logger.error(f"❌ DM Error for {user.id}: {str(e)}")
-                                await global_added.insert_one({"user_id": user.id, "status": "failed_all"})
-                                handled = True
-                        else:
-                            logger.info(f"⏭️ Skipped {getattr(user, 'first_name', user.id)} - Daily DM limit reached.")
-
-                    if handled:
-                        stealth_gap = random.randint(MEMBER_GAP_MIN, MEMBER_GAP_MAX)
-                        await asyncio.sleep(stealth_gap)
-                
-                await channel_status.update_one(
-                    {"username": source_channel},
-                    {"$set": {"last_offset_id": offset_id, "status": "in_progress"}},
-                    upsert=True
-                )
-                
-                logger.info(f"⏳ Batch finalized. Cooldown phase for {BATCH_GAP}s...")
-                await asyncio.sleep(BATCH_GAP)
-                    
-            except errors.FloodWaitError as e:
-                critical_wait = e.seconds + random.randint(30, 60)
-                logger.critical(f"🛑 CRITICAL FLOOD WAIT! Halting for {critical_wait}s...")
-                await asyncio.sleep(critical_wait)
-            except Exception as e:
-                logger.error(f"💥 Fatal error while processing history of {source_channel}: {str(e)}")
-                await asyncio.sleep(30)
-                
-    finally:
-        is_scraping_running = False
-        logger.info("🏁 Chat History Scraper engine completed and unlocked.")
-        
-    return {"status": "completed", "today_adds": await get_daily_stats("adds"), "today_dms": await get_daily_stats("dms")}
-
-
-# --- Background Task Orchestrator ---
-async def run_scraper():
-    if not SESSION_STRING:
-        logger.critical("SESSION_STRING is missing! Authenticated access denied.")
-        return
-        
-    try:
-        logger.info("🔌 Establishing secure connection to Telegram servers...")
-        async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
-            await scrape_and_add_safely(client)
+        await client.send_message(ADMIN_REPORT_USERNAME, f"🚨 **System Alert** 🚨\n\n{message}")
     except Exception as e:
-        global is_scraping_running
-        is_scraping_running = False
-        logger.error(f"🔥 Session Connection Failure: {str(e)}")
+        logger.error(f"Failed to send SOS: {e}")
 
+# --- 🌾 3. THE HARVESTER ENGINE (Runs on Cooling IDs) ---
+async def fetch_group_admins(client, channel):
+    """Fetch and cache admins to ignore them"""
+    if channel not in admin_cache:
+        try:
+            admins = await client.get_participants(channel, filter=ChannelParticipantsAdmins)
+            admin_cache[channel] = [a.id for a in admins]
+        except:
+            admin_cache[channel] = []
+    return admin_cache[channel]
 
-# --- RESTful API Endpoints ---
-app = FastAPI(title="Nexus History Scraper Pro", version="4.1.0")
-
-@app.post("/start-scraping")
-async def start_scraping(background_tasks: BackgroundTasks):
-    global is_scraping_running
+async def harvester_task():
+    """Runs continuously using IDs that are in Cooling Mode"""
+    logger.info("🌾 Harvester Engine Started...")
     
-    async with scraping_lock:
-        if is_scraping_running:
-            raise HTTPException(status_code=409, detail="A scraping instance is already active.")
-        is_scraping_running = True
+    while is_engine_running:
+        # Find an account that is currently in 'cooling'
+        cooling_acc = await accounts_pool.find_one({"status": "cooling"})
         
-    background_tasks.add_task(run_scraper)
-    logger.info("🚀 API Request: History Scraping sequence initiated.")
-    
-    return {
-        "status": "active",
-        "message": "Chat history scraping protocol deployed.",
-        "config": {
-            "daily_adds_limit": DAILY_LIMIT,
-            "daily_dms_limit": MAX_DMS_PER_DAY
-        }
-    }
+        # If no cooling account, use any ready account temporarily for reading
+        if not cooling_acc:
+            cooling_acc = await accounts_pool.find_one({"status": "ready"})
+            
+        if not cooling_acc:
+            await asyncio.sleep(60)
+            continue
 
-@app.get("/status")
-async def get_status():
-    return {
-        "system_status": "ONLINE",
-        "engine_running": is_scraping_running,
-        "metrics": {
-            "adds_today": await get_daily_stats("adds"),
-            "dms_today": await get_daily_stats("dms"),
-            "daily_add_quota": DAILY_LIMIT,
-            "daily_dm_quota": MAX_DMS_PER_DAY
-        }
-    }
+        proxy_tuple = parse_proxy(cooling_acc.get("proxy"))
+        client = TelegramClient(StringSession(cooling_acc['session_string']), API_ID, API_HASH, proxy=proxy_tuple)
+        
+        try:
+            await client.connect()
+            
+            for channel in SOURCE_CHANNELS:
+                logger.info(f"🔍 Harvesting in {channel} backwards...")
+                admins = await fetch_group_admins(client, channel)
+                extracted_count = 0
+                
+                # Reverse Reading: Get latest 200 messages
+                async for message in client.iter_messages(channel, limit=200):
+                    users_to_check = []
+
+                    # 1. New Joiners
+                    if isinstance(message.action, (MessageActionChatAddUser, MessageActionChatJoined)):
+                        users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [message.sender])
+                    
+                    # 2. Chatters
+                    elif message.sender:
+                        users_to_check.append(message.sender)
+                    
+                    # 3. Poll Voters (View Votes logic)
+                    if message.poll and message.poll.public_voters:
+                        try:
+                            # Gets users who voted in public polls
+                            poll_votes = await client(functions.messages.GetPollVotesRequest(
+                                peer=channel, id=message.id, option=b'', limit=100
+                            ))
+                            users_to_check.extend(poll_votes.users)
+                        except Exception:
+                            pass
+
+                    # Process found users
+                    for user in users_to_check:
+                        if not isinstance(user, User) or user.bot or user.deleted:
+                            continue
+                        if user.id in admins:
+                            continue # Skip Competitor Admins
+                        
+                        full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
+                        
+                        # Spam Quality Check
+                        if SPAM_REGEX.search(full_name):
+                            continue
+                            
+                        # Double Filter: Not in blacklist, not in queue
+                        if not await is_blacklisted(user.id) and not await scraped_queue.find_one({"user_id": user.id}):
+                            username = getattr(user, 'username', None)
+                            tg_link = f"https://t.me/{username}" if username else f"tg://user?id={user.id}"
+                            
+                            await scraped_queue.insert_one({
+                                "user_id": user.id,
+                                "name": full_name or "Agri Student",
+                                "tg_link": tg_link,
+                                "source": channel,
+                                "status": "pending",
+                                "date_scraped": get_ist_now()
+                            })
+                            extracted_count += 1
+                
+                logger.info(f"✅ Extracted {extracted_count} pure students from {channel}")
+                await asyncio.sleep(15) # Safe gap between channels
+                
+        except Exception as e:
+            logger.error(f"Harvester error: {e}")
+        finally:
+            if client.is_connected():
+                await client.disconnect()
+                
+        await asyncio.sleep(300) # Loop every 5 mins
+
+# --- 💉 4. THE INJECTOR ENGINE (Runs on Ready IDs during Daytime) ---
+async def injector_task():
+    logger.info("💉 Injector Engine Started...")
+    
+    while is_engine_running:
+        if not is_working_hour():
+            logger.info("🌙 Night Time (10PM - 9AM). Injector sleeping. Harvester is still working.")
+            await asyncio.sleep(1800) # Check every 30 mins
+            continue
+
+        # Check for cooled down accounts and make them ready
+        now_ts = datetime.now(pytz.utc).timestamp()
+        await accounts_pool.update_many(
+            {"status": "cooling", "cooldown_until": {"$lt": now_ts}},
+            {"$set": {"status": "ready", "cooldown_until": 0}}
+        )
+
+        account = await accounts_pool.find_one({"status": "ready"})
+        if not account:
+            logger.warning("💤 All IDs are cooling. Waiting...")
+            await asyncio.sleep(600)
+            continue
+            
+        acc_id = account['account_id']
+        proxy_tuple = parse_proxy(account.get("proxy"))
+        client = TelegramClient(StringSession(account['session_string']), API_ID, API_HASH, proxy=proxy_tuple)
+        
+        daily_adds_count = 0
+        try:
+            await client.connect()
+            
+            while daily_adds_count < MAX_ADDS_PER_ID and is_working_hour():
+                user_doc = await scraped_queue.find_one({"status": "pending"})
+                if not user_doc:
+                    await asyncio.sleep(60) # Wait for Harvester to fetch
+                    break
+                    
+                user_id = user_doc['user_id']
+                
+                # Double Filter (Right before adding)
+                if await is_blacklisted(user_id):
+                    await scraped_queue.delete_one({"_id": user_doc['_id']})
+                    continue
+                
+                try:
+                    # 1. Try Direct Add
+                    await client(functions.channels.InviteToChannelRequest(TARGET_GROUP, [user_id]))
+                    logger.info(f"✅ [{acc_id}] Added: {user_doc['name']}")
+                    
+                except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError):
+                    # 2. Privacy Fallback: Professional DM
+                    logger.info(f"🔒 [{acc_id}] Privacy on {user_doc['name']}. Sending DM...")
+                    invite_msg = (
+                        "🌾 All Agriculture Students के लिए Important Group!\n"
+                        "📚 Agriculture Quiz, MCQs & Exam Updates के लिए अभी Join करें 👇\n"
+                        f"🔗 https://web.telegram.org/k/#@{TARGET_GROUP}\n"
+                        "👉 सभी Agriculture Students जरूर Join करें। 🌱"
+                    )
+                    await client.send_message(user_id, invite_msg)
+                    
+                except errors.PeerFloodError:
+                    raise # Go to exception block to trigger Cooling
+
+                # Mark as processed permanently
+                await master_blacklist.insert_one({
+                    "user_id": user_id, 
+                    "name": user_doc['name'],
+                    "tg_link": user_doc['tg_link'],
+                    "processed_by": acc_id, 
+                    "date": get_ist_now()
+                })
+                await scraped_queue.delete_one({"_id": user_doc['_id']})
+                daily_adds_count += 1
+                
+                # ⏳ Dynamic Human Delay (8 to 16 seconds)
+                await asyncio.sleep(random.randint(8, 16))
+
+            # If it reached 35 limit safely
+            if daily_adds_count >= MAX_ADDS_PER_ID:
+                raise errors.PeerFloodError(request=None)
+
+        except errors.PeerFloodError:
+            cooldown_time = (datetime.now(pytz.utc) + timedelta(hours=COOLDOWN_HOURS)).timestamp()
+            await accounts_pool.update_one(
+                {"_id": account['_id']}, 
+                {"$set": {"status": "cooling", "cooldown_until": cooldown_time}}
+            )
+            logger.critical(f"🛑 LIMIT/FLOOD for {acc_id}! Cooling for {COOLDOWN_HOURS}h.")
+            
+        except Exception as e:
+            if "banned" in str(e).lower() or "deactivated" in str(e).lower():
+                await send_sos_alert(client, f"ID {acc_id} is PERMANENTLY BANNED. Please Check!")
+                await accounts_pool.update_one({"_id": account['_id']}, {"$set": {"status": "banned"}})
+            logger.error(f"Error on {acc_id}: {e}")
+            
+        finally:
+            if client.is_connected():
+                await client.disconnect()
+
+# --- 📊 5. DAILY ANALYTICS SCHEDULER ---
+async def daily_reporter():
+    """Sends report at 10 PM IST daily"""
+    while is_engine_running:
+        now = get_ist_now()
+        if now.hour == 22 and now.minute < 5: # Around 10:00 PM
+            ready = await accounts_pool.count_documents({"status": "ready"})
+            cooling = await accounts_pool.count_documents({"status": "cooling"})
+            queue = await scraped_queue.count_documents({"status": "pending"})
+            total_added = await master_blacklist.count_documents({})
+            
+            report = (
+                f"📊 **Daily Analytics Report** 📊\n\n"
+                f"✅ **Total Students in Master DB:** {total_added}\n"
+                f"📥 **Pending in Queue:** {queue}\n"
+                f"🟢 **Active IDs:** {ready}\n"
+                f"🔴 **Cooling IDs:** {cooling}\n\n"
+                f"Great work today! The Harvester is taking over for the night. 🌙"
+            )
+            
+            acc = await accounts_pool.find_one({"status": {"$in": ["ready", "cooling"]}})
+            if acc:
+                client = TelegramClient(StringSession(acc['session_string']), API_ID, API_HASH, proxy=parse_proxy(acc.get("proxy")))
+                await client.connect()
+                await send_sos_alert(client, report)
+                await client.disconnect()
+                
+            await asyncio.sleep(3600) # Sleep for an hour so it doesn't trigger again
+        await asyncio.sleep(60)
+
+# --- 🚀 6. FASTAPI WEBSERVER ---
+app = FastAPI(title="Agri Mastermind Engine")
+
+@app.on_event("startup")
+async def startup_event():
+    global is_engine_running
+    is_engine_running = True
+    asyncio.create_task(harvester_task())
+    asyncio.create_task(injector_task())
+    asyncio.create_task(daily_reporter())
+    logger.info("✅ All Engines Fired Up Successfully!")
+
+@app.get("/")
+async def root():
+    return {"status": "Mastermind Engine is Active and Running 24/7"}
