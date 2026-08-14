@@ -14,7 +14,10 @@ from telethon.sessions import StringSession
 from telethon.tl.types import User, MessageActionChatAddUser, ChannelParticipantsAdmins
 
 # --- 🛠️ 1. SETUP & CONFIGURATIONS ---
-logging.basicConfig(format='%(asctime)s - [%(levelname)s] - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - [%(levelname)s] - %(message)s', 
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 # Credentials & Core Constants
@@ -330,6 +333,7 @@ async def harvester_task():
                                             "tg_link": tg_link, 
                                             "status": "pending"
                                         })
+                                        logger.info(f"🌾 Added {full_name} to queue")
                                 except Exception as e:
                                     logger.warning(f"Error processing user: {e}")
                                     continue
@@ -353,14 +357,14 @@ async def harvester_task():
             
         await asyncio.sleep(300)
 
-# --- 💉 6. INJECTOR ENGINE ---
+# --- 💉 6. INJECTOR ENGINE (With Auto-Join & Live Logs) ---
 async def injector_task():
     logger.info("💉 Injector Engine Started...")
     while is_engine_running:
         try:
             config = await get_system_config()
             if not is_working_hour() or config.get("is_paused"):
-                await asyncio.sleep(600)
+                await asyncio.sleep(60)
                 continue
 
             now_ts = datetime.now(pytz.utc).timestamp()
@@ -371,10 +375,12 @@ async def injector_task():
 
             account = await accounts_pool.find_one({"status": "ready"})
             if not account:
-                await asyncio.sleep(300)
+                await asyncio.sleep(60)
                 continue
                 
             acc_id = account['account_id']
+            logger.info(f"🔄 Using account: {acc_id}")
+            
             client = TelegramClient(
                 StringSession(account['session_string']), 
                 API_ID, 
@@ -385,42 +391,79 @@ async def injector_task():
             daily_adds_count = 0
             try:
                 await client.connect()
+                
+                # 🛠️ 1. AUTO-JOIN LOGIC: Account khud target group join karega
+                try:
+                    await client(functions.channels.JoinChannelRequest(TARGET_GROUP))
+                    logger.info(f"✅ Account {acc_id} auto-joined {TARGET_GROUP}")
+                except Exception as e:
+                    logger.warning(f"Auto-join skipped (already member or error): {e}")
+                
+                # Entity resolve karna zaroori hai add karne ke liye
+                target_entity = await client.get_entity(TARGET_GROUP)
+                logger.info(f"🎯 Target entity resolved: {TARGET_GROUP}")
+
                 while daily_adds_count < config.get("max_adds", 35) and is_working_hour() and not config.get("is_paused"):
                     user_doc = await scraped_queue.find_one({"status": "pending"})
                     if not user_doc:
+                        logger.info("📭 No pending users in queue. Waiting...")
                         await asyncio.sleep(60)
                         break
                         
                     user_id = user_doc['user_id']
+                    user_name = user_doc.get('name', 'Unknown')
+                    
                     if await is_blacklisted(user_id):
+                        logger.info(f"⏭️ User {user_id} already blacklisted. Skipping...")
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                         continue
                     
                     try:
-                        await client(functions.channels.InviteToChannelRequest(TARGET_GROUP, [user_id]))
+                        # 🛠️ 2. ADD USER
+                        await client(functions.channels.InviteToChannelRequest(target_entity, [user_id]))
+                        logger.info(f"✅ SUCCESS: Added user {user_name} ({user_id}) directly to group!")
+                        
                     except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError):
+                        logger.info(f"🔒 User privacy ON for {user_name} ({user_id}). Sending DM invitation...")
                         invite_msg = ("🌾 All Agriculture Students के लिए Important Group!\n"
                                       "📚 Agriculture Quiz, MCQs & Exam Updates के लिए अभी Join करें 👇\n"
                                       f"🔗 https://web.telegram.org/k/#@{TARGET_GROUP}\n"
                                       "👉 सभी Agriculture Students जरूर Join करें। 🌱")
-                        await client.send_message(user_id, invite_msg)
+                        try:
+                            await client.send_message(user_id, invite_msg)
+                            logger.info(f"📨 DM Invitation sent to {user_name} ({user_id})")
+                        except Exception as dm_err:
+                            logger.error(f"❌ Failed to send DM to {user_id}: {dm_err}")
+                            
                     except errors.PeerFloodError:
-                        raise
+                        logger.warning(f"🚫 Flood limit reached! Account {acc_id} going to cooling...")
+                        raise # Spam limit aa gayi toh account cooling me jayega
+                        
+                    except Exception as add_err:
+                        # 🚨 Ab agar fail hoga toh silent nahi rahega, log me dikhega
+                        logger.error(f"❌ Failed to process user {user_id}: {add_err}")
+                        # Error aane par bhi blacklist me daalna hai taki loop na ruke
+                        pass
 
+                    # Kaam hone ke baad blacklist me daalo aur queue se hatao
                     await master_blacklist.insert_one({
                         "user_id": user_id, 
-                        "name": user_doc['name'], 
-                        "tg_link": user_doc['tg_link']
+                        "name": user_name, 
+                        "tg_link": user_doc.get('tg_link', f"tg://user?id={user_id}")
                     })
                     await scraped_queue.delete_one({"_id": user_doc['_id']})
                     daily_adds_count += 1
                     
-                    await asyncio.sleep(random.randint(config.get("min_delay", 8), config.get("max_delay", 16)))
+                    delay = random.randint(config.get("min_delay", 8), config.get("max_delay", 16))
+                    logger.info(f"⏳ Sleeping for {delay} seconds to act like human... (Added {daily_adds_count}/{config.get('max_adds', 35)})")
+                    await asyncio.sleep(delay)
 
                 if daily_adds_count >= config.get("max_adds", 35):
+                    logger.info(f"📊 Account {acc_id} reached daily limit of {config.get('max_adds', 35)} adds")
                     raise errors.PeerFloodError(request=None)
 
             except errors.PeerFloodError as e:
+                logger.warning(f"❄️ Account {acc_id} reached Flood Limit. Going to Cooling.")
                 cooldown_time = (datetime.now(pytz.utc) + timedelta(hours=COOLDOWN_HOURS)).timestamp()
                 await accounts_pool.update_one(
                     {"_id": account['_id']}, 
@@ -431,23 +474,28 @@ async def injector_task():
                 if ai_msg:
                     try:
                         await admin_bot.send_message(ADMIN_USERNAME, ai_msg)
+                        logger.info(f"🤖 AI Healing message sent to admin")
                     except: 
                         pass
                 
             except Exception as e:
+                logger.error(f"🚨 Injector Fatal Error on ID {acc_id}: {e}")
                 if "banned" in str(e).lower() or "deactivated" in str(e).lower():
                     try:
                         await admin_bot.send_message(ADMIN_USERNAME, f"🚨 ID {acc_id} is permanently BANNED!")
+                        logger.info(f"⚠️ Banned account {acc_id} reported to admin")
                     except: 
                         pass
                     await accounts_pool.update_one(
                         {"_id": account['_id']}, 
                         {"$set": {"status": "banned"}}
                     )
+                await asyncio.sleep(60) # Prevent infinite fast loop on error
             finally:
                 try:
                     if client and client.is_connected(): 
                         await client.disconnect()
+                        logger.info(f"🔌 Disconnected account {acc_id}")
                 except:
                     pass
                     
@@ -491,4 +539,12 @@ async def health_check():
         "source_channels": sources,
         "total_added": await master_blacklist.count_documents({}),
         "pending_queue": await scraped_queue.count_documents({"status": "pending"})
+    }
+
+@app.get("/logs")
+async def get_recent_logs():
+    """Get recent logs for debugging"""
+    return {
+        "message": "Check Render logs for live updates",
+        "tip": "Logs are streaming to console"
     }
