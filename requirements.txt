@@ -3,3 +3,4 @@ uvicorn
 telethon
 motor
 python-dotenv
+PySocks==1.7.1
