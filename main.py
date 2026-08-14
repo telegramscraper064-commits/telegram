@@ -6,7 +6,7 @@ import re
 import socks
 from datetime import datetime, timedelta
 import pytz
-from google import genai
+import google.generativeai as genai
 from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, events, errors, functions
@@ -24,16 +24,58 @@ API_ID = 33239973
 API_HASH = "81430d577ca915f53c4b2827ba7c723f"
 
 TARGET_GROUP = "agriquizworld"
-ADMIN_USERNAME = "agrikrishna"  # Case-insensitive matching
+ADMIN_USERNAME = "agrikrishna"
 COOLDOWN_HOURS = 36
 IST = pytz.timezone('Asia/Kolkata')
 
-# --- 🧠 AI Model Constants ---
-PRIMARY_AI_MODEL = 'gemini-3.6-flash'       # Main conversational & command management model
-LIGHT_AI_MODEL = 'gemini-3.1-flash-lite'     # Fast utility & auto-healing model
+# --- 🧠 AI Configuration ---
+genai.configure(api_key=GEMINI_API_KEY)
 
-# AI Client Setup
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+# --- 🧠 ROBUST AI FALLBACK WRAPPER (Gemini 3.6 Flash & Gemini 3.1 Pro) ---
+async def safe_generate_ai_response(prompt_text):
+    # Priority chain: Pehle Gemini 3.6 Flash try karega, fir Gemini 3.1 Pro, aur backup ke liye 1.5 Flash
+    models_chain = ['gemini-3.6-flash', 'gemini-3.1-pro', 'gemini-1.5-flash']
+    
+    for model_name in models_chain:
+        try:
+            # Using the correct Google Generative AI API
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt_text)
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            logger.warning(f"Model {model_name} failed/busy: {e}. Switching to next model...")
+            continue
+            
+    return "⚠️ All AI models are temporarily busy. Please try asking again in a few seconds!"
+
+# AI Auto-Healing with Fallback
+async def ai_auto_heal(error_message, account_id):
+    try:
+        prompt = f"A Telegram automation script got this error on account {account_id}: '{error_message}'. " \
+                 f"If it's a flood/spam error, give safer limits. Reply strictly with three numbers separated by commas for max_adds,min_delay,max_delay e.g., '25,12,20'"
+        
+        # Use light model for healing (faster response)
+        healing_models = ['gemini-3.1-flash-lite', 'gemini-1.5-flash']
+        
+        for model_name in healing_models:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt)
+                if response and response.text:
+                    nums = re.findall(r'\d+', response.text)
+                    if len(nums) >= 3:
+                        new_max, new_min, new_max_d = int(nums[0]), int(nums[1]), int(nums[2])
+                        await system_config.update_one({"_id": "core_limits"}, {"$set": {"max_adds": new_max, "min_delay": new_min, "max_delay": new_max_d}})
+                        return f"🤖 AI Self-Healing Triggered: Limits updated to {new_max} adds, {new_min}-{new_max_d}s delay."
+                    break
+            except Exception as e:
+                logger.warning(f"Healing model {model_name} failed: {e}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"AI Healing failed: {e}")
+    return None
 
 SPAM_REGEX = re.compile(r'crypto|casino|invest|bitcoin|fx|binance|betting|earn', re.IGNORECASE)
 
@@ -53,7 +95,7 @@ admin_cache = {}
 # Initialize Admin Bot Client
 admin_bot = TelegramClient('admin_bot_session', API_ID, API_HASH)
 
-# --- 🔄 2. SEED ACCOUNTS POOL (Auto-Initialization) ---
+# --- 🔄 2. SEED ACCOUNTS POOL ---
 async def seed_accounts_if_empty():
     count = await accounts_pool.count_documents({})
     if count == 0:
@@ -92,7 +134,7 @@ async def seed_accounts_if_empty():
         await accounts_pool.insert_many(initial_accounts)
         logger.info("✅ Successfully seeded 5 accounts into MongoDB pool.")
 
-# --- 🧠 3. AI SELF-HEALING & CONFIG UTILITIES ---
+# --- 🧠 3. SYSTEM CONFIG UTILITIES ---
 async def get_system_config():
     config = await system_config.find_one({"_id": "core_limits"})
     if not config:
@@ -107,7 +149,6 @@ async def get_system_config():
         await system_config.insert_one(config)
     return config
 
-# Helper to manage source channels dynamically in MongoDB
 async def get_source_channels():
     config = await get_system_config()
     if "source_channels" in config:
@@ -119,26 +160,6 @@ async def get_source_channels():
         upsert=True
     )
     return default_sources
-
-async def ai_auto_heal(error_message, account_id):
-    try:
-        prompt = f"A Telegram automation script got this error on account {account_id}: '{error_message}'. " \
-                 f"If it's a flood/spam error, give safer limits. Reply strictly with three numbers separated by commas for max_adds,min_delay,max_delay e.g., '25,12,20'"
-        
-        # Using light model for faster healing
-        response = ai_client.models.generate_content(
-            model=LIGHT_AI_MODEL, 
-            contents=prompt
-        )
-        
-        nums = re.findall(r'\d+', response.text)
-        if len(nums) >= 3:
-            new_max, new_min, new_max_d = int(nums[0]), int(nums[1]), int(nums[2])
-            await system_config.update_one({"_id": "core_limits"}, {"$set": {"max_adds": new_max, "min_delay": new_min, "max_delay": new_max_d}})
-            return f"🤖 AI Self-Healing Triggered: Limits updated to {new_max} adds, {new_min}-{new_max_d}s delay."
-    except Exception as e:
-        logger.error(f"AI Healing failed: {e}")
-    return None
 
 def get_ist_now(): return datetime.now(IST)
 def is_working_hour(): return 9 <= get_ist_now().hour < 22
@@ -192,11 +213,10 @@ async def admin_chat_handler(event):
         # 3. RESUME SYSTEM
         elif "resume" in text_lower or "start" in text_lower or "chalu karo" in text_lower:
             await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": False}})
-            await event.reply("▶️ System has been **RESUMED** successfully and is back to work.")
+            await event.reply("▶️ System has been **RESUMED** successfully.")
 
-        # 4. ADD NEW SOURCE GROUP (Dynamic Chat Command)
+        # 4. ADD NEW SOURCE GROUP
         elif "add group" in text_lower or "group add" in text_lower or "jodo" in text_lower:
-            # Extract channel username/link from text using regex
             match = re.search(r'[@]?([a-zA-Z0-9_]{5,})', text)
             if match:
                 new_channel = match.group(1).replace('@', '')
@@ -204,13 +224,13 @@ async def admin_chat_handler(event):
                 if new_channel not in sources and new_channel.lower() not in ["add", "group", "to"]:
                     sources.append(new_channel)
                     await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
-                    await event.reply(f"✅ Success! Source group/channel **`@{new_channel}`** has been added to the harvesting queue.")
+                    await event.reply(f"✅ Success! Source group/channel **`@{new_channel}`** has been added.")
                 else:
                     await event.reply(f"⚠️ Group `@{new_channel}` is already in the source list.")
             else:
                 await event.reply("⚠️ Please specify a valid group username, e.g., 'Add group @agri_exam'")
 
-        # 5. REMOVE SOURCE GROUP (Dynamic Chat Command)
+        # 5. REMOVE SOURCE GROUP
         elif "remove group" in text_lower or "hatao" in text_lower or "delete group" in text_lower:
             match = re.search(r'[@]?([a-zA-Z0-9_]{5,})', text)
             if match:
@@ -219,33 +239,30 @@ async def admin_chat_handler(event):
                 if target_channel in sources:
                     sources.remove(target_channel)
                     await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
-                    await event.reply(f"🗑️ Group **`@{target_channel}`** has been removed from the harvesting sources.")
+                    await event.reply(f"🗑️ Group **`@{target_channel}`** has been removed.")
                 else:
-                    await event.reply(f"⚠️ Group `@{target_channel}` was not found in the active source list.")
+                    await event.reply(f"⚠️ Group `@{target_channel}` was not found.")
             else:
-                await event.reply("⚠️ Please specify the group username you want to remove, e.g., 'Remove group @Dream_Agri'")
+                await event.reply("⚠️ Please specify the group username to remove, e.g., 'Remove group @Dream_Agri'")
 
-        # 6. GENERAL AI ASSISTANT CONVERSATION & INTELLIGENT PARSING
+        # 6. GENERAL AI ASSISTANT CHAT (Using Fallback Wrapper)
         else:
             sources = await get_source_channels()
             system_prompt = (
-                f"You are an expert AI personal assistant managing a high-performance Telegram automation and scraping system for agriculture students. "
-                f"Current system configuration: Active sources are {sources}. "
+                f"You are an expert AI personal assistant managing a high-performance Telegram automation system for agriculture students. "
+                f"Active sources are {sources}. "
                 f"The admin asked: '{text}'. "
-                f"Reply politely, smartly, concisely, and professionally in Hinglish/Hindi as a dedicated technical assistant."
+                f"Reply politely, smartly, and concisely in Hinglish/Hindi."
             )
             
-            response = ai_client.models.generate_content(
-                model=PRIMARY_AI_MODEL, 
-                contents=system_prompt
-            )
-            await event.reply(f"🤖 {response.text}")
+            ai_reply_text = await safe_generate_ai_response(system_prompt)
+            await event.reply(f"🤖 {ai_reply_text}")
             
     except Exception as e:
         logger.error(f"Admin Chat Error: {e}")
-        await event.reply(f"🤖 Assistant Error detected: {str(e)[:150]}")
+        await event.reply(f"🤖 Assistant Error: {str(e)[:150]}")
 
-# --- 🌾 5. THE HARVESTER ENGINE (Dynamic Sources) ---
+# --- 🌾 5. HARVESTER ENGINE ---
 async def harvester_task():
     logger.info("🌾 Harvester Engine Started with Dynamic Sources...")
     while is_engine_running:
@@ -264,28 +281,24 @@ async def harvester_task():
         
         try:
             await client.connect()
-            # Get dynamic source channels
             source_channels = await get_source_channels()
             
             for channel in source_channels:
                 try:
                     admins = await client.get_participants(channel, filter=ChannelParticipantsAdmins)
                     admin_ids = [a.id for a in admins]
-                except Exception as e:
-                    logger.warning(f"Could not fetch admins for {channel}: {e}")
+                except:
                     admin_ids = []
                 
                 async for message in client.iter_messages(channel, limit=200):
                     users_to_check = []
                     
-                    # Handle message actions properly
                     if message.action:
                         if isinstance(message.action, MessageActionChatAddUser):
                             users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [])
                     elif message.sender:
                         users_to_check.append(message.sender)
                     
-                    # Poll Voters extraction
                     if message.poll and message.poll.public_voters:
                         try:
                             poll_votes = await client(functions.messages.GetPollVotesRequest(peer=channel, id=message.id, option=b'', limit=100))
@@ -313,7 +326,7 @@ async def harvester_task():
             if client.is_connected(): await client.disconnect()
         await asyncio.sleep(300)
 
-# --- 💉 6. THE INJECTOR ENGINE (Ready IDs) ---
+# --- 💉 6. INJECTOR ENGINE ---
 async def injector_task():
     logger.info("💉 Injector Engine Started...")
     while is_engine_running:
@@ -395,7 +408,7 @@ async def startup_event():
     is_engine_running = True
     
     await seed_accounts_if_empty()
-    await get_system_config()  # Initialize config with defaults
+    await get_system_config()
     
     try:
         await admin_bot.start(bot_token=BOT_TOKEN)
