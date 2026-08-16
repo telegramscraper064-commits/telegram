@@ -212,10 +212,15 @@ async def is_blacklisted(user_id):
         return False
 
 # ==========================================
-# 🤖 6. AI & UTILITY FUNCTIONS
+# 🤖 6. AI & UTILITY FUNCTIONS (UPDATED)
 # ==========================================
+
 async def safe_generate_ai_response(prompt_text):
-    models_chain = ['Gemini 3.5 Flash', 'gemini-1.5-pro', 'gemini-1.5-flash']
+    """
+    Admin Bot के AI Replies के लिए - Gemini 2.5 Flash Models
+    """
+    # 🔥 BEST FREE MODELS: Gemini 2.5 Flash & Flash-Lite
+    models_chain = ['gemini-2.5-flash', 'gemini-2.5-flash-lite']
     
     for model_name in models_chain:
         try:
@@ -228,14 +233,19 @@ async def safe_generate_ai_response(prompt_text):
         except Exception as e:
             logger.warning(f"Model {model_name} failed: {e}")
             continue
-            
-    return "⚠️ All AI models are temporarily busy. Please try again in a few seconds!"
+    
+    # 🔥 Fallback Reply (अगर दोनों Models Fail हो जाएं)
+    return "⚠️ AI models are currently busy. Please try again in a few seconds!"
 
 async def ai_auto_heal(error_message, account_id):
+    """
+    AI Self-Healing System - Gemini 2.5 Flash Models
+    """
     try:
         prompt = f"A Telegram automation script got this error on account {account_id}: '{error_message}'. If it's a flood/spam error, give safer limits. Reply strictly with three numbers separated by commas for max_adds,min_delay,max_delay e.g., '25,12,20'"
         
-        healing_models = ['gemini-2.0-flash-exp', 'gemini-1.5-flash']
+        # 🔥 BEST FREE MODELS: Gemini 2.5 Flash & Flash-Lite
+        healing_models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite']
         
         for model_name in healing_models:
             try:
