@@ -215,7 +215,7 @@ async def is_blacklisted(user_id):
 # 🤖 6. AI & UTILITY FUNCTIONS
 # ==========================================
 async def safe_generate_ai_response(prompt_text):
-    models_chain = ['gemini-2.0-flash-exp', 'gemini-1.5-pro', 'gemini-1.5-flash']
+    models_chain = ['Gemini 3.5 Flash', 'gemini-1.5-pro', 'gemini-1.5-flash']
     
     for model_name in models_chain:
         try:
