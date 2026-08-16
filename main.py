@@ -7,12 +7,11 @@ import socks
 from datetime import datetime, timedelta
 import pytz
 from google import genai
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, events, errors, functions
 from telethon.sessions import StringSession
 from telethon.tl.types import User, MessageActionChatAddUser, ChannelParticipantsAdmins
-from contextlib import asynccontextmanager
 
 # ==========================================
 # 🛠️ 1. LOGGING & CONFIGURATION
@@ -69,7 +68,6 @@ admin_bot = TelegramClient('admin_bot_session', API_ID, API_HASH)
 
 # Global State
 is_engine_running = False
-SHUTDOWN_EVENT = asyncio.Event()
 
 # ==========================================
 # 4. DATABASE UTILITY FUNCTIONS
@@ -725,5 +723,136 @@ async def admin_chat_handler(event):
         text = event.raw_text.strip()
         text_lower = text.lower()
         
-        # Status Command
-        if "status" in text_lower or "
+        # 🔥 STATUS COMMAND (Fixed)
+        if "status" in text_lower or "kaisa chal" in text_lower or "performance" in text_lower:
+            ready = await accounts_pool.count_documents({"status": "ready"})
+            cooling = await accounts_pool.count_documents({"status": "cooling"})
+            queue = await scraped_queue.count_documents({"status": "pending"})
+            
+            total_added = await master_blacklist.count_documents({})
+            dm_sent = await master_blacklist.count_documents({"add_method": "ghost_dm"})
+            direct_add = await master_blacklist.count_documents({"add_method": "direct"})
+            
+            config = await get_system_config()
+            sources = await get_source_channels()
+            
+            reply = (
+                f"📊 **System Report** 📊\n\n"
+                f"✅ **Total Added:** {total_added}\n"
+                f" ├ 🎯 **Direct:** {direct_add}\n"
+                f" └ 📩 **Ghost DM:** {dm_sent}\n\n"
+                f"📥 **Pending Queue:** {queue}\n"
+                f"🟢 **Ready IDs:** {ready} | 🔴 **Cooling:** {cooling}\n"
+                f"⚙️ **Limits:** {config['max_adds']} adds, {config['min_delay']}-{config['max_delay']}s delay\n"
+                f"🎯 **Sources:** {', '.join(sources)}"
+            )
+            await event.reply(reply)
+            
+        # PAUSE COMMAND
+        elif "pause" in text_lower or "rok" in text_lower:
+            await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": True}})
+            await event.reply("🛑 System PAUSED")
+            
+        # RESUME COMMAND
+        elif "resume" in text_lower or "chalu" in text_lower:
+            await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": False}})
+            await event.reply("▶️ System RESUMED")
+            
+        # ADD SOURCE GROUP
+        elif "add group" in text_lower:
+            match = re.search(r'[@]?([a-zA-Z0-9_]{5,})', text)
+            if match:
+                new_channel = match.group(1).replace('@', '')
+                sources = await get_source_channels()
+                if new_channel not in sources:
+                    sources.append(new_channel)
+                    await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
+                    await event.reply(f"✅ Added: @{new_channel}")
+                else:
+                    await event.reply(f"⚠️ @{new_channel} exists")
+            else:
+                await event.reply("⚠️ Usage: add group @username")
+                
+        # REMOVE SOURCE GROUP
+        elif "remove group" in text_lower or "hatao" in text_lower:
+            match = re.search(r'[@]?([a-zA-Z0-9_]{5,})', text)
+            if match:
+                target = match.group(1).replace('@', '')
+                sources = await get_source_channels()
+                if target in sources:
+                    sources.remove(target)
+                    await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
+                    await event.reply(f"🗑️ Removed: @{target}")
+                else:
+                    await event.reply(f"⚠️ @{target} not found")
+            else:
+                await event.reply("⚠️ Usage: remove group @username")
+                
+        # AI CHAT (Default)
+        else:
+            sources = await get_source_channels()
+            prompt = f"You are an expert AI assistant for Telegram automation. Active sources: {sources}. Admin asked: '{text}'. Reply concisely in Hinglish/Hindi."
+            ai_reply = await safe_generate_ai_response(prompt)
+            await event.reply(f"🤖 {ai_reply}")
+            
+    except Exception as e:
+        logger.error(f"Admin command error: {e}")
+        await event.reply(f"❌ Error: {str(e)[:150]}")
+
+# ==========================================
+# 10. FASTAPI & SERVER LIFECYCLE
+# ==========================================
+app = FastAPI()
+
+@app.on_event("startup")
+async def startup_event():
+    global is_engine_running
+    is_engine_running = True
+    
+    # Seed accounts
+    await seed_accounts_if_empty()
+    
+    # Start Admin Bot
+    try:
+        await admin_bot.start(bot_token=BOT_TOKEN)
+        logger.info("✅ Admin Bot Started!")
+    except Exception as e:
+        logger.error(f"Admin bot error: {e}")
+    
+    # Start background tasks
+    asyncio.create_task(harvester_task())
+    asyncio.create_task(injector_task())
+    logger.info("🚀 All Engines Started!")
+
+@app.get("/")
+async def root():
+    return {
+        "status": "AgriBot is LIVE! 🌾🚀",
+        "version": "1.0.0",
+        "engine": "running" if is_engine_running else "stopped"
+    }
+
+@app.get("/health")
+async def health():
+    try:
+        total_added = await master_blacklist.count_documents({})
+        pending = await scraped_queue.count_documents({"status": "pending"})
+        ready = await accounts_pool.count_documents({"status": "ready"})
+        
+        return {
+            "status": "healthy",
+            "total_added": total_added,
+            "pending_queue": pending,
+            "ready_accounts": ready,
+            "engine": "running" if is_engine_running else "stopped"
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# ==========================================
+# 11. RUN SCRIPT
+# ==========================================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
