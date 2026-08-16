@@ -212,45 +212,92 @@ async def is_blacklisted(user_id):
         return False
 
 # ==========================================
-# 🤖 6. AI & UTILITY FUNCTIONS (UPDATED)
+# 🤖 6. AI & UTILITY FUNCTIONS (UPDATED - Gemini 3 Series)
 # ==========================================
 
 async def safe_generate_ai_response(prompt_text):
     """
-    Admin Bot के AI Replies के लिए - Gemini 2.5 Flash Models
+    Admin Bot के AI Replies के लिए - Gemini 3 Series Models
+    Primary: gemini-3.6-flash (Complex Tasks)
+    Fallback: gemini-3.1-flash-lite (Light Tasks)
     """
-    # 🔥 BEST FREE MODELS: Gemini 2.5 Flash & Flash-Lite
-    models_chain = ['gemini-2.5-flash', 'gemini-2.5-flash-lite']
     
-    for model_name in models_chain:
+    # 🔥 Gemini 3 Series Models
+    primary_model = "gemini-3.6-flash"      # भारी काम (Complex Reasoning)
+    fallback_model = "gemini-3.1-flash-lite" # हल्के काम (Fast & Efficient)
+    
+    try:
+        # Primary Model से Try करें
+        logger.info(f"🤖 Trying with Primary Model: {primary_model}")
+        response = ai_client.models.generate_content(
+            model=primary_model,
+            contents=prompt_text
+        )
+        if response and response.text:
+            logger.info(f"✅ Response from {primary_model}")
+            return response.text
+        else:
+            raise Exception("Empty response from primary model")
+            
+    except Exception as e:
+        # Primary Model Fail होने पर Fallback Try करें
+        logger.warning(f"⚠️ Primary model {primary_model} failed: {e}")
+        logger.info(f"🔄 Switching to Fallback: {fallback_model}")
+        
         try:
             response = ai_client.models.generate_content(
-                model=model_name,
+                model=fallback_model,
                 contents=prompt_text
             )
             if response and response.text:
+                logger.info(f"✅ Response from {fallback_model}")
                 return response.text
-        except Exception as e:
-            logger.warning(f"Model {model_name} failed: {e}")
-            continue
-    
-    # 🔥 Fallback Reply (अगर दोनों Models Fail हो जाएं)
-    return "⚠️ AI models are currently busy. Please try again in a few seconds!"
+            else:
+                raise Exception("Empty response from fallback model")
+                
+        except Exception as fallback_error:
+            logger.error(f"❌ Both models failed. Error: {fallback_error}")
+            return "⚠️ All AI models are currently busy. Please try again in a few seconds!"
 
 async def ai_auto_heal(error_message, account_id):
     """
-    AI Self-Healing System - Gemini 2.5 Flash Models
+    AI Self-Healing System - Gemini 3 Series Models
     """
     try:
         prompt = f"A Telegram automation script got this error on account {account_id}: '{error_message}'. If it's a flood/spam error, give safer limits. Reply strictly with three numbers separated by commas for max_adds,min_delay,max_delay e.g., '25,12,20'"
         
-        # 🔥 BEST FREE MODELS: Gemini 2.5 Flash & Flash-Lite
-        healing_models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite']
+        # 🔥 Gemini 3 Series Models
+        primary_model = "gemini-3.6-flash"
+        fallback_model = "gemini-3.1-flash-lite"
         
-        for model_name in healing_models:
+        try:
+            # Primary Model Try करें
+            response = ai_client.models.generate_content(
+                model=primary_model,
+                contents=prompt
+            )
+            if response and response.text:
+                nums = re.findall(r'\d+', response.text)
+                if len(nums) >= 3:
+                    new_max, new_min, new_max_d = int(nums[0]), int(nums[1]), int(nums[2])
+                    new_max = max(20, min(40, new_max))
+                    
+                    await system_config.update_one(
+                        {"_id": "core_limits"},
+                        {"$set": {"max_adds": new_max, "min_delay": new_min, "max_delay": new_max_d}}
+                    )
+                    return f"🤖 AI Self-Healing Triggered: Limits balanced to {new_max} adds, {new_min}-{new_max_d}s delay."
+                else:
+                    raise Exception("Invalid response format")
+                    
+        except Exception as e:
+            # Fallback Try करें
+            logger.warning(f"⚠️ Healing primary model failed: {e}")
+            logger.info(f"🔄 Healing switching to fallback: {fallback_model}")
+            
             try:
                 response = ai_client.models.generate_content(
-                    model=model_name,
+                    model=fallback_model,
                     contents=prompt
                 )
                 if response and response.text:
@@ -263,11 +310,12 @@ async def ai_auto_heal(error_message, account_id):
                             {"_id": "core_limits"},
                             {"$set": {"max_adds": new_max, "min_delay": new_min, "max_delay": new_max_d}}
                         )
-                        return f"🤖 AI Self-Healing Triggered: Limits balanced to {new_max} adds, {new_min}-{new_max_d}s delay."
-                    break
-            except Exception as e:
-                logger.warning(f"Healing model {model_name} failed: {e}")
-                continue
+                        return f"🤖 AI Self-Healing Triggered (fallback): Limits balanced to {new_max} adds, {new_min}-{new_max_d}s delay."
+                    else:
+                        return None
+            except Exception as fallback_error:
+                logger.error(f"❌ Both healing models failed: {fallback_error}")
+                return None
                 
     except Exception as e:
         logger.error(f"AI Healing failed: {e}")
