@@ -13,7 +13,9 @@ from telethon import TelegramClient, events, errors, functions
 from telethon.sessions import StringSession
 from telethon.tl.types import User, MessageActionChatAddUser, ChannelParticipantsAdmins
 
-# --- 🛠️ 1. SETUP & CONFIGURATIONS ---
+# ==========================================
+# 🛠️ 1. SETUP & CONFIGURATIONS
+# ==========================================
 logging.basicConfig(
     format='%(asctime)s - [%(levelname)s] - %(message)s', 
     level=logging.INFO
@@ -21,22 +23,34 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Credentials & Core Constants
-BOT_TOKEN = "8857141734:AAGmL8gjCRZfbZyZeSaszs6_vcSXuGco0HE"
-GEMINI_API_KEY = "AQ.Ab8RN6LU2kQij3-Q64wr6xlumvZK_5VcM_Mx695A5maMGjTZkA"
+BOT_TOKEN = "YOUR_BOT_TOKEN"  # 🔥 अपना Bot Token डालें
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"  # 🔥 अपना Gemini API Key डालें
 API_ID = 33239973
 API_HASH = "81430d577ca915f53c4b2827ba7c723f"
 
 TARGET_GROUP = "agriquizworld"
-ADMIN_USERNAME = "agrikrishna"
+ADMIN_USERNAME = "YOUR_TELEGRAM_USERNAME"  # 🔥 अपना Telegram Username डालें (बिना @ के)
 COOLDOWN_HOURS = 36
 IST = pytz.timezone('Asia/Kolkata')
 
 # --- 🧠 AI Client Setup ---
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# --- 🧠 ROBUST AI FALLBACK WRAPPER ---
+# ==========================================
+# 2. GEN Z INVITATION MESSAGE (Ghost DM)
+# ==========================================
+INVITE_MESSAGE = (
+    "Yo {name}! 👋\n\n"
+    "Prepping for Agri exams? We drop daily quizzes and absolute W notes here. 📚✨\n\n"
+    "Join the squad: 👉 https://t.me/agriquizworld\n\n"
+    "Let's secure that bag! 🚀"
+)
+
+# ==========================================
+# 3. AI FALLBACK & AUTO-HEAL
+# ==========================================
 async def safe_generate_ai_response(prompt_text):
-    models_chain = ['gemini-3.6-flash', 'gemini-3.1-pro', 'gemini-1.5-flash']
+    models_chain = ['gemini-2.0-flash-exp', 'gemini-1.5-pro', 'gemini-1.5-flash']
     
     for model_name in models_chain:
         try:
@@ -57,7 +71,7 @@ async def ai_auto_heal(error_message, account_id):
         prompt = f"A Telegram automation script got this error on account {account_id}: '{error_message}'. " \
                  f"If it's a flood/spam error, give safer limits. Reply strictly with three numbers separated by commas for max_adds,min_delay,max_delay e.g., '25,12,20'"
         
-        healing_models = ['gemini-3.1-flash-lite', 'gemini-1.5-flash']
+        healing_models = ['gemini-2.0-flash-exp', 'gemini-1.5-flash']
         
         for model_name in healing_models:
             try:
@@ -89,7 +103,9 @@ async def ai_auto_heal(error_message, account_id):
 
 SPAM_REGEX = re.compile(r'crypto|casino|invest|bitcoin|fx|binance|betting|earn', re.IGNORECASE)
 
-# Database Setup
+# ==========================================
+# 4. DATABASE SETUP
+# ==========================================
 MONGO_URI = os.getenv('MONGO_URI', 'mongodb+srv://mailforfulltest_db_user:1vmiEQA28y0ok4Fh@cluster0.k85vzmp.mongodb.net/?appName=Cluster0')
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client['telegram_scraper_safe']
@@ -105,7 +121,9 @@ admin_cache = {}
 # Initialize Admin Bot Client
 admin_bot = TelegramClient('admin_bot_session', API_ID, API_HASH)
 
-# --- 🔄 2. SEED ACCOUNTS POOL (ALL 7 ACCOUNTS) ---
+# ==========================================
+# 5. SEED ACCOUNTS POOL
+# ==========================================
 async def seed_accounts_if_empty():
     initial_accounts = [
         {
@@ -160,7 +178,9 @@ async def seed_accounts_if_empty():
         )
     logger.info("✅ Verified 7 accounts in MongoDB pool.")
 
-# --- 🧠 3. SYSTEM CONFIG UTILITIES ---
+# ==========================================
+# 6. SYSTEM CONFIG UTILITIES
+# ==========================================
 async def get_system_config():
     config = await system_config.find_one({"_id": "core_limits"})
     if not config:
@@ -202,103 +222,58 @@ def parse_proxy(proxy_str):
 async def is_blacklisted(user_id: int):
     return await master_blacklist.find_one({"user_id": user_id}) is not None
 
-# --- 🤖 ADVANCED CONVERSATIONAL & COMMAND CENTER BOT ---
-@admin_bot.on(events.NewMessage(incoming=True))
-async def admin_chat_handler(event):
-    sender = await event.get_sender()
-    if not sender or not sender.username:
-        return
-        
-    if sender.username.lower() != ADMIN_USERNAME.lower():
-        return
-        
-    text = event.raw_text.strip()
-    text_lower = text.lower()
-    
+# ==========================================
+# 7. GHOST DM FUNCTION (Gen Z Style)
+# ==========================================
+async def process_student_via_dm(client, user_entity, student_name, student_db_id):
+    """
+    यह फंक्शन यूज़र को DM करेगा और तुरंत सेंडर (आपके) चैट बॉक्स से डिलीट कर देगा।
+    """
     try:
-        # 1. STATUS & PERFORMANCE CHECK
-        if "status" in text_lower or "kaisa chal" in text_lower or "performance" in text_lower or "kaise chal" in text_lower:
-            ready = await accounts_pool.count_documents({"status": "ready"})
-            cooling = await accounts_pool.count_documents({"status": "cooling"})
-            queue = await scraped_queue.count_documents({"status": "pending"})
-            
-            total_added = await master_blacklist.count_documents({})
-            dm_sent = await master_blacklist.count_documents({"add_method": "dm"})
-            direct_add = total_added - dm_sent 
-            
-            config = await get_system_config()
-            sources = await get_source_channels()
-            
-            reply = (
-                f"📊 **System Performance & Status Report** 📊\n\n"
-                f"✅ **Total Processed:** {total_added}\n"
-                f" ├ 🎯 **Direct Added:** {direct_add}\n"
-                f" └ 📩 **DM / Link Sent:** {dm_sent}\n\n"
-                f"📥 **Pending Queue:** {queue}\n"
-                f"🟢 **Ready IDs:** {ready} | 🔴 **Cooling IDs:** {cooling}\n"
-                f"⚙️ **Active Limits:** {config['max_adds']} max adds, {config['min_delay']}-{config['max_delay']}s delay.\n"
-                f"🎯 **Active Source Groups:** {', '.join(sources)}"
-            )
-            await event.reply(reply)
+        # यूज़र के नाम के साथ मैसेज तैयार करें
+        custom_message = INVITE_MESSAGE.format(name=student_name)
+        
+        # 1. स्टूडेंट को DM (Direct Message) भेजें
+        logger.info(f"📩 Sending Invitation DM to {student_name}...")
+        sent_msg = await client.send_message(user_entity, custom_message)
+        
+        # 2. घोस्ट मोड: मैसेज सेंड होते ही सिर्फ अपनी चैट हिस्ट्री से डिलीट करें!
+        # revoke=False का मतलब है: "Delete for me only" (सामने वाले के इनबॉक्स में सुरक्षित रहेगा)
+        logger.info(f"🧹 Clearing chat history for {student_name} (Ghost Cleanup)...")
+        await client.delete_messages(user_entity, [sent_msg.id], revoke=False)
+        
+        # 3. SUCCESS लॉग
+        logger.info(f"✅ SUCCESS: Invisible DM sent to {student_name} and chat cleared!")
+        
+        # MongoDB में स्टूडेंट का स्टेटस अपडेट करें
+        await master_blacklist.insert_one({
+            "user_id": student_db_id,
+            "name": student_name,
+            "add_method": "ghost_dm",
+            "added_at": datetime.now(pytz.utc)
+        })
+        
+        return True
 
-        # 2. PAUSE SYSTEM
-        elif "pause" in text_lower or "rok do" in text_lower:
-            await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": True}})
-            await event.reply("🛑 System has been securely **PAUSED** via chat command.")
-            
-        # 3. RESUME SYSTEM
-        elif "resume" in text_lower or "start" in text_lower or "chalu karo" in text_lower:
-            await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": False}})
-            await event.reply("▶️ System has been **RESUMED** successfully.")
-
-        # 4. ADD NEW SOURCE GROUP
-        elif "add group" in text_lower or "group add" in text_lower or "jodo" in text_lower:
-            match = re.search(r'[@]?([a-zA-Z0-9_]{5,})', text)
-            if match:
-                new_channel = match.group(1).replace('@', '')
-                sources = await get_source_channels()
-                if new_channel not in sources and new_channel.lower() not in ["add", "group", "to"]:
-                    sources.append(new_channel)
-                    await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
-                    await event.reply(f"✅ Success! Source group/channel **`@{new_channel}`** has been added.")
-                else:
-                    await event.reply(f"⚠️ Group `@{new_channel}` is already in the source list.")
-            else:
-                await event.reply("⚠️ Please specify a valid group username, e.g., 'Add group @agri_exam'")
-
-        # 5. REMOVE SOURCE GROUP
-        elif "remove group" in text_lower or "hatao" in text_lower or "delete group" in text_lower:
-            match = re.search(r'[@]?([a-zA-Z0-9_]{5,})', text)
-            if match:
-                target_channel = match.group(1).replace('@', '')
-                sources = await get_source_channels()
-                if target_channel in sources:
-                    sources.remove(target_channel)
-                    await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
-                    await event.reply(f"🗑️ Group **`@{target_channel}`** has been removed.")
-                else:
-                    await event.reply(f"⚠️ Group `@{target_channel}` was not found.")
-            else:
-                await event.reply("⚠️ Please specify the group username to remove, e.g., 'Remove group @Dream_Agri'")
-
-        # 6. GENERAL AI ASSISTANT CHAT
-        else:
-            sources = await get_source_channels()
-            system_prompt = (
-                f"You are an expert AI personal assistant managing a high-performance Telegram automation system for agriculture students. "
-                f"Active sources are {sources}. "
-                f"The admin asked: '{text}'. "
-                f"Reply politely, smartly, and concisely in Hinglish/Hindi."
-            )
-            
-            ai_reply_text = await safe_generate_ai_response(system_prompt)
-            await event.reply(f"🤖 {ai_reply_text}")
-            
+    except errors.PeerFloodError:
+        logger.error("🔴 Telegram Flood Limit reached! Account needs cooling.")
+        return "FLOOD"
+    
+    except errors.UserIsBlockedError:
+        logger.warning(f"⚠️ {student_name} has blocked the bot/account.")
+        return False
+        
+    except errors.UserPrivacyRestrictedError:
+        logger.warning(f"🔒 {student_name} has strict privacy settings (Cannot send DM).")
+        return False
+        
     except Exception as e:
-        logger.error(f"Admin Chat Error: {e}")
-        await event.reply(f"🤖 Assistant Error: {str(e)[:150]}")
+        logger.error(f"❌ Failed to DM {student_name}: {str(e)}")
+        return False
 
-# --- 🌾 5. ULTIMATE DEEP HARVESTER ENGINE ---
+# ==========================================
+# 8. DEEP HARVESTER ENGINE
+# ==========================================
 async def harvester_task():
     logger.info("🌾 Ultimate Deep Harvester Started! Hunting for 100k+ Students...")
     while is_engine_running:
@@ -458,9 +433,11 @@ async def harvester_task():
         logger.info("💤 Deep Harvester cycle complete. Resting for 15 minutes...")
         await asyncio.sleep(900)
 
-# --- 💉 6. INJECTOR ENGINE (With Add Method & Smart Counter) ---
+# ==========================================
+# 9. INJECTOR ENGINE (With Ghost DM Support)
+# ==========================================
 async def injector_task():
-    logger.info("💉 Injector Engine Started...")
+    logger.info("💉 Injector Engine Started (Ghost DM + Direct Add)...")
     while is_engine_running:
         try:
             config = await get_system_config()
@@ -519,7 +496,7 @@ async def injector_task():
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                         continue
                     
-                    # 🛠️ 2. ENTITY RESOLUTION FIX
+                    # 🛠️ 2. ENTITY RESOLUTION
                     target_user = user_id
                     if "https://t.me/" in tg_link:
                         target_user = tg_link.replace("https://t.me/", "")
@@ -536,28 +513,26 @@ async def injector_task():
                             logger.warning(f"Entity resolution failed, using fallback: {e}")
                             user_entity = target_user
                             
-                        # Ab add karo
+                        # 🔥 3. TRY: DIRECT ADD
                         await client(functions.channels.InviteToChannelRequest(target_entity, [user_entity]))
                         logger.info(f"✅ SUCCESS: Added user {user_name} ({user_id}) to group!")
                         add_successful = True
                         add_method = "direct"
                         
                     except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError) as e:
-                        logger.info(f"🔒 Privacy ON for {user_name} ({user_id}). Sending DM...")
-                        invite_msg = ("🌾 All Agriculture Students के लिए Important Group!\n"
-                                      "📚 Agriculture Quiz, MCQs & Exam Updates के लिए अभी Join करें 👇\n"
-                                      f"🔗 https://web.telegram.org/k/#@{TARGET_GROUP}\n"
-                                      "👉 सभी Agriculture Students जरूर Join करें। 🌱")
+                        logger.info(f"🔒 Privacy ON for {user_name} ({user_id}). Sending Ghost DM...")
+                        # 🔥 4. FALLBACK: GHOST DM
                         try:
-                            try:
-                                await client.send_message(user_entity, invite_msg)
-                            except:
-                                await client.send_message(user_id, invite_msg)
-                            logger.info(f"📨 DM Invitation sent to {user_name} ({user_id})")
-                            add_successful = True
-                            add_method = "dm"
+                            result = await process_student_via_dm(client, user_entity, user_name, user_id)
+                            if result == "FLOOD":
+                                raise errors.PeerFloodError(request=None)
+                            elif result == True:
+                                add_successful = True
+                                add_method = "ghost_dm"
+                            else:
+                                add_successful = False
                         except Exception as dm_err:
-                            logger.error(f"❌ Failed to send DM to {user_id}: {dm_err}")
+                            logger.error(f"❌ Ghost DM failed for {user_id}: {dm_err}")
                             add_successful = False
                         
                     except errors.PeerFloodError:
@@ -575,7 +550,8 @@ async def injector_task():
                                 "user_id": user_id, 
                                 "name": user_name, 
                                 "tg_link": tg_link,
-                                "add_method": add_method
+                                "add_method": add_method,
+                                "added_at": datetime.now(pytz.utc)
                             })
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                     except Exception as db_err:
@@ -637,51 +613,40 @@ async def injector_task():
             
         await asyncio.sleep(60)
 
-# --- 🚀 7. FASTAPI & LIFECYCLE ---
-app = FastAPI(title="Agri Mastermind AI Engine")
-
-@app.on_event("startup")
-async def startup_event():
-    global is_engine_running
-    is_engine_running = True
-    
-    await seed_accounts_if_empty()
-    await get_system_config()
+# ==========================================
+# 10. ADMIN BOT COMMAND HANDLER
+# ==========================================
+@admin_bot.on(events.NewMessage(incoming=True))
+async def admin_chat_handler(event):
+    sender = await event.get_sender()
+    if not sender or not sender.username:
+        return
+        
+    if sender.username.lower() != ADMIN_USERNAME.lower():
+        return
+        
+    text = event.raw_text.strip()
+    text_lower = text.lower()
     
     try:
-        await admin_bot.start(bot_token=BOT_TOKEN)
-        logger.info("✅ Telegram Admin Command Bot Connected!")
-    except Exception as e:
-        logger.error(f"Admin bot start failed: {e}")
-    
-    asyncio.create_task(harvester_task())
-    asyncio.create_task(injector_task())
-    logger.info("✅ All Subsystems and Background Engines Deployed.")
-
-@app.get("/")
-async def root():
-    return {"status": "AI Mastermind Engine is Online and Fully Autonomous"}
-
-@app.get("/health")
-async def health_check():
-    config = await get_system_config()
-    sources = await get_source_channels()
-    queue_stats = await scraped_queue.aggregate([
-        {"$group": {"_id": "$status", "count": {"$sum": 1}}}
-    ]).to_list(length=None)
-    
-    return {
-        "status": "healthy",
-        "is_paused": config.get("is_paused", False),
-        "source_channels": sources,
-        "total_added": await master_blacklist.count_documents({}),
-        "pending_queue": await scraped_queue.count_documents({"status": "pending"}),
-        "queue_stats": queue_stats
-    }
-
-@app.get("/logs")
-async def get_recent_logs():
-    return {
-        "message": "Check Render logs for live updates",
-        "tip": "Logs are streaming to console"
-    }
+        # 1. STATUS & PERFORMANCE CHECK
+        if "status" in text_lower or "kaisa chal" in text_lower or "performance" in text_lower or "kaise chal" in text_lower:
+            ready = await accounts_pool.count_documents({"status": "ready"})
+            cooling = await accounts_pool.count_documents({"status": "cooling"})
+            queue = await scraped_queue.count_documents({"status": "pending"})
+            
+            total_added = await master_blacklist.count_documents({})
+            dm_sent = await master_blacklist.count_documents({"add_method": "ghost_dm"})
+            direct_add = await master_blacklist.count_documents({"add_method": "direct"})
+            
+            config = await get_system_config()
+            sources = await get_source_channels()
+            
+            reply = (
+                f"📊 **System Performance & Status Report** 📊\n\n"
+                f"✅ **Total Processed:** {total_added}\n"
+                f" ├ 🎯 **Direct Added:** {direct_add}\n"
+                f" └ 📩 **Ghost DM Sent:** {dm_sent}\n\n"
+                f"📥 **Pending Queue:** {queue}\n"
+                f"🟢 **Ready IDs:** {ready} | 🔴 **Cooling IDs:** {cooling}\n"
+                f"⚙️ **Active Limits:** {config['max_adds']} max adds, {config['min_delay']}-{config['max_delay']}s delay.\
