@@ -7,11 +7,12 @@ import socks
 from datetime import datetime, timedelta
 import pytz
 from google import genai
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, events, errors, functions
 from telethon.sessions import StringSession
 from telethon.tl.types import User, MessageActionChatAddUser, ChannelParticipantsAdmins
+from contextlib import asynccontextmanager
 
 # ==========================================
 # 🛠️ 1. LOGGING & CONFIGURATION
@@ -22,9 +23,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment Variables (Render पर Set करें)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+# ==========================================
+# 📦 2. ENVIRONMENT VARIABLES (Render पर Set करें)
+# ==========================================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8857141734:AAGmL8gjCRZfbZyZeSaszs6_vcSXuGco0HE")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6LU2kQij3-Q64wr6xlumvZK_5VcM_Mx695A5maMGjTZkA")
 API_ID = int(os.getenv("API_ID", 33239973))
 API_HASH = os.getenv("API_HASH", "81430d577ca915f53c4b2827ba7c723f")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://mailforfulltest_db_user:1vmiEQA28y0ok4Fh@cluster0.k85vzmp.mongodb.net/?appName=Cluster0")
@@ -36,11 +39,10 @@ COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", 36))
 IST = pytz.timezone('Asia/Kolkata')
 
 # ==========================================
-# 2. AI & SPAM CONFIG
+# 🧠 3. AI & SPAM CONFIG
 # ==========================================
 SPAM_REGEX = re.compile(r'crypto|casino|invest|bitcoin|fx|binance|betting|earn|porn|adult', re.IGNORECASE)
 
-# Gen Z Invitation Message
 INVITE_MESSAGE = (
     "Yo {name}! 👋\n\n"
     "Prepping for Agri exams? We drop daily quizzes and absolute W notes here. 📚✨\n\n"
@@ -49,7 +51,7 @@ INVITE_MESSAGE = (
 )
 
 # ==========================================
-# 3. DATABASE & CLIENTS
+# 💾 4. DATABASE & CLIENTS
 # ==========================================
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client['telegram_scraper_safe']
@@ -70,7 +72,7 @@ admin_bot = TelegramClient('admin_bot_session', API_ID, API_HASH)
 is_engine_running = False
 
 # ==========================================
-# 4. DATABASE UTILITY FUNCTIONS
+# 🔧 5. DATABASE UTILITY FUNCTIONS
 # ==========================================
 async def seed_accounts_if_empty():
     """Seed initial accounts if pool is empty"""
@@ -210,7 +212,7 @@ async def is_blacklisted(user_id):
         return False
 
 # ==========================================
-# 5. AI & UTILITY FUNCTIONS
+# 🤖 6. AI & UTILITY FUNCTIONS
 # ==========================================
 async def safe_generate_ai_response(prompt_text):
     models_chain = ['gemini-2.0-flash-exp', 'gemini-1.5-pro', 'gemini-1.5-flash']
@@ -262,7 +264,6 @@ async def ai_auto_heal(error_message, account_id):
     return None
 
 async def log_operation(operation, details, status="success"):
-    """Log operations to MongoDB for auditing"""
     try:
         await operation_logs.insert_one({
             "operation": operation,
@@ -274,7 +275,7 @@ async def log_operation(operation, details, status="success"):
         logger.error(f"Failed to log operation: {e}")
 
 # ==========================================
-# 6. GHOST DM FUNCTION
+# 👻 7. GHOST DM FUNCTION
 # ==========================================
 async def process_student_via_dm(client, user_entity, student_name, user_id):
     try:
@@ -288,7 +289,6 @@ async def process_student_via_dm(client, user_entity, student_name, user_id):
         
         logger.info(f"✅ Ghost DM sent to {student_name} ({user_id})")
         
-        # Insert into blacklist
         await master_blacklist.insert_one({
             "user_id": user_id,
             "name": student_name,
@@ -323,21 +323,19 @@ async def process_student_via_dm(client, user_entity, student_name, user_id):
         return False
 
 # ==========================================
-# 7. HARVESTER ENGINE
+# 🌾 8. HARVESTER ENGINE
 # ==========================================
 async def harvester_task():
     logger.info("🌾 Ultimate Harvester Engine Started!")
     
     while is_engine_running:
         try:
-            # Check if system is paused
             config = await get_system_config()
             if config.get("is_paused"):
                 logger.info("⏸️ Harvester paused by admin")
                 await asyncio.sleep(60)
                 continue
             
-            # Get available account
             account = await accounts_pool.find_one({
                 "status": {"$in": ["ready", "cooling"]}
             })
@@ -349,7 +347,6 @@ async def harvester_task():
             
             logger.info(f"🔄 Harvester using account: {account['account_id']}")
             
-            # Connect with proxy
             proxy_tuple = parse_proxy(account.get("proxy"))
             client = TelegramClient(
                 StringSession(account['session_string']),
@@ -372,7 +369,6 @@ async def harvester_task():
                     logger.info(f"🎯 Harvester scanning: {channel}")
                     
                     try:
-                        # Get admins to exclude
                         admins = []
                         try:
                             admins = await client.get_participants(channel, filter=ChannelParticipantsAdmins)
@@ -381,7 +377,6 @@ async def harvester_task():
                             logger.warning(f"Could not fetch admins for {channel}: {e}")
                             admin_ids = []
                         
-                        # Try direct participant fetch first
                         participant_count = 0
                         try:
                             async for user in client.iter_participants(channel, limit=3000):
@@ -409,7 +404,6 @@ async def harvester_task():
                         except Exception as e:
                             logger.info(f"ℹ️ Direct member fetch not available for {channel}: {e}")
                         
-                        # Deep message scan
                         logger.info(f"🔍 Deep scanning messages in {channel}")
                         message_count = 0
                         mention_count = 0
@@ -419,15 +413,12 @@ async def harvester_task():
                             users_to_check = []
                             
                             try:
-                                # Message sender
                                 if message.sender:
                                     users_to_check.append(message.sender)
                                 
-                                # Join events
                                 if message.action and isinstance(message.action, MessageActionChatAddUser):
                                     users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [])
                                 
-                                # Mentions
                                 if message.text:
                                     mentions = re.findall(r'@([a-zA-Z0-9_]{5,32})', message.text)
                                     for username in mentions:
@@ -443,7 +434,6 @@ async def harvester_task():
                                             })
                                             mention_count += 1
                                 
-                                # Poll votes
                                 if getattr(message, 'poll', None) and hasattr(message.poll, 'poll') and message.poll.poll.public_voters:
                                     try:
                                         poll_votes = await client(functions.messages.GetPollVotesRequest(
@@ -456,7 +446,6 @@ async def harvester_task():
                                     except Exception as e:
                                         pass
                                 
-                                # Reactions
                                 if message.reactions:
                                     try:
                                         reactions = await client(functions.messages.GetMessageReactionsListRequest(
@@ -469,7 +458,6 @@ async def harvester_task():
                             except Exception as e:
                                 continue
                             
-                            # Process collected users
                             for user in users_to_check:
                                 try:
                                     if not isinstance(user, User) or user.bot or user.deleted or user.id in admin_ids:
@@ -520,14 +508,13 @@ async def harvester_task():
         await asyncio.sleep(900)
 
 # ==========================================
-# 8. INJECTOR ENGINE
+# 💉 9. INJECTOR ENGINE
 # ==========================================
 async def injector_task():
     logger.info("💉 Injector Engine Started!")
     
     while is_engine_running:
         try:
-            # Check working hours and pause status
             config = await get_system_config()
             if config.get("is_paused"):
                 logger.info("⏸️ Injector paused by admin")
@@ -539,14 +526,12 @@ async def injector_task():
                 await asyncio.sleep(3600)
                 continue
             
-            # Update cooling accounts to ready
             now_ts = datetime.now(pytz.utc).timestamp()
             await accounts_pool.update_many(
                 {"status": "cooling", "cooldown_until": {"$lt": now_ts}},
                 {"$set": {"status": "ready", "cooldown_until": 0}}
             )
             
-            # Get available account
             account = await accounts_pool.find_one({"status": "ready"})
             if not account:
                 logger.info("⏳ No ready accounts available, waiting...")
@@ -556,7 +541,6 @@ async def injector_task():
             acc_id = account['account_id']
             logger.info(f"🔄 Injector using account: {acc_id}")
             
-            # Connect with proxy
             proxy_tuple = parse_proxy(account.get("proxy"))
             client = TelegramClient(
                 StringSession(account['session_string']),
@@ -570,7 +554,6 @@ async def injector_task():
                 await client.connect()
                 logger.info(f"✅ Injector connected: {acc_id}")
                 
-                # Auto join target group
                 try:
                     await client(functions.channels.JoinChannelRequest(TARGET_GROUP))
                     logger.info(f"✅ Auto-joined {TARGET_GROUP}")
@@ -591,12 +574,10 @@ async def injector_task():
                     user_name = user_doc.get('name', 'Unknown')
                     tg_link = user_doc.get('tg_link', '')
                     
-                    # Skip if already blacklisted
                     if await is_blacklisted(user_id):
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                         continue
                     
-                    # Resolve entity
                     target_user = user_id
                     if "https://t.me/" in tg_link:
                         target_user = tg_link.replace("https://t.me/", "")
@@ -605,21 +586,18 @@ async def injector_task():
                     add_method = "direct"
                     
                     try:
-                        # Try to get entity
                         try:
                             user_entity = await client.get_input_entity(target_user)
                         except Exception as e:
                             logger.warning(f"Entity resolution failed: {e}")
                             user_entity = target_user
                         
-                        # Try direct add
                         await client(functions.channels.InviteToChannelRequest(target_entity, [user_entity]))
                         add_successful = True
                         add_method = "direct"
                         logger.info(f"✅ Direct added: {user_name}")
                         
                     except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError) as e:
-                        # Fallback to Ghost DM
                         logger.info(f"🔒 Privacy restricted, sending Ghost DM to {user_name}")
                         result = await process_student_via_dm(client, user_entity, user_name, user_id)
                         if result == "FLOOD":
@@ -638,7 +616,6 @@ async def injector_task():
                         logger.error(f"Failed to add {user_name}: {e}")
                         add_successful = False
                     
-                    # Update database
                     try:
                         if add_successful:
                             await master_blacklist.insert_one({
@@ -656,7 +633,6 @@ async def injector_task():
                     except Exception as e:
                         logger.error(f"Database update error: {e}")
                     
-                    # Delay
                     if add_successful:
                         delay = random.randint(config.get("min_delay", 8), config.get("max_delay", 16))
                         logger.info(f"⏳ Sleeping {delay}s... ({daily_adds}/{max_adds})")
@@ -708,22 +684,31 @@ async def injector_task():
         await asyncio.sleep(30)
 
 # ==========================================
-# 9. ADMIN BOT COMMAND HANDLER
+# 🤖 10. ADMIN BOT COMMAND HANDLER (FIXED)
 # ==========================================
 @admin_bot.on(events.NewMessage(incoming=True))
 async def admin_chat_handler(event):
     try:
         sender = await event.get_sender()
-        if not sender or not sender.username:
+        
+        # 🔥 FIX: Username Check को Safe बनाएं
+        if not sender:
             return
             
+        # अगर Sender का Username नहीं है, तो Ignore करें
+        if not sender.username:
+            logger.warning(f"⚠️ Sender {sender.id} has no username, ignoring")
+            return
+            
+        # 🔥 FIX: Case-Insensitive Check
         if sender.username.lower() != ADMIN_USERNAME.lower():
+            logger.info(f"⏭️ Ignoring message from {sender.username} (not admin)")
             return
-            
+        
         text = event.raw_text.strip()
         text_lower = text.lower()
         
-        # 🔥 STATUS COMMAND (Fixed)
+        # STATUS COMMAND
         if "status" in text_lower or "kaisa chal" in text_lower or "performance" in text_lower:
             ready = await accounts_pool.count_documents({"status": "ready"})
             cooling = await accounts_pool.count_documents({"status": "cooling"})
@@ -747,16 +732,19 @@ async def admin_chat_handler(event):
                 f"🎯 **Sources:** {', '.join(sources)}"
             )
             await event.reply(reply)
+            logger.info(f"✅ Status report sent to {sender.username}")
             
         # PAUSE COMMAND
         elif "pause" in text_lower or "rok" in text_lower:
             await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": True}})
             await event.reply("🛑 System PAUSED")
+            logger.info(f"🛑 System paused by {sender.username}")
             
         # RESUME COMMAND
         elif "resume" in text_lower or "chalu" in text_lower:
             await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": False}})
             await event.reply("▶️ System RESUMED")
+            logger.info(f"▶️ System resumed by {sender.username}")
             
         # ADD SOURCE GROUP
         elif "add group" in text_lower:
@@ -768,6 +756,7 @@ async def admin_chat_handler(event):
                     sources.append(new_channel)
                     await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
                     await event.reply(f"✅ Added: @{new_channel}")
+                    logger.info(f"✅ Source group added: {new_channel} by {sender.username}")
                 else:
                     await event.reply(f"⚠️ @{new_channel} exists")
             else:
@@ -783,6 +772,7 @@ async def admin_chat_handler(event):
                     sources.remove(target)
                     await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
                     await event.reply(f"🗑️ Removed: @{target}")
+                    logger.info(f"🗑️ Source group removed: {target} by {sender.username}")
                 else:
                     await event.reply(f"⚠️ @{target} not found")
             else:
@@ -794,32 +784,54 @@ async def admin_chat_handler(event):
             prompt = f"You are an expert AI assistant for Telegram automation. Active sources: {sources}. Admin asked: '{text}'. Reply concisely in Hinglish/Hindi."
             ai_reply = await safe_generate_ai_response(prompt)
             await event.reply(f"🤖 {ai_reply}")
+            logger.info(f"🤖 AI reply sent to {sender.username}")
             
     except Exception as e:
         logger.error(f"Admin command error: {e}")
-        await event.reply(f"❌ Error: {str(e)[:150]}")
+        try:
+            await event.reply(f"❌ Error: {str(e)[:150]}")
+        except Exception as e:
+            pass
 
 # ==========================================
-# 10. FASTAPI & SERVER LIFECYCLE
+# 🚀 11. FASTAPI & SERVER LIFECYCLE
 # ==========================================
-app = FastAPI()
+app = FastAPI(title="Agri Mastermind AI Engine", version="1.0.0")
 
 @app.on_event("startup")
 async def startup_event():
     global is_engine_running
     is_engine_running = True
     
-    # Seed accounts
-    await seed_accounts_if_empty()
+    # 🔥 1. MongoDB Connection Test
+    try:
+        await mongo_client.admin.command('ping')
+        logger.info("✅ MongoDB Connected Successfully!")
+    except Exception as e:
+        logger.error(f"❌ MongoDB Connection Failed: {e}")
+        # MongoDB Fail होने पर भी Bot को Start होने दें
     
-    # Start Admin Bot
+    # 🔥 2. Seed Accounts (अगर DB Connected है तो)
+    try:
+        await seed_accounts_if_empty()
+    except Exception as e:
+        logger.warning(f"⚠️ Could not seed accounts: {e}")
+    
+    # 🔥 3. Admin Bot Start (हमेशा)
     try:
         await admin_bot.start(bot_token=BOT_TOKEN)
-        logger.info("✅ Admin Bot Started!")
+        logger.info("✅ Admin Bot Started Successfully!")
+        
+        # Test message to admin
+        try:
+            await admin_bot.send_message(ADMIN_USERNAME, "🚀 **Agri Mastermind AI Engine is Online!**\n\nSend `Status` to check system health.")
+            logger.info(f"✅ Welcome message sent to @{ADMIN_USERNAME}")
+        except Exception as e:
+            logger.warning(f"Could not send welcome message: {e}")
     except Exception as e:
-        logger.error(f"Admin bot error: {e}")
+        logger.error(f"❌ Admin bot error: {e}")
     
-    # Start background tasks
+    # 🔥 4. Start Background Engines
     asyncio.create_task(harvester_task())
     asyncio.create_task(injector_task())
     logger.info("🚀 All Engines Started!")
@@ -827,9 +839,11 @@ async def startup_event():
 @app.get("/")
 async def root():
     return {
-        "status": "AgriBot is LIVE! 🌾🚀",
+        "status": "Agri Mastermind AI Engine is LIVE! 🌾🚀",
         "version": "1.0.0",
-        "engine": "running" if is_engine_running else "stopped"
+        "engine": "running" if is_engine_running else "stopped",
+        "admin": ADMIN_USERNAME,
+        "target_group": TARGET_GROUP
     }
 
 @app.get("/health")
@@ -838,19 +852,36 @@ async def health():
         total_added = await master_blacklist.count_documents({})
         pending = await scraped_queue.count_documents({"status": "pending"})
         ready = await accounts_pool.count_documents({"status": "ready"})
+        cooling = await accounts_pool.count_documents({"status": "cooling"})
+        banned = await accounts_pool.count_documents({"status": "banned"})
         
         return {
             "status": "healthy",
             "total_added": total_added,
             "pending_queue": pending,
             "ready_accounts": ready,
-            "engine": "running" if is_engine_running else "stopped"
+            "cooling_accounts": cooling,
+            "banned_accounts": banned,
+            "engine": "running" if is_engine_running else "stopped",
+            "source_channels": await get_source_channels(),
+            "target_group": TARGET_GROUP
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+@app.get("/docs")
+async def docs():
+    return {
+        "message": "API Documentation",
+        "endpoints": {
+            "/": "Health check",
+            "/health": "Detailed system health",
+            "/status": "System status report"
+        }
+    }
+
 # ==========================================
-# 11. RUN SCRIPT
+# 🏃 12. RUN SCRIPT
 # ==========================================
 if __name__ == "__main__":
     import uvicorn
