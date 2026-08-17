@@ -333,37 +333,69 @@ async def log_operation(operation, details, status="success"):
         logger.error(f"Failed to log operation: {e}")
 
 # ==========================================
-# 👻 7. GHOST DM FUNCTION
+# 👻 7. GHOST DM FUNCTION (UPDATED & FIXED)
 # ==========================================
-async def process_student_via_dm(client, user_entity, student_name, user_id):
+
+async def process_student_via_dm(client, user_entity, student_name, user_id, tg_link=""):
+    """
+    Student को Ghost DM (Invitation Link) भेजें और अपनी Chat History से Delete करें।
+    
+    Args:
+        client: Telegram Client
+        user_entity: Student का Entity (User object ya InputEntity)
+        student_name: Student का नाम
+        user_id: Student का User ID
+        tg_link: Student का Telegram Link (Optional)
+    
+    Returns:
+        True: DM Successfully Sent
+        False: DM Failed (कोई Error)
+        "FLOOD": Flood Limit Reached
+    """
     try:
+        # 📨 Custom Message बनाएं (Student के नाम के साथ)
         custom_message = INVITE_MESSAGE.format(name=student_name)
         
+        # 1️⃣ Student को DM भेजें
         logger.info(f"📩 Sending invitation DM to {student_name} ({user_id})")
         sent_msg = await client.send_message(user_entity, custom_message)
         
-        # Ghost mode: Delete just our side, keep in recipient's inbox
+        # 2️⃣ Ghost Mode: Message को अपनी Side से Delete करें
+        # revoke=False → सिर्फ आपकी Chat History से Delete होगा, Student के Inbox में रहेगा
         await client.delete_messages(user_entity, [sent_msg.id], revoke=False)
         
         logger.info(f"✅ Ghost DM sent to {student_name} ({user_id})")
         
+        # 3️⃣ Student को Global Blacklist में Save करें (ताकि दोबारा DM न भेजें)
         await master_blacklist.insert_one({
             "user_id": user_id,
             "name": student_name,
+            "tg_link": tg_link or f"tg://user?id={user_id}",
             "add_method": "ghost_dm",
             "added_at": datetime.now(pytz.utc)
         })
         
-        await log_operation("ghost_dm", {"user_id": user_id, "name": student_name}, "success")
+        # 4️⃣ Operation Log में Save करें
+        await log_operation("ghost_dm", {
+            "user_id": user_id, 
+            "name": student_name,
+            "message": custom_message[:50] + "..."
+        }, "success")
+        
         return True
 
     except errors.PeerFloodError:
-        logger.error(f"🔴 Flood limit reached for ghost DM to {student_name}")
-        await log_operation("ghost_dm", {"user_id": user_id, "error": "flood"}, "error")
+        # 🚫 Flood Limit Reached
+        logger.error(f"🔴 Flood limit reached for ghost DM to {student_name} ({user_id})")
+        await log_operation("ghost_dm", {
+            "user_id": user_id, 
+            "error": "flood"
+        }, "error")
         return "FLOOD"
     
     except errors.UserIsBlockedError:
-        logger.warning(f"⚠️ User {student_name} has blocked")
+        # 🚫 Student ने Bot/Account को Block किया है
+        logger.warning(f"⚠️ User {student_name} ({user_id}) has blocked the account")
         await master_blacklist.insert_one({
             "user_id": user_id,
             "name": student_name,
@@ -373,13 +405,25 @@ async def process_student_via_dm(client, user_entity, student_name, user_id):
         return False
         
     except errors.UserPrivacyRestrictedError:
-        logger.warning(f"🔒 User {student_name} has privacy restricted")
+        # 🔒 Student की Privacy Setting DM को Block करती है
+        logger.warning(f"🔒 User {student_name} ({user_id}) has privacy restricted (cannot receive DM)")
         return False
         
+    except errors.FloodWaitError as e:
+        # ⏳ Telegram ने Wait करने को कहा है
+        wait_time = e.seconds + random.randint(5, 15)
+        logger.warning(f"⏳ FloodWait: Waiting {wait_time} seconds before retry...")
+        await asyncio.sleep(wait_time)
+        return "FLOOD"
+        
     except Exception as e:
-        logger.error(f"❌ Ghost DM failed for {student_name}: {e}")
+        # ❌ Unknown Error
+        logger.error(f"❌ Ghost DM failed for {student_name} ({user_id}): {e}")
+        await log_operation("ghost_dm", {
+            "user_id": user_id,
+            "error": str(e)
+        }, "error")
         return False
-
 # ==========================================
 # 🌾 8. HARVESTER ENGINE
 # ==========================================
