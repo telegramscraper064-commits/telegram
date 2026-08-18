@@ -212,7 +212,7 @@ async def is_blacklisted(user_id):
         return False
 
 # ==========================================
-# 🤖 6. AI & UTILITY FUNCTIONS (UPDATED - Gemini 3 Series)
+# 🤖 6. AI & UTILITY FUNCTIONS (Gemini 3 Series)
 # ==========================================
 
 async def safe_generate_ai_response(prompt_text):
@@ -333,7 +333,7 @@ async def log_operation(operation, details, status="success"):
         logger.error(f"Failed to log operation: {e}")
 
 # ==========================================
-# 👻 7. GHOST DM FUNCTION (UPDATED & FIXED)
+# 👻 7. GHOST DM FUNCTION
 # ==========================================
 
 async def process_student_via_dm(client, user_entity, student_name, user_id, tg_link=""):
@@ -424,6 +424,7 @@ async def process_student_via_dm(client, user_entity, student_name, user_id, tg_
             "error": str(e)
         }, "error")
         return False
+
 # ==========================================
 # 🌾 8. HARVESTER ENGINE
 # ==========================================
@@ -610,10 +611,11 @@ async def harvester_task():
         await asyncio.sleep(900)
 
 # ==========================================
-# 💉 9. INJECTOR ENGINE
+# 💉 9. INJECTOR ENGINE (ONLY GHOST DM)
 # ==========================================
+
 async def injector_task():
-    logger.info("💉 Injector Engine Started!")
+    logger.info("💉 Injector Engine Started (Ghost DM Only)!")
     
     while is_engine_running:
         try:
@@ -628,6 +630,7 @@ async def injector_task():
                 await asyncio.sleep(3600)
                 continue
             
+            # Update cooling accounts to ready
             now_ts = datetime.now(pytz.utc).timestamp()
             await accounts_pool.update_many(
                 {"status": "cooling", "cooldown_until": {"$lt": now_ts}},
@@ -656,13 +659,9 @@ async def injector_task():
                 await client.connect()
                 logger.info(f"✅ Injector connected: {acc_id}")
                 
-                try:
-                    await client(functions.channels.JoinChannelRequest(TARGET_GROUP))
-                    logger.info(f"✅ Auto-joined {TARGET_GROUP}")
-                except Exception as e:
-                    logger.debug(f"Auto-join skipped: {e}")
+                # 🔥 AUTO-JOIN HATAYA GAYA - TARGET_GROUP JOIN NAHI KARENGE
+                # क्योंकि अब Direct Add नहीं करना है, सिर्फ DM भेजना है
                 
-                target_entity = await client.get_entity(TARGET_GROUP)
                 max_adds = config.get("max_adds", 35)
                 
                 while daily_adds < max_adds and is_working_hour() and not config.get("is_paused"):
@@ -676,16 +675,18 @@ async def injector_task():
                     user_name = user_doc.get('name', 'Unknown')
                     tg_link = user_doc.get('tg_link', '')
                     
+                    # Skip if already blacklisted
                     if await is_blacklisted(user_id):
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                         continue
                     
+                    # Resolve entity
                     target_user = user_id
                     if "https://t.me/" in tg_link:
                         target_user = tg_link.replace("https://t.me/", "")
                     
                     add_successful = False
-                    add_method = "direct"
+                    add_method = "ghost_dm"
                     
                     try:
                         try:
@@ -694,30 +695,30 @@ async def injector_task():
                             logger.warning(f"Entity resolution failed: {e}")
                             user_entity = target_user
                         
-                        await client(functions.channels.InviteToChannelRequest(target_entity, [user_entity]))
-                        add_successful = True
-                        add_method = "direct"
-                        logger.info(f"✅ Direct added: {user_name}")
+                        # 🚀 DIRECT ADD HATA DIYA GAYA HAI - SEEDHA GHOST DM CALL KARENGE
+                        logger.info(f"📩 Sending Ghost DM directly to {user_name} ({user_id})")
                         
-                    except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError) as e:
-                        logger.info(f"🔒 Privacy restricted, sending Ghost DM to {user_name}")
-                        result = await process_student_via_dm(client, user_entity, user_name, user_id)
+                        result = await process_student_via_dm(client, user_entity, user_name, user_id, tg_link)
+                        
                         if result == "FLOOD":
                             raise errors.PeerFloodError(request=None)
                         elif result == True:
                             add_successful = True
                             add_method = "ghost_dm"
+                            logger.info(f"✅ Ghost DM sent to {user_name}")
                         else:
                             add_successful = False
+                            logger.warning(f"⚠️ Ghost DM failed for {user_name}")
                             
                     except errors.PeerFloodError:
                         logger.warning(f"🚫 Flood limit reached for {acc_id}")
                         raise
                         
                     except Exception as e:
-                        logger.error(f"Failed to add {user_name}: {e}")
+                        logger.error(f"Failed to send Ghost DM to {user_name}: {e}")
                         add_successful = False
                     
+                    # Database updates
                     try:
                         if add_successful:
                             await master_blacklist.insert_one({
@@ -730,11 +731,12 @@ async def injector_task():
                             daily_adds += 1
                         
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
-                        await log_operation("add_user", {"user_id": user_id, "method": add_method}, "success" if add_successful else "error")
+                        await log_operation("ghost_dm", {"user_id": user_id, "name": user_name}, "success" if add_successful else "error")
                         
                     except Exception as e:
                         logger.error(f"Database update error: {e}")
                     
+                    # Delay (Ghost DM के बाद)
                     if add_successful:
                         delay = random.randint(config.get("min_delay", 8), config.get("max_delay", 16))
                         logger.info(f"⏳ Sleeping {delay}s... ({daily_adds}/{max_adds})")
@@ -786,7 +788,7 @@ async def injector_task():
         await asyncio.sleep(30)
 
 # ==========================================
-# 🤖 10. ADMIN BOT COMMAND HANDLER (FIXED)
+# 🤖 10. ADMIN BOT COMMAND HANDLER
 # ==========================================
 @admin_bot.on(events.NewMessage(incoming=True))
 async def admin_chat_handler(event):
@@ -825,9 +827,8 @@ async def admin_chat_handler(event):
             
             reply = (
                 f"📊 **System Report** 📊\n\n"
-                f"✅ **Total Added:** {total_added}\n"
-                f" ├ 🎯 **Direct:** {direct_add}\n"
-                f" └ 📩 **Ghost DM:** {dm_sent}\n\n"
+                f"✅ **Total Processed:** {total_added}\n"
+                f" └ 📩 **Ghost DM Sent:** {dm_sent}\n\n"
                 f"📥 **Pending Queue:** {queue}\n"
                 f"🟢 **Ready IDs:** {ready} | 🔴 **Cooling:** {cooling}\n"
                 f"⚙️ **Limits:** {config['max_adds']} adds, {config['min_delay']}-{config['max_delay']}s delay\n"
