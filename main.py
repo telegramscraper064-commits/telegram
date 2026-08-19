@@ -339,34 +339,17 @@ async def log_operation(operation, details, status="success"):
 async def process_student_via_dm(client, user_entity, student_name, user_id, tg_link=""):
     """
     Student को Ghost DM (Invitation Link) भेजें और अपनी Chat History से Delete करें।
-    
-    Args:
-        client: Telegram Client
-        user_entity: Student का Entity (User object ya InputEntity)
-        student_name: Student का नाम
-        user_id: Student का User ID
-        tg_link: Student का Telegram Link (Optional)
-    
-    Returns:
-        True: DM Successfully Sent
-        False: DM Failed (कोई Error)
-        "FLOOD": Flood Limit Reached
     """
     try:
-        # 📨 Custom Message बनाएं (Student के नाम के साथ)
         custom_message = INVITE_MESSAGE.format(name=student_name)
         
-        # 1️⃣ Student को DM भेजें
         logger.info(f"📩 Sending invitation DM to {student_name} ({user_id})")
         sent_msg = await client.send_message(user_entity, custom_message)
         
-        # 2️⃣ Ghost Mode: Message को अपनी Side से Delete करें
-        # revoke=False → सिर्फ आपकी Chat History से Delete होगा, Student के Inbox में रहेगा
         await client.delete_messages(user_entity, [sent_msg.id], revoke=False)
         
         logger.info(f"✅ Ghost DM sent to {student_name} ({user_id})")
         
-        # 3️⃣ Student को Global Blacklist में Save करें (ताकि दोबारा DM न भेजें)
         await master_blacklist.insert_one({
             "user_id": user_id,
             "name": student_name,
@@ -375,7 +358,6 @@ async def process_student_via_dm(client, user_entity, student_name, user_id, tg_
             "added_at": datetime.now(pytz.utc)
         })
         
-        # 4️⃣ Operation Log में Save करें
         await log_operation("ghost_dm", {
             "user_id": user_id, 
             "name": student_name,
@@ -385,7 +367,6 @@ async def process_student_via_dm(client, user_entity, student_name, user_id, tg_
         return True
 
     except errors.PeerFloodError:
-        # 🚫 Flood Limit Reached
         logger.error(f"🔴 Flood limit reached for ghost DM to {student_name} ({user_id})")
         await log_operation("ghost_dm", {
             "user_id": user_id, 
@@ -394,7 +375,6 @@ async def process_student_via_dm(client, user_entity, student_name, user_id, tg_
         return "FLOOD"
     
     except errors.UserIsBlockedError:
-        # 🚫 Student ने Bot/Account को Block किया है
         logger.warning(f"⚠️ User {student_name} ({user_id}) has blocked the account")
         await master_blacklist.insert_one({
             "user_id": user_id,
@@ -405,19 +385,16 @@ async def process_student_via_dm(client, user_entity, student_name, user_id, tg_
         return False
         
     except errors.UserPrivacyRestrictedError:
-        # 🔒 Student की Privacy Setting DM को Block करती है
         logger.warning(f"🔒 User {student_name} ({user_id}) has privacy restricted (cannot receive DM)")
         return False
         
     except errors.FloodWaitError as e:
-        # ⏳ Telegram ने Wait करने को कहा है
         wait_time = e.seconds + random.randint(5, 15)
         logger.warning(f"⏳ FloodWait: Waiting {wait_time} seconds before retry...")
         await asyncio.sleep(wait_time)
         return "FLOOD"
         
     except Exception as e:
-        # ❌ Unknown Error
         logger.error(f"❌ Ghost DM failed for {student_name} ({user_id}): {e}")
         await log_operation("ghost_dm", {
             "user_id": user_id,
@@ -611,11 +588,11 @@ async def harvester_task():
         await asyncio.sleep(900)
 
 # ==========================================
-# 💉 9. INJECTOR ENGINE (ONLY GHOST DM)
+# 💉 9. INJECTOR ENGINE (DIRECT ADD + RETRY + VERIFY + DM FALLBACK)
 # ==========================================
 
 async def injector_task():
-    logger.info("💉 Injector Engine Started (Ghost DM Only)!")
+    logger.info("💉 Injector Engine Started (Direct Add + Retry + Verify)!")
     
     while is_engine_running:
         try:
@@ -659,9 +636,14 @@ async def injector_task():
                 await client.connect()
                 logger.info(f"✅ Injector connected: {acc_id}")
                 
-                # 🔥 AUTO-JOIN HATAYA GAYA - TARGET_GROUP JOIN NAHI KARENGE
-                # क्योंकि अब Direct Add नहीं करना है, सिर्फ DM भेजना है
+                # 🔥 Auto-join karna hoga (Direct Add ke liye)
+                try:
+                    await client(functions.channels.JoinChannelRequest(TARGET_GROUP))
+                    logger.info(f"✅ Auto-joined {TARGET_GROUP}")
+                except Exception as e:
+                    logger.debug(f"Auto-join skipped: {e}")
                 
+                target_entity = await client.get_entity(TARGET_GROUP)
                 max_adds = config.get("max_adds", 35)
                 
                 while daily_adds < max_adds and is_working_hour() and not config.get("is_paused"):
@@ -686,37 +668,87 @@ async def injector_task():
                         target_user = tg_link.replace("https://t.me/", "")
                     
                     add_successful = False
-                    add_method = "ghost_dm"
+                    add_method = "direct"
+                    retry_count = 0
+                    max_retries = 3
                     
+                    # 🔥 RESOLVE ENTITY
                     try:
-                        try:
-                            user_entity = await client.get_input_entity(target_user)
-                        except Exception as e:
-                            logger.warning(f"Entity resolution failed: {e}")
-                            user_entity = target_user
-                        
-                        # 🚀 DIRECT ADD HATA DIYA GAYA HAI - SEEDHA GHOST DM CALL KARENGE
-                        logger.info(f"📩 Sending Ghost DM directly to {user_name} ({user_id})")
-                        
-                        result = await process_student_via_dm(client, user_entity, user_name, user_id, tg_link)
-                        
-                        if result == "FLOOD":
-                            raise errors.PeerFloodError(request=None)
-                        elif result == True:
-                            add_successful = True
-                            add_method = "ghost_dm"
-                            logger.info(f"✅ Ghost DM sent to {user_name}")
-                        else:
-                            add_successful = False
-                            logger.warning(f"⚠️ Ghost DM failed for {user_name}")
-                            
-                    except errors.PeerFloodError:
-                        logger.warning(f"🚫 Flood limit reached for {acc_id}")
-                        raise
-                        
+                        user_entity = await client.get_input_entity(target_user)
                     except Exception as e:
-                        logger.error(f"Failed to send Ghost DM to {user_name}: {e}")
-                        add_successful = False
+                        logger.warning(f"Entity resolution failed: {e}")
+                        user_entity = target_user
+                    
+                    # 🔥 DIRECT ADD WITH RETRY
+                    while retry_count < max_retries and not add_successful:
+                        try:
+                            await client(functions.channels.InviteToChannelRequest(target_entity, [user_entity]))
+                            add_successful = True
+                            add_method = "direct"
+                            logger.info(f"✅ Direct added: {user_name}")
+                            break
+                            
+                        except errors.PeerFloodError:
+                            logger.warning(f"🚫 Flood limit reached for {acc_id}")
+                            raise
+                            
+                        except errors.UserPrivacyRestrictedError:
+                            logger.info(f"🔒 Privacy restricted: {user_name} → Fallback DM")
+                            # Fallback to DM
+                            result = await process_student_via_dm(client, user_entity, user_name, user_id, tg_link)
+                            if result == "FLOOD":
+                                raise errors.PeerFloodError(request=None)
+                            elif result == True:
+                                add_successful = True
+                                add_method = "ghost_dm"
+                            else:
+                                add_successful = False
+                            break
+                            
+                        except errors.UserNotMutualContactError:
+                            logger.info(f"🔒 Not mutual: {user_name} → Fallback DM")
+                            result = await process_student_via_dm(client, user_entity, user_name, user_id, tg_link)
+                            if result == "FLOOD":
+                                raise errors.PeerFloodError(request=None)
+                            elif result == True:
+                                add_successful = True
+                                add_method = "ghost_dm"
+                            else:
+                                add_successful = False
+                            break
+                            
+                        except errors.FloodWaitError as e:
+                            wait_time = e.seconds + random.randint(5, 15)
+                            logger.warning(f"⏳ FloodWait: Waiting {wait_time}s... (Retry {retry_count+1}/{max_retries})")
+                            await asyncio.sleep(wait_time)
+                            retry_count += 1
+                            
+                        except Exception as e:
+                            logger.warning(f"⚠️ Add error ({retry_count+1}/{max_retries}): {e}")
+                            retry_count += 1
+                            await asyncio.sleep(random.randint(3, 7))
+                    
+                    # 🔥 VERIFY: Check if user actually added
+                    if add_successful and add_method == "direct":
+                        try:
+                            # Check if user is in group
+                            participants = await client.get_participants(target_entity, limit=10)
+                            user_ids = [p.id for p in participants]
+                            if user_id in user_ids:
+                                logger.info(f"✅ VERIFIED: {user_name} is in group")
+                            else:
+                                logger.warning(f"⚠️ NOT VERIFIED: {user_name} not found in group, trying DM...")
+                                # Fallback to DM
+                                result = await process_student_via_dm(client, user_entity, user_name, user_id, tg_link)
+                                if result == "FLOOD":
+                                    raise errors.PeerFloodError(request=None)
+                                elif result == True:
+                                    add_successful = True
+                                    add_method = "ghost_dm_after_fail"
+                                else:
+                                    add_successful = False
+                        except Exception as e:
+                            logger.warning(f"⚠️ Verification failed: {e}")
                     
                     # Database updates
                     try:
@@ -731,12 +763,12 @@ async def injector_task():
                             daily_adds += 1
                         
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
-                        await log_operation("ghost_dm", {"user_id": user_id, "name": user_name}, "success" if add_successful else "error")
+                        await log_operation("add_user", {"user_id": user_id, "method": add_method}, "success" if add_successful else "error")
                         
                     except Exception as e:
                         logger.error(f"Database update error: {e}")
                     
-                    # Delay (Ghost DM के बाद)
+                    # Delay (Direct Add या DM के बाद)
                     if add_successful:
                         delay = random.randint(config.get("min_delay", 8), config.get("max_delay", 16))
                         logger.info(f"⏳ Sleeping {delay}s... ({daily_adds}/{max_adds})")
@@ -795,16 +827,13 @@ async def admin_chat_handler(event):
     try:
         sender = await event.get_sender()
         
-        # 🔥 FIX: Username Check को Safe बनाएं
         if not sender:
             return
             
-        # अगर Sender का Username नहीं है, तो Ignore करें
         if not sender.username:
             logger.warning(f"⚠️ Sender {sender.id} has no username, ignoring")
             return
             
-        # 🔥 FIX: Case-Insensitive Check
         if sender.username.lower() != ADMIN_USERNAME.lower():
             logger.info(f"⏭️ Ignoring message from {sender.username} (not admin)")
             return
@@ -820,7 +849,7 @@ async def admin_chat_handler(event):
             
             total_added = await master_blacklist.count_documents({})
             dm_sent = await master_blacklist.count_documents({"add_method": "ghost_dm"})
-            direct_add = await master_blacklist.count_documents({"add_method": "direct"})
+            direct_add = await master_blacklist.count_documents({"add_method": {"$in": ["direct", "direct_verified"]}})
             
             config = await get_system_config()
             sources = await get_source_channels()
@@ -828,6 +857,7 @@ async def admin_chat_handler(event):
             reply = (
                 f"📊 **System Report** 📊\n\n"
                 f"✅ **Total Processed:** {total_added}\n"
+                f" ├ 🎯 **Direct Added:** {direct_add}\n"
                 f" └ 📩 **Ghost DM Sent:** {dm_sent}\n\n"
                 f"📥 **Pending Queue:** {queue}\n"
                 f"🟢 **Ready IDs:** {ready} | 🔴 **Cooling:** {cooling}\n"
