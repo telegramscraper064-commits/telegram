@@ -1,21 +1,25 @@
+"""
+Agri Mastermind AI Engine v3.0 - Production Ready
+"""
+
 import os
 import asyncio
-import random
 import logging
+import random
 import re
 import socks
 from datetime import datetime, timedelta
 import pytz
 from google import genai
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
-from telethon import TelegramClient, events, errors, functions
+from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
-from telethon.tl.types import User, MessageActionChatAddUser, ChannelParticipantsAdmins
-from contextlib import asynccontextmanager
+from telethon.tl.types import User, ChannelParticipantsAdmins
+from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
 
 # ==========================================
-# 🛠️ 1. LOGGING & CONFIGURATION
+# LOGGING
 # ==========================================
 logging.basicConfig(
     format='%(asctime)s - [%(levelname)s] - %(name)s - %(message)s',
@@ -24,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# 📦 2. ENVIRONMENT VARIABLES (Render पर Set करें)
+# ENVIRONMENT VARIABLES
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8857141734:AAGmL8gjCRZfbZyZeSaszs6_vcSXuGco0HE")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6LU2kQij3-Q64wr6xlumvZK_5VcM_Mx695A5maMGjTZkA")
@@ -32,26 +36,14 @@ API_ID = int(os.getenv("API_ID", 33239973))
 API_HASH = os.getenv("API_HASH", "81430d577ca915f53c4b2827ba7c723f")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://mailforfulltest_db_user:1vmiEQA28y0ok4Fh@cluster0.k85vzmp.mongodb.net/?appName=Cluster0")
 
-# Core Constants
 TARGET_GROUP = os.getenv("TARGET_GROUP", "agriquizworld")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "agrikrishna")
-COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", 36))
+MAX_ADDS_PER_DAY = int(os.getenv("MAX_ADDS_PER_DAY", 20))
+COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", 24))
 IST = pytz.timezone('Asia/Kolkata')
 
 # ==========================================
-# 🧠 3. AI & SPAM CONFIG
-# ==========================================
-SPAM_REGEX = re.compile(r'crypto|casino|invest|bitcoin|fx|binance|betting|earn|porn|adult', re.IGNORECASE)
-
-INVITE_MESSAGE = (
-    "Yo {name}! 👋\n\n"
-    "Prepping for Agri exams? We drop daily quizzes and absolute W notes here. 📚✨\n\n"
-    "Join the squad: 👉 https://t.me/agriquizworld\n\n"
-    "Let's secure that bag! 🚀"
-)
-
-# ==========================================
-# 💾 4. DATABASE & CLIENTS
+# DATABASE
 # ==========================================
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client['telegram_scraper_safe']
@@ -62,24 +54,19 @@ master_blacklist = db['global_added']
 system_config = db['system_config']
 operation_logs = db['operation_logs']
 
-# AI Client
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
-
-# Telegram Admin Bot Client
-admin_bot = TelegramClient('admin_bot_session', API_ID, API_HASH)
-
-# Global State
+admin_bot = TelegramClient('admin_bot', API_ID, API_HASH)
 is_engine_running = False
 
 # ==========================================
-# 🔧 5. DATABASE UTILITY FUNCTIONS
+# UTILITY FUNCTIONS
 # ==========================================
-async def seed_accounts_if_empty():
-    """Seed initial accounts if pool is empty"""
+
+async def seed_accounts():
+    """Seed accounts if pool is empty"""
     try:
         count = await accounts_pool.count_documents({})
         if count > 0:
-            logger.info(f"✅ Accounts pool already has {count} accounts")
+            logger.info(f"✅ Accounts pool: {count} accounts")
             return
             
         initial_accounts = [
@@ -88,111 +75,49 @@ async def seed_accounts_if_empty():
                 "session_string": "1BVtsOJABu2KfNbcYM0PuNc2W5X4KRKHWn6PoLtNYaJjkKhCqM2cwnIrpCy1A71InQNhEIwaygzQlXB1RPIwVQAque3oEfQtKTgn3Mw56RzyPF0FKjAgIjcL8b_l5kgFaQUxwBjBvirhbEWWeKfqbdpau3O6PoKKEJjaOXqaiXpNaP7CU-Mn2sIwqkuCSDkkw9aDYTQzPq46YL2AVQbOw72wbRwt1piaLKWanNrSJ9DUFHOKdqCkA-sP9PJANiJDyKsmWp6Z0tX-ntLBVqMphkVB03oaNVDFzWaFnUsOewqMU_Y0n42TsxBD6-MFvDxgdvVr-T_if3A-lhomb5E9D7Uk0JdcdgoI=",
                 "proxy": "31.59.20.176:6754:obekiuxk:c2itxr9847ac",
                 "status": "ready",
-                "cooldown_until": 0,
-                "created_at": datetime.now(pytz.utc)
+                "cooldown_until": 0
             },
             {
-                "account_id": "7985169157",
-                "session_string": "1BVtsOKwBu01UNwz8ZrH7jP8KM3g_BDq-D1lKVbGc2h6KlxWiVhP7s_svdezBCMFcU0YoZ1NXz2M-7TY7UCf4CsuAi_KG2AML6O83ktDcNvcQEzn-qg1MXJcrUhv6x4-I6poP8A1GBXTYnupGYAfr1s-uypFH5zPYvlnFZC2dS8FfhSMnwmRR3cxtlkTRwsesqFWw6TI_Pvobbjmddy_mByDmNPwHa0bfMgR9j49JhU8140cPTQUxogKm9f4UqR76y7Texect_JVMabP2_zN_ZGoDNSYubThSpdgbff9BAMNc5qXZlw8lsMz6q8v6Gro-TWG4BkU-Tl1r8qZU5k0qYxojVcI8Gzc=",
-                "proxy": "45.38.107.97:6014:obekiuxk:c2itxr9847ac",
+                "account_id": "7238051659",
+                "session_string": "1BVtsOMEBu0T7jep1-0LN_nY0k-qIedAbTROqFc5R9ENfdhfccf_HdTWNxct8Cz2ds4zjj0u_K_VnwZXeDbvZQj9BxvyI9N8KMFjz-fFSCNFcD1ENzxPUHHlIH8a0MuqxJ1PgRNYyPRFIVSFfGGdA47ceE50BFis01ob51dlIsF2wR6UTloO3OTccrtJbdSGWwmSn56pZR4_mepAtwxwu5_TZ8o5YtW9wGH_QijkownVVliGfr1wIi-8wPWnLhvLnDFr7tfGiU9mqWLpjoOiuIj9bmnmAU9Lch-crjUAyHo6pVTcEg7SUpb-OXax6KYqF7ZITBUgDzXxgQtIdlmk9yitjpz4cuBw=",
+                "proxy": "38.154.185.97:6370:obekiuxk:c2itxr9847ac",
                 "status": "ready",
-                "cooldown_until": 0,
-                "created_at": datetime.now(pytz.utc)
-            },
-            {
-                "account_id": "9569579629_didi",
-                "session_string": "1BVtsOH4Bu1fZsOCOnXedYiLJvSUzowlvpMxdDTaMvLnD0zqzg4dPtlFoeqfZsmsydOQuOKN0lGuVvO99iY7HK5s0TrT1eOAFwxMrj1zWY2vPkchvE8KrTQzmfAgxoOLfjAkQTj9B5zFh70gYgd0hwJvwn75v3fYstXt-ulLgDT_UzmHyXEp59sXU1jGFmqtSk88jGZ6taDmZpU7iwrUXwQXXGkwGnjOlu9VLtTW85-RcCG5vcZkzeaKvHS-yK_4U_FRaVwBpGtwGadCkbrjNu0asCp5ELm4Jy3x-ZMCFNniDqbLANge03Qr1FA_CBJOgP8WSP-5_O5mseL8oeJOXyYz__5AmTpE=",
-                "proxy": "198.105.121.200:6462:obekiuxk:c2itxr9847ac",
-                "status": "ready",
-                "cooldown_until": 0,
-                "created_at": datetime.now(pytz.utc)
-            },
-            {
-                "account_id": "9303815860_sudha",
-                "session_string": "1BVtsOH4Bu5pkBe4mqH3Q6wspEUzTNVaowvi844eM7mbxl__XdK4a_qvmfCyR0n0RA4HFmHZhT92t3oMxvMuUABOXrvbE5MtUyaOgaODa2O-Yz6Kn5PzWPqpeLWppbBsMGdswqvwjdXjCVzi0NjpY1vNh4uBWcn-Ky7AdGe7dXq-JC-AUIWhySfcuU-M-R_Hwup6m1mgEJ-aLFYTQ8rzy08O-pRs3lO8n_viIvyAbGTmMfa1VTcye6eIFIhhA_AcuOCwDsnN4-2R2w3-Q9N6rAjV8K1-bu7pPviQ-pJ1qktoUCLUzl7R6p4QTgqEsIO4LCu_9sOMrzzeu_tzbCQhoCIljJdTHmc4=",
-                "proxy": "64.137.96.74:6641:obekiuxk:c2itxr9847ac",
-                "status": "ready",
-                "cooldown_until": 0,
-                "created_at": datetime.now(pytz.utc)
-            },
-            {
-                "account_id": "Account_5",
-                "session_string": "1BVtsOH4BuwM9jPFW8r1AII2WR1-ANOlOqE95k1GPl4D09Ynx3Emf_Yr4dqxX6IZ0h30XvlD3ANbxd4Vd5ceP11sYmxSS33zMyxmhgYLJxOZIU-To3PCIXC_xEzf8gT5eu8MPaAvZbNjxypEcstYK5aNerpmmABizYnBix6ZUSMESiTEh9X-R5E17OffHPzojONVAY2bwAAOvYV4Cd4PCEAkW-sac8_Yjm66eNg-nu6sCbhekqxO3exkZgBMmPDZ3qLzjbS29toYHZq7MfSO3MvmjBWnY611s-kPVXWWJrH4knGBig8lxzrtyT6QVdaG6uJU2TO3iRPgHc1To-OaISry-lNdQeoU=",
-                "proxy": "142.111.67.146:5611:obekiuxk:c2itxr9847ac",
-                "status": "ready",
-                "cooldown_until": 0,
-                "created_at": datetime.now(pytz.utc)
-            },
-            {
-                "account_id": "9455647843",
-                "session_string": "1BVtsOJABuxUEaaZDmKad8UsvHgNwmLjJWfrhMeiWoVtkFV-vJdZ5OQ5YOPgx834tdZcd4N6Z8MYakGuLHjH-yl49Pw0yvOp0rv0OjXgeJvWXTvUiMJlx5KESD_uOuA2qH28A3fPsxauAN1axu2DmMug6BOwpNCAgZOWWpZpRlEhwbLHX_feHyUAVOPu4zj-69t8owdoZR9S1J5mV3qB1AfwaUbcb_acJUBfANjbMGpXxudDGhh3KlxeUiKflrYkYmEuLSumclYClzs5ShW1tpn1sssWWCGoJxigZ9wAi8YNH_sXDeOTjBtTsqIrXa2pfewzVkW88XjN7WuO_Jd0bENSIqR6gklg=",
-                "proxy": "31.56.127.193:7684:obekiuxk:c2itxr9847ac",
-                "status": "ready",
-                "cooldown_until": 0,
-                "created_at": datetime.now(pytz.utc)
-            },
-            {
-                "account_id": "6392166529",
-                "session_string": "1BVtsOJABu5IumbJNN3MCHtXRdhQGiShx-3Xy_3vZ4_hH3Y8M9j7yCLcMN_DX0v3ObCq0ZLBHnTUhvYgrqduhYjV_V2PsRKVjNcTTADnWoQkTMdxcz9rd6BtRd2eiM3AJGZimDMHiVOeD0ukI8uhVCY9Pkq0NcWERS7NjLH_OwtbEygR7j6JuAbStwKz2m3l0FoisOYdCa7Qji6i8KYQQG1U2WmbPPDnU2Cmr1B23Y1sOOgXOssSQA78lCdq8Q7CXtJvqMUUqGcbNtFTOCaTkZNvgRTudc1ZTmDwOfY_ZjvJQ3uY6ks_l19uOsx-dsddZXiR3q91-S00PoB-mfNQJCVnqY2mlSZY=",
-                "proxy": "198.23.243.226:6361:obekiuxk:c2itxr9847ac",
-                "status": "ready",
-                "cooldown_until": 0,
-                "created_at": datetime.now(pytz.utc)
+                "cooldown_until": 0
             }
         ]
         
         if initial_accounts:
             await accounts_pool.insert_many(initial_accounts)
-            logger.info(f"✅ Successfully seeded {len(initial_accounts)} accounts")
+            logger.info(f"✅ Seeded {len(initial_accounts)} accounts")
             
     except Exception as e:
-        logger.error(f"Failed to seed accounts: {e}", exc_info=True)
+        logger.error(f"Seed error: {e}")
 
-async def get_system_config():
-    """Get or create system configuration"""
+async def get_config():
+    """Get system configuration"""
     try:
         config = await system_config.find_one({"_id": "core_limits"})
         if not config:
             config = {
                 "_id": "core_limits",
-                "max_adds": 35,
-                "min_delay": 8,
-                "max_delay": 16,
+                "max_adds": MAX_ADDS_PER_DAY,
+                "min_delay": 60,
+                "max_delay": 120,
                 "is_paused": False,
                 "source_channels": ["Dream_Agri", "AGLAERT", "afo2023interview", "Gen_Agriculture", "IBPSSO25"],
                 "last_updated": datetime.now(pytz.utc)
             }
             await system_config.insert_one(config)
-            logger.info("✅ System config created")
         return config
     except Exception as e:
-        logger.error(f"Failed to get system config: {e}", exc_info=True)
-        return {
-            "_id": "core_limits",
-            "max_adds": 35,
-            "min_delay": 8,
-            "max_delay": 16,
-            "is_paused": False,
-            "source_channels": ["Dream_Agri", "AGLAERT", "afo2023interview", "Gen_Agriculture", "IBPSSO25"]
-        }
-
-async def get_source_channels():
-    """Get source channels list"""
-    try:
-        config = await get_system_config()
-        return config.get("source_channels", ["Dream_Agri", "AGLAERT", "afo2023interview", "Gen_Agriculture", "IBPSSO25"])
-    except Exception as e:
-        logger.error(f"Failed to get source channels: {e}", exc_info=True)
-        return ["Dream_Agri", "AGLAERT", "afo2023interview", "Gen_Agriculture", "IBPSSO25"]
-
-def get_ist_now():
-    return datetime.now(IST)
+        return {"max_adds": MAX_ADDS_PER_DAY, "min_delay": 60, "max_delay": 120, "is_paused": False}
 
 def is_working_hour():
-    current_hour = get_ist_now().hour
-    return 9 <= current_hour < 22
+    """Check if within working hours (9 AM - 10 PM IST)"""
+    return 9 <= datetime.now(IST).hour < 22
 
 def parse_proxy(proxy_str):
+    """Parse proxy string for Telethon"""
     if not proxy_str:
         return None
     try:
@@ -200,414 +125,137 @@ def parse_proxy(proxy_str):
         if len(parts) >= 4:
             return (socks.SOCKS5, parts[0], int(parts[1]), True, parts[2], parts[3])
         return None
-    except Exception as e:
-        logger.warning(f"Failed to parse proxy: {e}")
+    except:
         return None
 
 async def is_blacklisted(user_id):
+    """Check if user is already added"""
     try:
         return await master_blacklist.find_one({"user_id": user_id}) is not None
-    except Exception as e:
-        logger.error(f"Failed to check blacklist: {e}")
+    except:
         return False
 
 # ==========================================
-# 🤖 6. AI & UTILITY FUNCTIONS (Gemini 3 Series)
+# HARVESTER ENGINE
 # ==========================================
 
-async def safe_generate_ai_response(prompt_text):
-    """
-    Admin Bot के AI Replies के लिए - Gemini 3 Series Models
-    Primary: gemini-3.6-flash (Complex Tasks)
-    Fallback: gemini-3.1-flash-lite (Light Tasks)
-    """
-    
-    # 🔥 Gemini 3 Series Models
-    primary_model = "gemini-3.6-flash"      # भारी काम (Complex Reasoning)
-    fallback_model = "gemini-3.1-flash-lite" # हल्के काम (Fast & Efficient)
-    
-    try:
-        # Primary Model से Try करें
-        logger.info(f"🤖 Trying with Primary Model: {primary_model}")
-        response = ai_client.models.generate_content(
-            model=primary_model,
-            contents=prompt_text
-        )
-        if response and response.text:
-            logger.info(f"✅ Response from {primary_model}")
-            return response.text
-        else:
-            raise Exception("Empty response from primary model")
-            
-    except Exception as e:
-        # Primary Model Fail होने पर Fallback Try करें
-        logger.warning(f"⚠️ Primary model {primary_model} failed: {e}")
-        logger.info(f"🔄 Switching to Fallback: {fallback_model}")
-        
-        try:
-            response = ai_client.models.generate_content(
-                model=fallback_model,
-                contents=prompt_text
-            )
-            if response and response.text:
-                logger.info(f"✅ Response from {fallback_model}")
-                return response.text
-            else:
-                raise Exception("Empty response from fallback model")
-                
-        except Exception as fallback_error:
-            logger.error(f"❌ Both models failed. Error: {fallback_error}")
-            return "⚠️ All AI models are currently busy. Please try again in a few seconds!"
-
-async def ai_auto_heal(error_message, account_id):
-    """
-    AI Self-Healing System - Gemini 3 Series Models
-    """
-    try:
-        prompt = f"A Telegram automation script got this error on account {account_id}: '{error_message}'. If it's a flood/spam error, give safer limits. Reply strictly with three numbers separated by commas for max_adds,min_delay,max_delay e.g., '25,12,20'"
-        
-        # 🔥 Gemini 3 Series Models
-        primary_model = "gemini-3.6-flash"
-        fallback_model = "gemini-3.1-flash-lite"
-        
-        try:
-            # Primary Model Try करें
-            response = ai_client.models.generate_content(
-                model=primary_model,
-                contents=prompt
-            )
-            if response and response.text:
-                nums = re.findall(r'\d+', response.text)
-                if len(nums) >= 3:
-                    new_max, new_min, new_max_d = int(nums[0]), int(nums[1]), int(nums[2])
-                    new_max = max(20, min(40, new_max))
-                    
-                    await system_config.update_one(
-                        {"_id": "core_limits"},
-                        {"$set": {"max_adds": new_max, "min_delay": new_min, "max_delay": new_max_d}}
-                    )
-                    return f"🤖 AI Self-Healing Triggered: Limits balanced to {new_max} adds, {new_min}-{new_max_d}s delay."
-                else:
-                    raise Exception("Invalid response format")
-                    
-        except Exception as e:
-            # Fallback Try करें
-            logger.warning(f"⚠️ Healing primary model failed: {e}")
-            logger.info(f"🔄 Healing switching to fallback: {fallback_model}")
-            
-            try:
-                response = ai_client.models.generate_content(
-                    model=fallback_model,
-                    contents=prompt
-                )
-                if response and response.text:
-                    nums = re.findall(r'\d+', response.text)
-                    if len(nums) >= 3:
-                        new_max, new_min, new_max_d = int(nums[0]), int(nums[1]), int(nums[2])
-                        new_max = max(20, min(40, new_max))
-                        
-                        await system_config.update_one(
-                            {"_id": "core_limits"},
-                            {"$set": {"max_adds": new_max, "min_delay": new_min, "max_delay": new_max_d}}
-                        )
-                        return f"🤖 AI Self-Healing Triggered (fallback): Limits balanced to {new_max} adds, {new_min}-{new_max_d}s delay."
-                    else:
-                        return None
-            except Exception as fallback_error:
-                logger.error(f"❌ Both healing models failed: {fallback_error}")
-                return None
-                
-    except Exception as e:
-        logger.error(f"AI Healing failed: {e}")
-    return None
-
-async def log_operation(operation, details, status="success"):
-    try:
-        await operation_logs.insert_one({
-            "operation": operation,
-            "details": details,
-            "status": status,
-            "timestamp": datetime.now(pytz.utc)
-        })
-    except Exception as e:
-        logger.error(f"Failed to log operation: {e}")
-
-# ==========================================
-# 👻 7. GHOST DM FUNCTION
-# ==========================================
-
-async def process_student_via_dm(client, user_entity, student_name, user_id, tg_link=""):
-    """
-    Student को Ghost DM (Invitation Link) भेजें और अपनी Chat History से Delete करें।
-    """
-    try:
-        custom_message = INVITE_MESSAGE.format(name=student_name)
-        
-        logger.info(f"📩 Sending invitation DM to {student_name} ({user_id})")
-        sent_msg = await client.send_message(user_entity, custom_message)
-        
-        await client.delete_messages(user_entity, [sent_msg.id], revoke=False)
-        
-        logger.info(f"✅ Ghost DM sent to {student_name} ({user_id})")
-        
-        await master_blacklist.insert_one({
-            "user_id": user_id,
-            "name": student_name,
-            "tg_link": tg_link or f"tg://user?id={user_id}",
-            "add_method": "ghost_dm",
-            "added_at": datetime.now(pytz.utc)
-        })
-        
-        await log_operation("ghost_dm", {
-            "user_id": user_id, 
-            "name": student_name,
-            "message": custom_message[:50] + "..."
-        }, "success")
-        
-        return True
-
-    except errors.PeerFloodError:
-        logger.error(f"🔴 Flood limit reached for ghost DM to {student_name} ({user_id})")
-        await log_operation("ghost_dm", {
-            "user_id": user_id, 
-            "error": "flood"
-        }, "error")
-        return "FLOOD"
-    
-    except errors.UserIsBlockedError:
-        logger.warning(f"⚠️ User {student_name} ({user_id}) has blocked the account")
-        await master_blacklist.insert_one({
-            "user_id": user_id,
-            "name": student_name,
-            "add_method": "blocked",
-            "added_at": datetime.now(pytz.utc)
-        })
-        return False
-        
-    except errors.UserPrivacyRestrictedError:
-        logger.warning(f"🔒 User {student_name} ({user_id}) has privacy restricted (cannot receive DM)")
-        return False
-        
-    except errors.FloodWaitError as e:
-        wait_time = e.seconds + random.randint(5, 15)
-        logger.warning(f"⏳ FloodWait: Waiting {wait_time} seconds before retry...")
-        await asyncio.sleep(wait_time)
-        return "FLOOD"
-        
-    except Exception as e:
-        logger.error(f"❌ Ghost DM failed for {student_name} ({user_id}): {e}")
-        await log_operation("ghost_dm", {
-            "user_id": user_id,
-            "error": str(e)
-        }, "error")
-        return False
-
-# ==========================================
-# 🌾 8. HARVESTER ENGINE
-# ==========================================
-async def harvester_task():
-    logger.info("🌾 Ultimate Harvester Engine Started!")
+async def harvester_engine():
+    """Scrape users from source channels"""
+    logger.info("🌾 Harvester Engine Started!")
+    global is_engine_running
     
     while is_engine_running:
         try:
-            config = await get_system_config()
+            config = await get_config()
             if config.get("is_paused"):
-                logger.info("⏸️ Harvester paused by admin")
                 await asyncio.sleep(60)
                 continue
             
-            account = await accounts_pool.find_one({
-                "status": {"$in": ["ready", "cooling"]}
-            })
-            
+            account = await accounts_pool.find_one({"status": "ready"})
             if not account:
-                logger.info("⏳ No available accounts for harvesting, waiting...")
+                logger.info("⏳ No available accounts")
                 await asyncio.sleep(120)
                 continue
             
-            logger.info(f"🔄 Harvester using account: {account['account_id']}")
-            
-            proxy_tuple = parse_proxy(account.get("proxy"))
+            proxy = parse_proxy(account.get("proxy"))
             client = TelegramClient(
                 StringSession(account['session_string']),
                 API_ID,
                 API_HASH,
-                proxy=proxy_tuple
+                proxy=proxy
             )
             
             try:
                 await client.connect()
-                logger.info(f"✅ Harvester connected for {account['account_id']}")
+                logger.info(f"✅ Harvester connected: {account['account_id']}")
                 
-                source_channels = await get_source_channels()
-                total_new_users = 0
+                source_channels = config.get("source_channels", ["Dream_Agri"])
                 
                 for channel in source_channels:
                     if not is_engine_running:
                         break
-                        
-                    logger.info(f"🎯 Harvester scanning: {channel}")
                     
+                    logger.info(f"🎯 Scanning: {channel}")
+                    
+                    # Get admins
                     try:
-                        admins = []
-                        try:
-                            admins = await client.get_participants(channel, filter=ChannelParticipantsAdmins)
-                            admin_ids = [a.id for a in admins]
-                        except Exception as e:
-                            logger.warning(f"Could not fetch admins for {channel}: {e}")
-                            admin_ids = []
-                        
-                        participant_count = 0
-                        try:
-                            async for user in client.iter_participants(channel, limit=3000):
-                                if not isinstance(user, User) or user.bot or user.deleted or user.id in admin_ids:
-                                    continue
-                                
-                                full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
-                                if SPAM_REGEX.search(full_name):
-                                    continue
-                                    
-                                if not await is_blacklisted(user.id) and not await scraped_queue.find_one({"user_id": user.id}):
-                                    tg_link = f"https://t.me/{user.username}" if user.username else f"tg://user?id={user.id}"
-                                    await scraped_queue.insert_one({
-                                        "user_id": user.id,
-                                        "name": full_name or "Agri Student",
-                                        "tg_link": tg_link,
-                                        "status": "pending",
-                                        "source_channel": channel,
-                                        "scraped_at": datetime.now(pytz.utc)
-                                    })
-                                    participant_count += 1
-                                    if participant_count % 100 == 0:
-                                        logger.info(f"📊 Collected {participant_count} direct members from {channel}")
-                            logger.info(f"✅ Direct: {participant_count} members from {channel}")
-                        except Exception as e:
-                            logger.info(f"ℹ️ Direct member fetch not available for {channel}: {e}")
-                        
-                        logger.info(f"🔍 Deep scanning messages in {channel}")
-                        message_count = 0
-                        mention_count = 0
-                        
-                        async for message in client.iter_messages(channel, limit=5000):
-                            message_count += 1
-                            users_to_check = []
-                            
-                            try:
-                                if message.sender:
-                                    users_to_check.append(message.sender)
-                                
-                                if message.action and isinstance(message.action, MessageActionChatAddUser):
-                                    users_to_check.extend(message.action.users if hasattr(message.action, 'users') else [])
-                                
-                                if message.text:
-                                    mentions = re.findall(r'@([a-zA-Z0-9_]{5,32})', message.text)
-                                    for username in mentions:
-                                        tg_link = f"https://t.me/{username}"
-                                        if not await scraped_queue.find_one({"tg_link": tg_link}) and not await master_blacklist.find_one({"tg_link": tg_link}):
-                                            await scraped_queue.insert_one({
-                                                "user_id": f"resolve_{username}",
-                                                "name": username,
-                                                "tg_link": tg_link,
-                                                "status": "pending",
-                                                "source_channel": channel,
-                                                "scraped_at": datetime.now(pytz.utc)
-                                            })
-                                            mention_count += 1
-                                
-                                if getattr(message, 'poll', None) and hasattr(message.poll, 'poll') and message.poll.poll.public_voters:
-                                    try:
-                                        poll_votes = await client(functions.messages.GetPollVotesRequest(
-                                            peer=channel,
-                                            id=message.id,
-                                            option=b'',
-                                            limit=100
-                                        ))
-                                        users_to_check.extend(poll_votes.users)
-                                    except Exception as e:
-                                        pass
-                                
-                                if message.reactions:
-                                    try:
-                                        reactions = await client(functions.messages.GetMessageReactionsListRequest(
-                                            peer=channel, msg_id=message.id, limit=50
-                                        ))
-                                        users_to_check.extend(reactions.users)
-                                    except Exception as e:
-                                        pass
-                                        
-                            except Exception as e:
+                        admins = await client.get_participants(channel, filter=ChannelParticipantsAdmins)
+                        admin_ids = [a.id for a in admins]
+                    except:
+                        admin_ids = []
+                    
+                    count = 0
+                    try:
+                        async for user in client.iter_participants(channel, limit=500):
+                            if not isinstance(user, User) or user.bot or user.deleted:
                                 continue
                             
-                            for user in users_to_check:
-                                try:
-                                    if not isinstance(user, User) or user.bot or user.deleted or user.id in admin_ids:
-                                        continue
-                                    
-                                    full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
-                                    if SPAM_REGEX.search(full_name):
-                                        continue
-                                        
-                                    if not await is_blacklisted(user.id) and not await scraped_queue.find_one({"user_id": user.id}):
-                                        tg_link = f"https://t.me/{user.username}" if user.username else f"tg://user?id={user.id}"
-                                        await scraped_queue.insert_one({
-                                            "user_id": user.id,
-                                            "name": full_name or "Agri Student",
-                                            "tg_link": tg_link,
-                                            "status": "pending",
-                                            "source_channel": channel,
-                                            "scraped_at": datetime.now(pytz.utc)
-                                        })
-                                        total_new_users += 1
-                                except Exception as e:
-                                    continue
+                            if user.id in admin_ids:
+                                continue
                             
-                            if message_count % 500 == 0:
-                                logger.info(f"📊 Scanned {message_count} messages in {channel}")
-                        
-                        logger.info(f"✅ Deep scan: {mention_count} mentions, {message_count} messages in {channel}")
-                        await asyncio.sleep(15)
-                        
+                            if await is_blacklisted(user.id):
+                                continue
+                            
+                            existing = await scraped_queue.find_one({"user_id": user.id})
+                            if existing:
+                                continue
+                            
+                            name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "User"
+                            await scraped_queue.insert_one({
+                                "user_id": user.id,
+                                "name": name,
+                                "source_channel": channel,
+                                "scraped_at": datetime.now(pytz.utc),
+                                "status": "pending"
+                            })
+                            count += 1
+                            
+                            if count % 100 == 0:
+                                logger.info(f"📊 Scraped {count} from {channel}")
+                                
                     except Exception as e:
-                        logger.error(f"Error processing channel {channel}: {e}")
-                        await asyncio.sleep(30)
+                        logger.error(f"Scrape error {channel}: {e}")
+                    
+                    logger.info(f"✅ Scraped {count} users from {channel}")
+                    await asyncio.sleep(30)
                 
-                logger.info(f"🌾 Harvester cycle complete: {total_new_users} new users found")
+                logger.info("🌾 Harvester cycle complete")
                 
             except Exception as e:
-                logger.error(f"Harvester connection error: {e}")
+                logger.error(f"Harvester error: {e}")
             finally:
-                try:
-                    await client.disconnect()
-                except Exception as e:
-                    pass
+                await client.disconnect()
                 
         except Exception as e:
-            logger.error(f"Harvester task error: {e}", exc_info=True)
+            logger.error(f"Harvester loop error: {e}")
         
-        logger.info("💤 Harvester sleeping for 15 minutes...")
-        await asyncio.sleep(900)
+        await asyncio.sleep(900)  # 15 minutes
 
 # ==========================================
-# 💉 9. INJECTOR ENGINE (DIRECT ADD + RETRY + VERIFY + DM FALLBACK)
+# INJECTOR ENGINE (Direct Add Only)
 # ==========================================
 
-async def injector_task():
-    logger.info("💉 Injector Engine Started (Direct Add + Retry + Verify)!")
+async def injector_engine():
+    """Add users with privacy check + accurate counting"""
+    logger.info("💉 Injector Engine Started (Direct Add Only)!")
+    global is_engine_running
+    
+    stats = {"attempted": 0, "successful": 0, "skipped": 0, "failed": 0}
     
     while is_engine_running:
         try:
-            config = await get_system_config()
-            if config.get("is_paused"):
-                logger.info("⏸️ Injector paused by admin")
-                await asyncio.sleep(60)
-                continue
-            
+            # Check working hours
             if not is_working_hour():
-                logger.info("🌙 Outside working hours, injector sleeping...")
+                logger.info("🌙 Outside working hours")
                 await asyncio.sleep(3600)
                 continue
             
-            # Update cooling accounts to ready
+            config = await get_config()
+            if config.get("is_paused"):
+                await asyncio.sleep(60)
+                continue
+            
+            # Update cooldown accounts
             now_ts = datetime.now(pytz.utc).timestamp()
             await accounts_pool.update_many(
                 {"status": "cooling", "cooldown_until": {"$lt": now_ts}},
@@ -616,406 +264,263 @@ async def injector_task():
             
             account = await accounts_pool.find_one({"status": "ready"})
             if not account:
-                logger.info("⏳ No ready accounts available, waiting...")
+                logger.info("⏳ No ready accounts")
                 await asyncio.sleep(120)
                 continue
             
-            acc_id = account['account_id']
-            logger.info(f"🔄 Injector using account: {acc_id}")
-            
-            proxy_tuple = parse_proxy(account.get("proxy"))
+            proxy = parse_proxy(account.get("proxy"))
             client = TelegramClient(
                 StringSession(account['session_string']),
                 API_ID,
                 API_HASH,
-                proxy=proxy_tuple
+                proxy=proxy
             )
             
-            daily_adds = 0
             try:
                 await client.connect()
-                logger.info(f"✅ Injector connected: {acc_id}")
+                logger.info(f"✅ Injector connected: {account['account_id']}")
                 
-                # 🔥 Auto-join karna hoga (Direct Add ke liye)
+                # Auto-join target group
                 try:
-                    await client(functions.channels.JoinChannelRequest(TARGET_GROUP))
-                    logger.info(f"✅ Auto-joined {TARGET_GROUP}")
-                except Exception as e:
-                    logger.debug(f"Auto-join skipped: {e}")
+                    await client(JoinChannelRequest(TARGET_GROUP))
+                except:
+                    pass
                 
                 target_entity = await client.get_entity(TARGET_GROUP)
-                max_adds = config.get("max_adds", 35)
+                max_adds = config.get("max_adds", MAX_ADDS_PER_DAY)
                 
-                while daily_adds < max_adds and is_working_hour() and not config.get("is_paused"):
+                # Reset stats if limit reached
+                if stats["successful"] >= max_adds:
+                    stats = {"attempted": 0, "successful": 0, "skipped": 0, "failed": 0}
+                
+                while stats["successful"] < max_adds:
+                    # Get pending user
                     user_doc = await scraped_queue.find_one({"status": "pending"})
                     if not user_doc:
-                        logger.info("📭 No pending users in queue")
-                        await asyncio.sleep(60)
+                        logger.info("📭 No pending users")
                         break
                     
-                    user_id = user_doc['user_id']
-                    user_name = user_doc.get('name', 'Unknown')
-                    tg_link = user_doc.get('tg_link', '')
-                    
-                    # Skip if already blacklisted
-                    if await is_blacklisted(user_id):
+                    # Skip if blacklisted
+                    if await is_blacklisted(user_doc['user_id']):
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                         continue
                     
-                    # Resolve entity
-                    target_user = user_id
-                    if "https://t.me/" in tg_link:
-                        target_user = tg_link.replace("https://t.me/", "")
+                    stats["attempted"] += 1
                     
-                    add_successful = False
-                    add_method = "direct"
-                    retry_count = 0
-                    max_retries = 3
-                    
-                    # 🔥 RESOLVE ENTITY
+                    # 🔥 PRE-VALIDATION: Privacy Check
                     try:
-                        user_entity = await client.get_input_entity(target_user)
-                    except Exception as e:
-                        logger.warning(f"Entity resolution failed: {e}")
-                        user_entity = target_user
-                    
-                    # 🔥 DIRECT ADD WITH RETRY
-                    while retry_count < max_retries and not add_successful:
+                        user_entity = await client.get_entity(user_doc['user_id'])
+                        
+                        # Privacy check by trying to send message
                         try:
-                            await client(functions.channels.InviteToChannelRequest(target_entity, [user_entity]))
-                            add_successful = True
-                            add_method = "direct"
-                            logger.info(f"✅ Direct added: {user_name}")
-                            break
-                            
-                        except errors.PeerFloodError:
-                            logger.warning(f"🚫 Flood limit reached for {acc_id}")
-                            raise
-                            
+                            await client.send_message(user_entity, "test")
+                            valid = True
                         except errors.UserPrivacyRestrictedError:
-                            logger.info(f"🔒 Privacy restricted: {user_name} → Fallback DM")
-                            # Fallback to DM
-                            result = await process_student_via_dm(client, user_entity, user_name, user_id, tg_link)
-                            if result == "FLOOD":
-                                raise errors.PeerFloodError(request=None)
-                            elif result == True:
-                                add_successful = True
-                                add_method = "ghost_dm"
-                            else:
-                                add_successful = False
-                            break
-                            
+                            stats["skipped"] += 1
+                            logger.info(f"⏭️ Skipped (privacy): {user_doc['name']}")
+                            await scraped_queue.delete_one({"_id": user_doc['_id']})
+                            continue
                         except errors.UserNotMutualContactError:
-                            logger.info(f"🔒 Not mutual: {user_name} → Fallback DM")
-                            result = await process_student_via_dm(client, user_entity, user_name, user_id, tg_link)
-                            if result == "FLOOD":
-                                raise errors.PeerFloodError(request=None)
-                            elif result == True:
-                                add_successful = True
-                                add_method = "ghost_dm"
-                            else:
-                                add_successful = False
-                            break
+                            stats["skipped"] += 1
+                            logger.info(f"⏭️ Skipped (not mutual): {user_doc['name']}")
+                            await scraped_queue.delete_one({"_id": user_doc['_id']})
+                            continue
+                        except:
+                            valid = True
                             
-                        except errors.FloodWaitError as e:
-                            wait_time = e.seconds + random.randint(5, 15)
-                            logger.warning(f"⏳ FloodWait: Waiting {wait_time}s... (Retry {retry_count+1}/{max_retries})")
-                            await asyncio.sleep(wait_time)
-                            retry_count += 1
-                            
-                        except Exception as e:
-                            logger.warning(f"⚠️ Add error ({retry_count+1}/{max_retries}): {e}")
-                            retry_count += 1
-                            await asyncio.sleep(random.randint(3, 7))
+                    except Exception as e:
+                        logger.warning(f"Entity error: {e}")
+                        await scraped_queue.delete_one({"_id": user_doc['_id']})
+                        continue
                     
-                    # 🔥 VERIFY: Check if user actually added
-                    if add_successful and add_method == "direct":
-                        try:
-                            # Check if user is in group
-                            participants = await client.get_participants(target_entity, limit=10)
-                            user_ids = [p.id for p in participants]
-                            if user_id in user_ids:
-                                logger.info(f"✅ VERIFIED: {user_name} is in group")
-                            else:
-                                logger.warning(f"⚠️ NOT VERIFIED: {user_name} not found in group, trying DM...")
-                                # Fallback to DM
-                                result = await process_student_via_dm(client, user_entity, user_name, user_id, tg_link)
-                                if result == "FLOOD":
-                                    raise errors.PeerFloodError(request=None)
-                                elif result == True:
-                                    add_successful = True
-                                    add_method = "ghost_dm_after_fail"
-                                else:
-                                    add_successful = False
-                        except Exception as e:
-                            logger.warning(f"⚠️ Verification failed: {e}")
-                    
-                    # Database updates
+                    # 🔥 DIRECT ADD ATTEMPT
                     try:
-                        if add_successful:
+                        await client(InviteToChannelRequest(target_entity, [user_entity]))
+                        
+                        # ✅ SUCCESS - Only count here
+                        stats["successful"] += 1
+                        logger.info(f"✅ Added: {user_doc['name']} ({stats['successful']}/{max_adds})")
+                        
+                        # Add to blacklist
+                        await master_blacklist.insert_one({
+                            "user_id": user_doc['user_id'],
+                            "name": user_doc['name'],
+                            "add_method": "direct",
+                            "added_at": datetime.now(pytz.utc)
+                        })
+                        await scraped_queue.delete_one({"_id": user_doc['_id']})
+                        
+                        # 1-2 minute gap to avoid flood
+                        delay = random.randint(60, 120)
+                        logger.info(f"⏳ Waiting {delay}s...")
+                        await asyncio.sleep(delay)
+                        
+                    except errors.PeerFloodError:
+                        logger.warning(f"🚫 FLOOD! Cooldown {COOLDOWN_HOURS}h")
+                        cooldown_time = (datetime.now(pytz.utc) + timedelta(hours=COOLDOWN_HOURS)).timestamp()
+                        await accounts_pool.update_one(
+                            {"_id": account['_id']},
+                            {"$set": {"status": "cooling", "cooldown_until": cooldown_time}}
+                        )
+                        stats["failed"] += 1
+                        break
+                        
+                    except errors.FloodWaitError as e:
+                        wait = e.seconds + 10
+                        logger.info(f"⏳ FloodWait: {wait}s")
+                        await asyncio.sleep(wait)
+                        # Retry once
+                        try:
+                            await client(InviteToChannelRequest(target_entity, [user_entity]))
+                            stats["successful"] += 1
                             await master_blacklist.insert_one({
-                                "user_id": user_id,
-                                "name": user_name,
-                                "tg_link": tg_link,
-                                "add_method": add_method,
+                                "user_id": user_doc['user_id'],
+                                "name": user_doc['name'],
+                                "add_method": "direct",
                                 "added_at": datetime.now(pytz.utc)
                             })
-                            daily_adds += 1
-                        
+                        except:
+                            stats["failed"] += 1
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
-                        await log_operation("add_user", {"user_id": user_id, "method": add_method}, "success" if add_successful else "error")
                         
                     except Exception as e:
-                        logger.error(f"Database update error: {e}")
+                        stats["failed"] += 1
+                        logger.error(f"Add error: {e}")
+                        await scraped_queue.delete_one({"_id": user_doc['_id']})
+                        await asyncio.sleep(5)
                     
-                    # Delay (Direct Add या DM के बाद)
-                    if add_successful:
-                        delay = random.randint(config.get("min_delay", 8), config.get("max_delay", 16))
-                        logger.info(f"⏳ Sleeping {delay}s... ({daily_adds}/{max_adds})")
-                        await asyncio.sleep(delay)
-                    else:
-                        await asyncio.sleep(2)
+                    # Progress log
+                    if stats["successful"] % 5 == 0:
+                        logger.info(f"""
+📊 PROGRESS:
+✅ Success: {stats['successful']}
+⏭️ Skipped: {stats['skipped']}
+❌ Failed: {stats['failed']}
+🎯 Target: {max_adds}
+""")
                 
-                if daily_adds >= max_adds:
-                    logger.info(f"📊 Account {acc_id} reached daily limit of {max_adds}")
-                    raise errors.PeerFloodError(request=None)
-                
-            except errors.PeerFloodError as e:
-                logger.warning(f"❄️ Account {acc_id} limit reached, cooling for {COOLDOWN_HOURS}h")
-                cooldown_time = (datetime.now(pytz.utc) + timedelta(hours=COOLDOWN_HOURS)).timestamp()
-                await accounts_pool.update_one(
-                    {"_id": account['_id']},
-                    {"$set": {"status": "cooling", "cooldown_until": cooldown_time}}
-                )
-                
-                ai_msg = await ai_auto_heal(str(e), acc_id)
-                if ai_msg:
-                    try:
-                        await admin_bot.send_message(ADMIN_USERNAME, ai_msg)
-                    except Exception as e:
-                        pass
+                # Cooldown after reaching limit
+                if stats["successful"] >= max_adds:
+                    logger.info(f"✅ Reached {max_adds} adds!")
+                    cooldown_time = (datetime.now(pytz.utc) + timedelta(hours=COOLDOWN_HOURS)).timestamp()
+                    await accounts_pool.update_one(
+                        {"_id": account['_id']},
+                        {"$set": {"status": "cooling", "cooldown_until": cooldown_time}}
+                    )
                 
             except Exception as e:
-                logger.error(f"🚨 Injector error on {acc_id}: {e}")
-                if "banned" in str(e).lower() or "deactivated" in str(e).lower():
+                logger.error(f"Injector error: {e}")
+                if "banned" in str(e).lower():
                     await accounts_pool.update_one(
                         {"_id": account['_id']},
                         {"$set": {"status": "banned"}}
                     )
-                    try:
-                        await admin_bot.send_message(ADMIN_USERNAME, f"🚨 Account {acc_id} is BANNED!")
-                    except Exception as e:
-                        pass
-            
             finally:
-                try:
-                    await client.disconnect()
-                except Exception as e:
-                    pass
+                await client.disconnect()
                 
         except Exception as e:
-            logger.error(f"Injector main loop error: {e}", exc_info=True)
-            await asyncio.sleep(60)
+            logger.error(f"Injector loop error: {e}")
         
         await asyncio.sleep(30)
 
 # ==========================================
-# 🤖 10. ADMIN BOT COMMAND HANDLER
+# ADMIN BOT COMMANDS
 # ==========================================
+
 @admin_bot.on(events.NewMessage(incoming=True))
-async def admin_chat_handler(event):
+async def admin_handler(event):
     try:
         sender = await event.get_sender()
+        if not sender or not sender.username:
+            return
         
-        if not sender:
-            return
-            
-        if not sender.username:
-            logger.warning(f"⚠️ Sender {sender.id} has no username, ignoring")
-            return
-            
         if sender.username.lower() != ADMIN_USERNAME.lower():
-            logger.info(f"⏭️ Ignoring message from {sender.username} (not admin)")
             return
         
-        text = event.raw_text.strip()
-        text_lower = text.lower()
+        text = event.raw_text.lower().strip()
         
-        # STATUS COMMAND
-        if "status" in text_lower or "kaisa chal" in text_lower or "performance" in text_lower:
+        if "status" in text:
             ready = await accounts_pool.count_documents({"status": "ready"})
             cooling = await accounts_pool.count_documents({"status": "cooling"})
-            queue = await scraped_queue.count_documents({"status": "pending"})
+            pending = await scraped_queue.count_documents({"status": "pending"})
+            total = await master_blacklist.count_documents({})
             
-            total_added = await master_blacklist.count_documents({})
-            dm_sent = await master_blacklist.count_documents({"add_method": "ghost_dm"})
-            direct_add = await master_blacklist.count_documents({"add_method": {"$in": ["direct", "direct_verified"]}})
+            await event.reply(f"""
+📊 **System Status**
+🟢 Ready: {ready}
+🟡 Cooling: {cooling}
+📥 Pending: {pending}
+✅ Added: {total}
+🎯 Target/day: {MAX_ADDS_PER_DAY}
+📍 Group: @{TARGET_GROUP}
+""")
             
-            config = await get_system_config()
-            sources = await get_source_channels()
-            
-            reply = (
-                f"📊 **System Report** 📊\n\n"
-                f"✅ **Total Processed:** {total_added}\n"
-                f" ├ 🎯 **Direct Added:** {direct_add}\n"
-                f" └ 📩 **Ghost DM Sent:** {dm_sent}\n\n"
-                f"📥 **Pending Queue:** {queue}\n"
-                f"🟢 **Ready IDs:** {ready} | 🔴 **Cooling:** {cooling}\n"
-                f"⚙️ **Limits:** {config['max_adds']} adds, {config['min_delay']}-{config['max_delay']}s delay\n"
-                f"🎯 **Sources:** {', '.join(sources)}"
-            )
-            await event.reply(reply)
-            logger.info(f"✅ Status report sent to {sender.username}")
-            
-        # PAUSE COMMAND
-        elif "pause" in text_lower or "rok" in text_lower:
+        elif "pause" in text:
             await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": True}})
-            await event.reply("🛑 System PAUSED")
-            logger.info(f"🛑 System paused by {sender.username}")
+            await event.reply("🛑 Paused")
             
-        # RESUME COMMAND
-        elif "resume" in text_lower or "chalu" in text_lower:
+        elif "resume" in text:
             await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": False}})
-            await event.reply("▶️ System RESUMED")
-            logger.info(f"▶️ System resumed by {sender.username}")
+            await event.reply("▶️ Resumed")
             
-        # ADD SOURCE GROUP
-        elif "add group" in text_lower:
-            match = re.search(r'[@]?([a-zA-Z0-9_]{5,})', text)
-            if match:
-                new_channel = match.group(1).replace('@', '')
-                sources = await get_source_channels()
-                if new_channel not in sources:
-                    sources.append(new_channel)
-                    await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
-                    await event.reply(f"✅ Added: @{new_channel}")
-                    logger.info(f"✅ Source group added: {new_channel} by {sender.username}")
-                else:
-                    await event.reply(f"⚠️ @{new_channel} exists")
-            else:
-                await event.reply("⚠️ Usage: add group @username")
-                
-        # REMOVE SOURCE GROUP
-        elif "remove group" in text_lower or "hatao" in text_lower:
-            match = re.search(r'[@]?([a-zA-Z0-9_]{5,})', text)
-            if match:
-                target = match.group(1).replace('@', '')
-                sources = await get_source_channels()
-                if target in sources:
-                    sources.remove(target)
-                    await system_config.update_one({"_id": "core_limits"}, {"$set": {"source_channels": sources}})
-                    await event.reply(f"🗑️ Removed: @{target}")
-                    logger.info(f"🗑️ Source group removed: {target} by {sender.username}")
-                else:
-                    await event.reply(f"⚠️ @{target} not found")
-            else:
-                await event.reply("⚠️ Usage: remove group @username")
-                
-        # AI CHAT (Default)
         else:
-            sources = await get_source_channels()
-            prompt = f"You are an expert AI assistant for Telegram automation. Active sources: {sources}. Admin asked: '{text}'. Reply concisely in Hinglish/Hindi."
-            ai_reply = await safe_generate_ai_response(prompt)
-            await event.reply(f"🤖 {ai_reply}")
-            logger.info(f"🤖 AI reply sent to {sender.username}")
+            await event.reply("Commands: status, pause, resume")
             
     except Exception as e:
-        logger.error(f"Admin command error: {e}")
-        try:
-            await event.reply(f"❌ Error: {str(e)[:150]}")
-        except Exception as e:
-            pass
+        logger.error(f"Admin error: {e}")
 
 # ==========================================
-# 🚀 11. FASTAPI & SERVER LIFECYCLE
+# FASTAPI APP
 # ==========================================
-app = FastAPI(title="Agri Mastermind AI Engine", version="1.0.0")
+
+app = FastAPI(title="Agri Mastermind AI Engine", version="3.0.0")
 
 @app.on_event("startup")
-async def startup_event():
+async def startup():
     global is_engine_running
     is_engine_running = True
     
-    # 🔥 1. MongoDB Connection Test
+    # Connect MongoDB
     try:
         await mongo_client.admin.command('ping')
-        logger.info("✅ MongoDB Connected Successfully!")
-    except Exception as e:
-        logger.error(f"❌ MongoDB Connection Failed: {e}")
-        # MongoDB Fail होने पर भी Bot को Start होने दें
+        logger.info("✅ MongoDB Connected!")
+    except:
+        logger.error("❌ MongoDB error")
     
-    # 🔥 2. Seed Accounts (अगर DB Connected है तो)
-    try:
-        await seed_accounts_if_empty()
-    except Exception as e:
-        logger.warning(f"⚠️ Could not seed accounts: {e}")
+    # Seed accounts
+    await seed_accounts()
     
-    # 🔥 3. Admin Bot Start (हमेशा)
+    # Start admin bot
     try:
         await admin_bot.start(bot_token=BOT_TOKEN)
-        logger.info("✅ Admin Bot Started Successfully!")
-        
-        # Test message to admin
-        try:
-            await admin_bot.send_message(ADMIN_USERNAME, "🚀 **Agri Mastermind AI Engine is Online!**\n\nSend `Status` to check system health.")
-            logger.info(f"✅ Welcome message sent to @{ADMIN_USERNAME}")
-        except Exception as e:
-            logger.warning(f"Could not send welcome message: {e}")
-    except Exception as e:
-        logger.error(f"❌ Admin bot error: {e}")
+        logger.info("✅ Admin Bot Started!")
+    except:
+        logger.error("❌ Bot error")
     
-    # 🔥 4. Start Background Engines
-    asyncio.create_task(harvester_task())
-    asyncio.create_task(injector_task())
+    # Start engines
+    asyncio.create_task(harvester_engine())
+    asyncio.create_task(injector_engine())
     logger.info("🚀 All Engines Started!")
 
 @app.get("/")
 async def root():
-    return {
-        "status": "Agri Mastermind AI Engine is LIVE! 🌾🚀",
-        "version": "1.0.0",
-        "engine": "running" if is_engine_running else "stopped",
-        "admin": ADMIN_USERNAME,
-        "target_group": TARGET_GROUP
-    }
+    return {"status": "Agri Mastermind AI Engine v3.0", "running": is_engine_running}
 
 @app.get("/health")
 async def health():
-    try:
-        total_added = await master_blacklist.count_documents({})
-        pending = await scraped_queue.count_documents({"status": "pending"})
-        ready = await accounts_pool.count_documents({"status": "ready"})
-        cooling = await accounts_pool.count_documents({"status": "cooling"})
-        banned = await accounts_pool.count_documents({"status": "banned"})
-        
-        return {
-            "status": "healthy",
-            "total_added": total_added,
-            "pending_queue": pending,
-            "ready_accounts": ready,
-            "cooling_accounts": cooling,
-            "banned_accounts": banned,
-            "engine": "running" if is_engine_running else "stopped",
-            "source_channels": await get_source_channels(),
-            "target_group": TARGET_GROUP
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/docs")
-async def docs():
+    ready = await accounts_pool.count_documents({"status": "ready"})
+    cooling = await accounts_pool.count_documents({"status": "cooling"})
+    pending = await scraped_queue.count_documents({"status": "pending"})
+    total = await master_blacklist.count_documents({})
     return {
-        "message": "API Documentation",
-        "endpoints": {
-            "/": "Health check",
-            "/health": "Detailed system health",
-            "/status": "System status report"
-        }
+        "status": "healthy",
+        "ready": ready,
+        "cooling": cooling,
+        "pending": pending,
+        "added": total,
+        "running": is_engine_running
     }
 
-# ==========================================
-# 🏃 12. RUN SCRIPT
-# ==========================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
