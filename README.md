@@ -1,17 +1,27 @@
-# Telegram Ultra-Safe Scraper
+# 🌾 Agri Mastermind AI Engine v3.0
 
-Automatically scrapes members from source channels and adds them to your target group with extreme safety measures.
+## 🎯 Features
 
-## Features
-- ⚡ 500 members/day limit
-- 🛡️ 5-10 sec random gaps
-- 🔄 Global duplicate check
-- 📊 Daily progress tracking
-- 🚀 Auto-resume capability
+| Feature | Status |
+|---------|--------|
+| Direct Add Only | ✅ |
+| Privacy Check Before Add | ✅ |
+| Accurate Counting (Only Success) | ✅ |
+| 60-120 Second Gap Between Adds | ✅ |
+| Auto-Cooldown on Flood | ✅ |
+| 2 Accounts with Fresh Proxies | ✅ |
+| Admin Bot Commands | ✅ |
+| 24/7 Working with IST Hours | ✅ |
 
-## Setup
-1. Add your `API_ID`, `API_HASH`, and `MONGO_URI` in Render Environment Variables.
-2. Set your `TARGET_GROUP` in `main.py`.
+## 📦 Environment Variables
 
-## Deployment
-Deploy on Render as a Cron Job with schedule: `0 0 * * *`
+```env
+BOT_TOKEN=your_bot_token
+GEMINI_API_KEY=your_gemini_key
+API_ID=your_api_id
+API_HASH=your_api_hash
+MONGO_URI=your_mongodb_uri
+TARGET_GROUP=agriquizworld
+ADMIN_USERNAME=agrikrishna
+MAX_ADDS_PER_DAY=20
+COOLDOWN_HOURS=24
