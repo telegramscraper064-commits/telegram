@@ -1,11 +1,12 @@
 """
-Agri Mastermind AI Engine v4.5 – Proxy Robust with python-socks (Fixed Import)
+Agri Mastermind AI Engine v4.7 – Proxy Fallback + Flood Handling
 """
 
 import os
 import asyncio
 import logging
 import random
+import socks
 from datetime import datetime, timedelta
 import pytz
 from fastapi import FastAPI
@@ -14,7 +15,6 @@ from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import User, ChannelParticipantsAdmins, InputPeerUser
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
-from python_socks import ProxyType   # ✅ Only this import is needed
 
 # ==========================================
 # LOGGING
@@ -124,7 +124,7 @@ async def seed_accounts():
                 "cooldown_until": 0
             })
         await accounts_pool.insert_many(accounts_to_insert)
-        logger.info(f"✅ Seeded {len(accounts_to_insert)} accounts (proxies from hardcoded map)")
+        logger.info(f"✅ Seeded {len(accounts_to_insert)} accounts")
     except Exception as e:
         logger.error(f"Seed error: {e}")
 
@@ -154,27 +154,13 @@ def is_working_hour():
     return 9 <= datetime.now(IST).hour < 22
 
 def parse_proxy(account_id):
-    """Returns a proxy dict for Telethon or None."""
+    """Return proxy tuple or None."""
     if account_id not in PROXY_MAP:
-        logger.info(f"ℹ️ No hardcoded proxy for {account_id}, using direct connection.")
         return None
-    proxy_str = PROXY_MAP[account_id]
     try:
-        parts = proxy_str.split(':')
-        if len(parts) != 4:
-            logger.warning(f"Invalid proxy format for {account_id}: {proxy_str}")
-            return None
-        ip, port, user, pwd = parts
-        return {
-            'proxy_type': ProxyType.SOCKS5,
-            'addr': ip,
-            'port': int(port),
-            'username': user,
-            'password': pwd,
-            'rdns': True
-        }
-    except Exception as e:
-        logger.error(f"Error parsing proxy for {account_id}: {e}")
+        ip, port, user, pwd = PROXY_MAP[account_id].split(':')
+        return (socks.SOCKS5, ip, int(port), True, user, pwd)
+    except Exception:
         return None
 
 async def is_blacklisted(user_id):
@@ -182,6 +168,60 @@ async def is_blacklisted(user_id):
         return await master_blacklist.find_one({"user_id": user_id}) is not None
     except:
         return False
+
+async def connect_with_fallback(account, purpose="engine"):
+    """Try proxy first, then fallback to direct if proxy fails."""
+    proxy = parse_proxy(account['account_id'])
+    if proxy:
+        logger.info(f"📌 Trying proxy for {account['account_id']}: {proxy[1]}:{proxy[2]}")
+    else:
+        logger.info(f"📌 Direct connection for {account['account_id']}")
+    
+    client = TelegramClient(
+        StringSession(account['session_string']),
+        API_ID,
+        API_HASH,
+        proxy=proxy
+    )
+    
+    try:
+        await client.connect()
+        logger.info(f"✅ {purpose} connected: {account['account_id']} via {'proxy' if proxy else 'direct'}")
+        return client, True
+    except Exception as e:
+        error_str = str(e)
+        # If proxy error, try without proxy
+        if proxy and ("SOCKS5" in error_str or "GeneralProxyError" in error_str):
+            logger.warning(f"⚠️ Proxy failed for {account['account_id']}, falling back to direct connection...")
+            # Retry without proxy
+            fallback_client = TelegramClient(
+                StringSession(account['session_string']),
+                API_ID,
+                API_HASH,
+                proxy=None
+            )
+            try:
+                await fallback_client.connect()
+                logger.info(f"✅ {purpose} connected (direct) for {account['account_id']} after proxy failure")
+                return fallback_client, True
+            except Exception as e2:
+                logger.error(f"❌ Direct connection also failed for {account['account_id']}: {e2}")
+                # Mark account as proxy_error
+                await accounts_pool.update_one(
+                    {"_id": account['_id']},
+                    {"$set": {"status": "proxy_error", "last_error": str(e2)[:200]}}
+                )
+                await client.disconnect()
+                return None, False
+        else:
+            # Other error (non‑proxy)
+            logger.error(f"❌ Connection error for {account['account_id']}: {e}")
+            await accounts_pool.update_one(
+                {"_id": account['_id']},
+                {"$set": {"status": "error", "last_error": str(e)[:200]}}
+            )
+            await client.disconnect()
+            return None, False
 
 # ==========================================
 # HARVESTER ENGINE
@@ -200,20 +240,12 @@ async def harvester_engine():
                 logger.info("⏳ No ready accounts")
                 await asyncio.sleep(120)
                 continue
-            proxy = parse_proxy(account['account_id'])
-            if proxy:
-                logger.info(f"📌 Using proxy for {account['account_id']}: {proxy['addr']}:{proxy['port']}")
-            else:
-                logger.info(f"📌 Direct connection for {account['account_id']}")
-            client = TelegramClient(
-                StringSession(account['session_string']),
-                API_ID,
-                API_HASH,
-                proxy=proxy
-            )
+            
+            client, ok = await connect_with_fallback(account, "Harvester")
+            if not ok:
+                continue
+            
             try:
-                await client.connect()
-                logger.info(f"✅ Harvester connected: {account['account_id']}")
                 source_channels = config.get("source_channels", ["Dream_Agri"])
                 for channel in source_channels:
                     if not is_engine_running:
@@ -256,12 +288,7 @@ async def harvester_engine():
                 logger.info("🌾 Harvester cycle complete")
             except Exception as e:
                 logger.error(f"Harvester error on {account['account_id']}: {e}")
-                if "SOCKS5" in str(e) or "GeneralProxyError" in str(e) or "authentication" in str(e).lower():
-                    await accounts_pool.update_one(
-                        {"_id": account['_id']},
-                        {"$set": {"status": "proxy_error", "last_error": str(e)[:200]}}
-                    )
-                else:
+                if "SOCKS5" not in str(e) and "GeneralProxyError" not in str(e):
                     await accounts_pool.update_one(
                         {"_id": account['_id']},
                         {"$set": {"status": "error", "last_error": str(e)[:200]}}
@@ -299,20 +326,12 @@ async def injector_engine():
                 logger.info("⏳ No ready accounts")
                 await asyncio.sleep(120)
                 continue
-            proxy = parse_proxy(account['account_id'])
-            if proxy:
-                logger.info(f"📌 Using proxy for {account['account_id']}: {proxy['addr']}:{proxy['port']}")
-            else:
-                logger.info(f"📌 Direct connection for {account['account_id']}")
-            client = TelegramClient(
-                StringSession(account['session_string']),
-                API_ID,
-                API_HASH,
-                proxy=proxy
-            )
+            
+            client, ok = await connect_with_fallback(account, "Injector")
+            if not ok:
+                continue
+            
             try:
-                await client.connect()
-                logger.info(f"✅ Injector connected: {account['account_id']}")
                 try:
                     await client(JoinChannelRequest(TARGET_GROUP))
                 except:
@@ -422,12 +441,7 @@ async def injector_engine():
                     )
             except Exception as e:
                 logger.error(f"Injector error on {account['account_id']}: {e}")
-                if "SOCKS5" in str(e) or "GeneralProxyError" in str(e) or "authentication" in str(e).lower():
-                    await accounts_pool.update_one(
-                        {"_id": account['_id']},
-                        {"$set": {"status": "proxy_error", "last_error": str(e)[:200]}}
-                    )
-                elif "banned" in str(e).lower():
+                if "banned" in str(e).lower():
                     await accounts_pool.update_one(
                         {"_id": account['_id']},
                         {"$set": {"status": "banned"}}
@@ -478,7 +492,7 @@ async def admin_handler(event):
 # ==========================================
 # FASTAPI APP
 # ==========================================
-app = FastAPI(title="Agri Mastermind AI Engine", version="4.5.0")
+app = FastAPI(title="Agri Mastermind AI Engine", version="4.7.0")
 
 @app.on_event("startup")
 async def startup():
@@ -494,7 +508,7 @@ async def startup():
         await admin_bot.start(bot_token=BOT_TOKEN)
         logger.info("✅ Admin Bot Started!")
         try:
-            await admin_bot.send_message(ADMIN_USERNAME, "🚀 Agri Mastermind AI Engine v4.5 started with python-socks!")
+            await admin_bot.send_message(ADMIN_USERNAME, "🚀 Agri Mastermind AI Engine v4.7 started with proxy fallback!")
         except:
             pass
     except Exception as e:
@@ -505,7 +519,7 @@ async def startup():
 
 @app.get("/")
 async def root():
-    return {"status": "Agri Mastermind AI Engine v4.5", "running": is_engine_running}
+    return {"status": "Agri Mastermind AI Engine v4.7", "running": is_engine_running}
 
 @app.get("/health")
 async def health():
