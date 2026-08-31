@@ -1,5 +1,5 @@
 """
-Agri Mastermind AI Engine v3.0 - Production Ready with Test Mode & Proxy Bypass
+Agri Mastermind AI Engine v3.0 - Production Ready with Access Hash Fix & Test Queue Cleanup
 """
 
 import os
@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
-from telethon.tl.types import User, ChannelParticipantsAdmins
+from telethon.tl.types import User, ChannelParticipantsAdmins, InputPeerUser
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
 
 # ==========================================
@@ -115,7 +115,7 @@ def is_working_hour():
     return 9 <= datetime.now(IST).hour < 22
 
 def parse_proxy(proxy_str):
-    """Parse proxy string – if TEST_MODE, return None (bypass proxy)"""
+    """Parse proxy – in test mode, bypass proxy"""
     if TEST_MODE:
         logger.info("🧪 Test mode: Bypassing proxy")
         return None
@@ -137,11 +137,11 @@ async def is_blacklisted(user_id):
         return False
 
 # ==========================================
-# HARVESTER ENGINE
+# HARVESTER ENGINE (with access_hash)
 # ==========================================
 
 async def harvester_engine():
-    """Scrape users from source channels"""
+    """Scrape users from source channels – store access_hash and username"""
     logger.info("🌾 Harvester Engine Started!")
     global is_engine_running
     
@@ -199,6 +199,8 @@ async def harvester_engine():
                             name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "User"
                             await scraped_queue.insert_one({
                                 "user_id": user.id,
+                                "access_hash": user.access_hash,
+                                "username": user.username,
                                 "name": name,
                                 "source_channel": channel,
                                 "scraped_at": datetime.now(pytz.utc),
@@ -226,7 +228,7 @@ async def harvester_engine():
         await asyncio.sleep(900)
 
 # ==========================================
-# INJECTOR ENGINE
+# INJECTOR ENGINE (with InputPeerUser)
 # ==========================================
 
 async def injector_engine():
@@ -294,8 +296,21 @@ async def injector_engine():
                     
                     stats["attempted"] += 1
                     
+                    # 🔥 Entity resolution with access_hash
                     try:
-                        user_entity = await client.get_entity(user_doc['user_id'])
+                        user_id = user_doc['user_id']
+                        access_hash = user_doc.get('access_hash')
+                        username = user_doc.get('username')
+                        
+                        if username:
+                            user_entity = await client.get_entity(username)
+                        elif access_hash:
+                            user_entity = await client.get_entity(InputPeerUser(user_id, access_hash))
+                        else:
+                            # Fallback (may fail, but we skip if fails)
+                            user_entity = await client.get_entity(user_id)
+                        
+                        # Privacy check
                         try:
                             await client.send_message(user_entity, "test")
                             valid = True
@@ -311,15 +326,18 @@ async def injector_engine():
                             continue
                         except:
                             valid = True
+                            
                     except Exception as e:
-                        logger.warning(f"Entity error: {e}")
+                        logger.warning(f"Entity resolution error for {user_doc.get('user_id')}: {e}")
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                         continue
                     
+                    # 🔥 DIRECT ADD
                     try:
                         await client(InviteToChannelRequest(target_entity, [user_entity]))
                         stats["successful"] += 1
                         logger.info(f"✅ Added: {user_doc['name']} ({stats['successful']}/{max_adds})")
+                        
                         await master_blacklist.insert_one({
                             "user_id": user_doc['user_id'],
                             "name": user_doc['name'],
@@ -327,6 +345,7 @@ async def injector_engine():
                             "added_at": datetime.now(pytz.utc)
                         })
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
+                        
                         delay = random.randint(60, 120)
                         logger.info(f"⏳ Waiting {delay}s...")
                         await asyncio.sleep(delay)
@@ -435,11 +454,15 @@ async def admin_handler(event):
         logger.error(f"Admin error: {e}")
 
 # ==========================================
-# TEST FUNCTIONS
+# TEST FUNCTIONS (with Queue Cleanup)
 # ==========================================
 
 async def run_tests():
     logger.info("🧪 Running Tests...")
+    
+    # 🔥 Clear the queue to avoid old users without access_hash
+    deleted = await scraped_queue.delete_many({})
+    logger.info(f"🧹 Cleared {deleted.deleted_count} old pending users from queue")
     
     account = await accounts_pool.find_one({"status": "ready"})
     if not account:
@@ -447,7 +470,6 @@ async def run_tests():
         return
     
     logger.info(f"🔍 Testing account: {account['account_id']}")
-    # In test mode, we bypass proxy (parse_proxy will return None)
     proxy = parse_proxy(account.get("proxy"))
     
     client = TelegramClient(
@@ -462,7 +484,7 @@ async def run_tests():
         me = await client.get_me()
         logger.info(f"✅ Connection successful: {me.first_name} (@{me.username})")
         
-        logger.info("🌾 Testing Harvester (scraping 10 users)...")
+        logger.info("🌾 Testing Harvester (scraping 10 users with access_hash)...")
         source_channels = ["Dream_Agri"]
         for channel in source_channels:
             try:
@@ -481,19 +503,39 @@ async def run_tests():
                     continue
                 name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "User"
                 logger.info(f"👤 Scraped: {name} (ID: {user.id})")
+                await scraped_queue.insert_one({
+                    "user_id": user.id,
+                    "access_hash": user.access_hash,
+                    "username": user.username,
+                    "name": name,
+                    "source_channel": channel,
+                    "scraped_at": datetime.now(pytz.utc),
+                    "status": "pending"
+                })
                 count += 1
                 if count >= 10:
                     break
             logger.info(f"✅ Scraped {count} users from {channel}")
         
-        logger.info("💉 Testing Injector (adding 1 user from queue)...")
-        user_doc = await scraped_queue.find_one({"status": "pending"})
+        # Now pick the first user that has access_hash (should be all, but check)
+        user_doc = await scraped_queue.find_one({"status": "pending", "access_hash": {"$exists": True}})
         if not user_doc:
-            logger.warning("⚠️ No pending users in queue, skipping add test")
+            logger.warning("⚠️ No pending users with access_hash found, skipping add test")
         else:
+            logger.info("💉 Testing Injector (adding 1 user from queue with access_hash)...")
             user_id = user_doc['user_id']
+            access_hash = user_doc['access_hash']
+            username = user_doc.get('username')
             try:
-                user_entity = await client.get_entity(user_id)
+                if username:
+                    user_entity = await client.get_entity(username)
+                elif access_hash:
+                    user_entity = await client.get_entity(InputPeerUser(user_id, access_hash))
+                else:
+                    # Shouldn't happen because we filtered, but fallback
+                    user_entity = await client.get_entity(user_id)
+                
+                # Privacy check
                 try:
                     await client.send_message(user_entity, "test")
                     valid = True
