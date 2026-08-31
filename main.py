@@ -1,12 +1,11 @@
 """
-Agri Mastermind AI Engine v4.3 – 8 Accounts, Hardcoded Proxies & Session Seeding
+Agri Mastermind AI Engine v4.4 – Proxy Robust with python-socks
 """
 
 import os
 import asyncio
 import logging
 import random
-import socks
 from datetime import datetime, timedelta
 import pytz
 from fastapi import FastAPI
@@ -15,6 +14,8 @@ from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import User, ChannelParticipantsAdmins, InputPeerUser
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
+from python_socks import ProxyType
+from python_socks.async_ import AsyncProxy
 
 # ==========================================
 # LOGGING
@@ -29,7 +30,6 @@ logger = logging.getLogger(__name__)
 # ENVIRONMENT VARIABLES
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8857141734:AAGmL8gjCRZfbZyZeSaszs6_vcSXuGco0HE")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6LU2kQij3-Q64wr6xlumvZK_5VcM_Mx695A5maMGjTZkA")
 API_ID = int(os.getenv("API_ID", 33239973))
 API_HASH = os.getenv("API_HASH", "81430d577ca915f53c4b2827ba7c723f")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://mailforfulltest_db_user:1vmiEQA28y0ok4Fh@cluster0.k85vzmp.mongodb.net/?appName=Cluster0")
@@ -75,47 +75,39 @@ ACCOUNTS_DATA = [
     {
         "account_id": "8787291649",
         "session_string": "1BVtsOKwBu01UNwz8ZrH7jP8KM3g_BDq-D1lKVbGc2h6KlxWiVhP7s_svdezBCMFcU0YoZ1NXz2M-7TY7UCf4CsuAi_KG2AML6O83ktDcNvcQEzn-qg1MXJcrUhv6x4-I6poP8A1GBXTYnupGYAfr1s-uypFH5zPYvlnFZC2dS8FfhSMnwmRR3cxtlkTRwsesqFWw6TI_Pvobbjmddy_mByDmNPwHa0bfMgR9j49JhU8140cPTQUxogKm9f4UqR76y7Texect_JVMabP2_zN_ZGoDNSYubThSpdgbff9BAMNc5qXZlw8lsMz6q8v6Gro-TWG4BkU-Tl1r8qZU5k0qYxojVcI8Gzc=",
-        "proxy": PROXY_MAP["8787291649"]
     },
     {
         "account_id": "7238051659",
         "session_string": "1BVtsOMEBu0T7jep1-0LN_nY0k-qIedAbTROqFc5R9ENfdhfccf_HdTWNxct8Cz2ds4zjj0u_K_VnwZXeDbvZQj9BxvyI9N8KMFjz-fFSCNFcD1ENzxPUHHlIH8a0MuqxJ1PgRNYyPRFIVSFfGGdA47ceE50BFis01ob51dlIsF2wR6UTloO3OTccrtJbdSGWwmSn56pZR4_mepAtwxwu5_TZ8o5YtW9wGH_QijkownVVliGfr1wIi-8wPWnLhvLnDFr7tfGiU9mqWLpjoOiuIj9bmnmAU9Lch-crjUAyHo6pVTcEg7SUpb-OXax6KYqF7ZITBUgDzXxgQtIdlmk9yitjpz4cuBw=",
-        "proxy": PROXY_MAP["7238051659"]
     },
     {
         "account_id": "7985169157",
         "session_string": "1BVtsOH4Bu1fZsOCOnXedYiLJvSUzowlvpMxdDTaMvLnD0zqzg4dPtlFoeqfZsmsydOQuOKN0lGuVvO99iY7HK5s0TrT1eOAFwxMrj1zWY2vPkchvE8KrTQzmfAgxoOLfjAkQTj9B5zFh70gYgd0hwJvwn75v3fYstXt-ulLgDT_UzmHyXEp59sXU1jGFmqtSk88jGZ6taDmZpU7iwrUXwQXXGkwGnjOlu9VLtTW85-RcCG5vcZkzeaKvHS-yK_4U_FRaVwBpGtwGadCkbrjNu0asCp5ELm4Jy3x-ZMCFNniDqbLANge03Qr1FA_CBJOgP8WSP-5_O5mseL8oeJOXyYz__5AmTpE=",
-        "proxy": PROXY_MAP["7985169157"]
     },
     {
         "account_id": "9303815860",
         "session_string": "1BVtsOH4BuwM9jPFW8r1AII2WR1-ANOlOqE95k1GPl4D09Ynx3Emf_Yr4dqxX6IZ0h30XvlD3ANbxd4Vd5ceP11sYmxSS33zMyxmhgYLJxOZIU-To3PCIXC_xEzf8gT5eu8MPaAvZbNjxypEcstYK5aNerpmmABizYnBix6ZUSMESiTEh9X-R5E17OffHPzojONVAY2bwAAOvYV4Cd4PCEAkW-sac8_Yjm66eNg-nu6sCbhekqxO3exkZgBMmPDZ3qLzjbS29toYHZq7MfSO3MvmjBWnY611s-kPVXWWJrH4knGBig8lxzrtyT6QVdaG6uJU2TO3iRPgHc1To-OaISry-lNdQeoU=",
-        "proxy": PROXY_MAP["9303815860"]
     },
     {
         "account_id": "9569579629",
         "session_string": "1BVtsOH4Bu5pkBe4mqH3Q6wspEUzTNVaowvi844eM7mbxl__XdK4a_qvmfCyR0n0RA4HFmHZhT92t3oMxvMuUABOXrvbE5MtUyaOgaODa2O-Yz6Kn5PzWPqpeLWppbBsMGdswqvwjdXjCVzi0NjpY1vNh4uBWcn-Ky7AdGe7dXq-JC-AUIWhySfcuU-M-R_Hwup6m1mgEJ-aLFYTQ8rzy08O-pRs3lO8n_viIvyAbGTmMfa1VTcye6eIFIhhA_AcuOCwDsnN4-2R2w3-Q9N6rAjV8K1-bu7pPviQ-pJ1qktoUCLUzl7R6p4QTgqEsIO4LCu_9sOMrzzeu_tzbCQhoCIljJdTHmc4=",
-        "proxy": PROXY_MAP["9569579629"]
     },
     {
         "account_id": "6392166529",
         "session_string": "1BVtsOJABu5IumbJNN3MCHtXRdhQGiShx-3Xy_3vZ4_hH3Y8M9j7yCLcMN_DX0v3ObCq0ZLBHnTUhvYgrqduhYjV_V2PsRKVjNcTTADnWoQkTMdxcz9rd6BtRd2eiM3AJGZimDMHiVOeD0ukI8uhVCY9Pkq0NcWERS7NjLH_OwtbEygR7j6JuAbStwKz2m3l0FoisOYdCa7Qji6i8KYQQG1U2WmbPPDnU2Cmr1B23Y1sOOgXOssSQA78lCdq8Q7CXtJvqMUUqGcbNtFTOCaTkZNvgRTudc1ZTmDwOfY_ZjvJQ3uY6ks_l19uOsx-dsddZXiR3q91-S00PoB-mfNQJCVnqY2mlSZY=",
-        "proxy": PROXY_MAP["6392166529"]
     },
     {
         "account_id": "9455647843",
         "session_string": "1BVtsOJABuxUEaaZDmKad8UsvHgNwmLjJWfrhMeiWoVtkFV-vJdZ5OQ5YOPgx834tdZcd4N6Z8MYakGuLHjH-yl49Pw0yvOp0rv0OjXgeJvWXTvUiMJlx5KESD_uOuA2qH28A3fPsxauAN1axu2DmMug6BOwpNCAgZOWWpZpRlEhwbLHX_feHyUAVOPu4zj-69t8owdoZR9S1J5mV3qB1AfwaUbcb_acJUBfANjbMGpXxudDGhh3KlxeUiKflrYkYmEuLSumclYClzs5ShW1tpn1sssWWCGoJxigZ9wAi8YNH_sXDeOTjBtTsqIrXa2pfewzVkW88XjN7WuO_Jd0bENSIqR6gklg=",
-        "proxy": PROXY_MAP["9455647843"]
     },
     {
         "account_id": "8009180726",
         "session_string": "1BVtsOMEBu0T7jep1-0LN_nY0k-qIedAbTROqFc5R9ENfdhfccf_HdTWNxct8Cz2ds4zjj0u_K_VnwZXeDbvZQj9BxvyI9N8KMFjz-fFSCNFcD1ENzxPUHHlIH8a0MuqxJ1PgRNYyPRFIVSFfGGdA47ceE50BFis01ob51dlIsF2wR6UTloO3OTccrtJbdSGWwmSn56pZR4_mepAtwxwu5_TZ8o5YtW9wGH_QijkownVVliGfr1wIi-8wPWnLhvLnDFr7tfGiU9mqWLpjoOiuIj9bmnmAU9Lch-crjUAyHo6pVTcEg7SUpb-OXax6KYqF7ZITBUgDzXxgQtIdlmk9yitjpz4cuBw=",
-        "proxy": PROXY_MAP["8009180726"]
     },
 ]
 
 # ==========================================
-# SEED ACCOUNTS (if empty)
+# SEED ACCOUNTS
 # ==========================================
 async def seed_accounts():
     try:
@@ -123,9 +115,18 @@ async def seed_accounts():
         if count > 0:
             logger.info(f"✅ Accounts pool already has {count} accounts")
             return
-        # Insert all accounts with their sessions and proxies
-        await accounts_pool.insert_many(ACCOUNTS_DATA)
-        logger.info(f"✅ Seeded {len(ACCOUNTS_DATA)} accounts with hardcoded proxies")
+        # Insert accounts with proxy field set to None (will be overridden by PROXY_MAP)
+        accounts_to_insert = []
+        for acc in ACCOUNTS_DATA:
+            accounts_to_insert.append({
+                "account_id": acc["account_id"],
+                "session_string": acc["session_string"],
+                "proxy": None,  # Will be overridden by hardcoded map
+                "status": "ready",
+                "cooldown_until": 0
+            })
+        await accounts_pool.insert_many(accounts_to_insert)
+        logger.info(f"✅ Seeded {len(accounts_to_insert)} accounts (proxies from hardcoded map)")
     except Exception as e:
         logger.error(f"Seed error: {e}")
 
@@ -154,26 +155,37 @@ async def get_config():
 def is_working_hour():
     return 9 <= datetime.now(IST).hour < 22
 
-def parse_proxy(account_id, db_proxy_str):
-    # Hardcoded proxy always overrides DB
-    if account_id in PROXY_MAP:
-        proxy_str = PROXY_MAP[account_id]
-        logger.info(f"📌 Using hardcoded proxy for account {account_id}")
-    else:
-        proxy_str = db_proxy_str
-        if proxy_str:
-            logger.info(f"📌 Using DB proxy for account {account_id}")
-        else:
-            logger.info(f"📌 No proxy for account {account_id} – direct connection")
-    if not proxy_str:
+def parse_proxy(account_id):
+    """
+    Returns a proxy tuple for Telethon using python-socks.
+    If account_id not in PROXY_MAP, returns None (direct connection).
+    """
+    if account_id not in PROXY_MAP:
+        logger.info(f"ℹ️ No hardcoded proxy for {account_id}, using direct connection.")
         return None
+    proxy_str = PROXY_MAP[account_id]
     try:
         parts = proxy_str.split(':')
-        if len(parts) >= 4:
-            return (socks.SOCKS5, parts[0], int(parts[1]), True, parts[2], parts[3])
-        return None
+        if len(parts) != 4:
+            logger.warning(f"Invalid proxy format for {account_id}: {proxy_str}")
+            return None
+        ip, port, user, pwd = parts
+        # Create proxy object for Telethon (compatible with python-socks)
+        from telethon.network.connection.tcpfull import ConnectionTcpFull
+        from telethon.network import MTProtoPlainSender
+        # Telethon expects a tuple for proxy: (socks.SOCKS5, ip, port, True, user, pwd) but we'll use a different approach:
+        # We'll pass proxy as a dict to Telethon's client constructor (newer versions support dict)
+        # Telethon 1.35+ supports proxy as a dict: {'proxy_type': ProxyType.SOCKS5, 'addr': ip, 'port': port, 'username': user, 'password': pwd, 'rdns': True}
+        return {
+            'proxy_type': ProxyType.SOCKS5,
+            'addr': ip,
+            'port': int(port),
+            'username': user,
+            'password': pwd,
+            'rdns': True
+        }
     except Exception as e:
-        logger.warning(f"Proxy parse error: {e}")
+        logger.error(f"Error parsing proxy for {account_id}: {e}")
         return None
 
 async def is_blacklisted(user_id):
@@ -185,7 +197,6 @@ async def is_blacklisted(user_id):
 # ==========================================
 # HARVESTER ENGINE
 # ==========================================
-
 async def harvester_engine():
     logger.info("🌾 Harvester Engine Started!")
     global is_engine_running
@@ -200,12 +211,16 @@ async def harvester_engine():
                 logger.info("⏳ No ready accounts")
                 await asyncio.sleep(120)
                 continue
-            proxy = parse_proxy(account['account_id'], account.get("proxy"))
+            proxy = parse_proxy(account['account_id'])
+            if proxy:
+                logger.info(f"📌 Using proxy for {account['account_id']}: {proxy['addr']}:{proxy['port']}")
+            else:
+                logger.info(f"📌 Direct connection for {account['account_id']}")
             client = TelegramClient(
                 StringSession(account['session_string']),
                 API_ID,
                 API_HASH,
-                proxy=proxy
+                proxy=proxy  # can be dict or None
             )
             try:
                 await client.connect()
@@ -251,11 +266,16 @@ async def harvester_engine():
                     await asyncio.sleep(30)
                 logger.info("🌾 Harvester cycle complete")
             except Exception as e:
-                logger.error(f"Harvester error: {e}")
-                if "SOCKS5" in str(e) or "GeneralProxyError" in str(e):
+                logger.error(f"Harvester error on {account['account_id']}: {e}")
+                if "SOCKS5" in str(e) or "GeneralProxyError" in str(e) or "authentication" in str(e).lower():
                     await accounts_pool.update_one(
                         {"_id": account['_id']},
-                        {"$set": {"status": "proxy_error", "last_error": str(e)}}
+                        {"$set": {"status": "proxy_error", "last_error": str(e)[:200]}}
+                    )
+                else:
+                    await accounts_pool.update_one(
+                        {"_id": account['_id']},
+                        {"$set": {"status": "error", "last_error": str(e)[:200]}}
                     )
             finally:
                 await client.disconnect()
@@ -266,7 +286,6 @@ async def harvester_engine():
 # ==========================================
 # INJECTOR ENGINE
 # ==========================================
-
 async def injector_engine():
     logger.info("💉 Injector Engine Started (Direct Add Only)!")
     global is_engine_running
@@ -291,7 +310,11 @@ async def injector_engine():
                 logger.info("⏳ No ready accounts")
                 await asyncio.sleep(120)
                 continue
-            proxy = parse_proxy(account['account_id'], account.get("proxy"))
+            proxy = parse_proxy(account['account_id'])
+            if proxy:
+                logger.info(f"📌 Using proxy for {account['account_id']}: {proxy['addr']}:{proxy['port']}")
+            else:
+                logger.info(f"📌 Direct connection for {account['account_id']}")
             client = TelegramClient(
                 StringSession(account['session_string']),
                 API_ID,
@@ -409,11 +432,11 @@ async def injector_engine():
                         {"$set": {"status": "cooling", "cooldown_until": cooldown_time}}
                     )
             except Exception as e:
-                logger.error(f"Injector error: {e}")
-                if "SOCKS5" in str(e) or "GeneralProxyError" in str(e):
+                logger.error(f"Injector error on {account['account_id']}: {e}")
+                if "SOCKS5" in str(e) or "GeneralProxyError" in str(e) or "authentication" in str(e).lower():
                     await accounts_pool.update_one(
                         {"_id": account['_id']},
-                        {"$set": {"status": "proxy_error", "last_error": str(e)}}
+                        {"$set": {"status": "proxy_error", "last_error": str(e)[:200]}}
                     )
                 elif "banned" in str(e).lower():
                     await accounts_pool.update_one(
@@ -429,7 +452,6 @@ async def injector_engine():
 # ==========================================
 # ADMIN BOT COMMANDS
 # ==========================================
-
 @admin_bot.on(events.NewMessage(incoming=True))
 async def admin_handler(event):
     try:
@@ -467,8 +489,7 @@ async def admin_handler(event):
 # ==========================================
 # FASTAPI APP
 # ==========================================
-
-app = FastAPI(title="Agri Mastermind AI Engine", version="4.3.0")
+app = FastAPI(title="Agri Mastermind AI Engine", version="4.4.0")
 
 @app.on_event("startup")
 async def startup():
@@ -479,27 +500,23 @@ async def startup():
         logger.info("✅ MongoDB Connected!")
     except Exception as e:
         logger.error(f"❌ MongoDB error: {e}")
-    
-    # Seed accounts if pool is empty
     await seed_accounts()
-    
     try:
         await admin_bot.start(bot_token=BOT_TOKEN)
         logger.info("✅ Admin Bot Started!")
         try:
-            await admin_bot.send_message(ADMIN_USERNAME, "🚀 Agri Mastermind AI Engine v4.3 started with 8 accounts & hardcoded proxies!")
+            await admin_bot.send_message(ADMIN_USERNAME, "🚀 Agri Mastermind AI Engine v4.4 started with python-socks!")
         except:
             pass
     except Exception as e:
         logger.error(f"❌ Bot error: {e}")
-    
     asyncio.create_task(harvester_engine())
     asyncio.create_task(injector_engine())
     logger.info("🚀 All Engines Started (Production Mode)!")
 
 @app.get("/")
 async def root():
-    return {"status": "Agri Mastermind AI Engine v4.3", "running": is_engine_running}
+    return {"status": "Agri Mastermind AI Engine v4.4", "running": is_engine_running}
 
 @app.get("/health")
 async def health():
