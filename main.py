@@ -17,6 +17,97 @@ from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import User, ChannelParticipantsAdmins
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
+# ==========================================
+# 🧪 TEST FUNCTIONS (Verify Components)
+# ==========================================
+
+async def run_tests():
+    """Run connection, harvester, and injector tests sequentially"""
+    logger.info("🧪 Running Tests...")
+    
+    # Account to test (pehla ready account uthao)
+    account = await accounts_pool.find_one({"status": "ready"})
+    if not account:
+        logger.error("❌ No ready account found for testing")
+        return
+    
+    logger.info(f"🔍 Testing account: {account['account_id']}")
+    proxy = parse_proxy(account.get("proxy"))
+    
+    client = TelegramClient(
+        StringSession(account['session_string']),
+        API_ID,
+        API_HASH,
+        proxy=proxy
+    )
+    
+    try:
+        # ---------- Connection Test ----------
+        await client.connect()
+        me = await client.get_me()
+        logger.info(f"✅ Connection successful: {me.first_name} (@{me.username})")
+        
+        # ---------- Harvester Test (10 users) ----------
+        logger.info("🌾 Testing Harvester (scraping 10 users)...")
+        source_channels = ["Dream_Agri"]  # pehla channel
+        for channel in source_channels:
+            try:
+                entity = await client.get_entity(channel)
+                admins = await client.get_participants(entity, filter=ChannelParticipantsAdmins)
+                admin_ids = [a.id for a in admins]
+            except Exception as e:
+                logger.error(f"❌ Cannot access {channel}: {e}")
+                continue
+            
+            count = 0
+            async for user in client.iter_participants(entity, limit=20):
+                if not isinstance(user, User) or user.bot or user.deleted:
+                    continue
+                if user.id in admin_ids:
+                    continue
+                name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "User"
+                logger.info(f"👤 Scraped: {name} (ID: {user.id})")
+                count += 1
+                if count >= 10:
+                    break
+            logger.info(f"✅ Scraped {count} users from {channel}")
+        
+        # ---------- Injector Test (1 user from queue) ----------
+        logger.info("💉 Testing Injector (adding 1 user from queue)...")
+        user_doc = await scraped_queue.find_one({"status": "pending"})
+        if not user_doc:
+            logger.warning("⚠️ No pending users in queue, skipping add test")
+        else:
+            user_id = user_doc['user_id']
+            try:
+                user_entity = await client.get_entity(user_id)
+                # Privacy check
+                try:
+                    await client.send_message(user_entity, "test")
+                    valid = True
+                except errors.UserPrivacyRestrictedError:
+                    logger.info(f"⏭️ Skipped (privacy): {user_doc['name']}")
+                except errors.UserNotMutualContactError:
+                    logger.info(f"⏭️ Skipped (not mutual): {user_doc['name']}")
+                except:
+                    valid = True
+                
+                if valid:
+                    target_entity = await client.get_entity(TARGET_GROUP)
+                    await client(InviteToChannelRequest(target_entity, [user_entity]))
+                    logger.info(f"✅ Added: {user_doc['name']}")
+                else:
+                    logger.info("⏭️ User not addable, skipping direct add")
+            except Exception as e:
+                logger.error(f"❌ Add test failed: {e}")
+        
+        logger.info("🧪 All tests completed!")
+        
+    except Exception as e:
+        logger.error(f"❌ Test suite failed: {e}")
+    finally:
+        await client.disconnect()
+        logger.info("🔌 Disconnected.")
 
 # ==========================================
 # LOGGING
