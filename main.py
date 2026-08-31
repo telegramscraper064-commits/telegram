@@ -1,5 +1,5 @@
 """
-Agri Mastermind AI Engine v4.4 – Proxy Robust with python-socks
+Agri Mastermind AI Engine v4.5 – Proxy Robust with python-socks (Fixed Import)
 """
 
 import os
@@ -14,8 +14,7 @@ from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import User, ChannelParticipantsAdmins, InputPeerUser
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
-from python_socks import ProxyType
-from python_socks.async_ import AsyncProxy
+from python_socks import ProxyType   # ✅ Only this import is needed
 
 # ==========================================
 # LOGGING
@@ -115,13 +114,12 @@ async def seed_accounts():
         if count > 0:
             logger.info(f"✅ Accounts pool already has {count} accounts")
             return
-        # Insert accounts with proxy field set to None (will be overridden by PROXY_MAP)
         accounts_to_insert = []
         for acc in ACCOUNTS_DATA:
             accounts_to_insert.append({
                 "account_id": acc["account_id"],
                 "session_string": acc["session_string"],
-                "proxy": None,  # Will be overridden by hardcoded map
+                "proxy": None,
                 "status": "ready",
                 "cooldown_until": 0
             })
@@ -156,10 +154,7 @@ def is_working_hour():
     return 9 <= datetime.now(IST).hour < 22
 
 def parse_proxy(account_id):
-    """
-    Returns a proxy tuple for Telethon using python-socks.
-    If account_id not in PROXY_MAP, returns None (direct connection).
-    """
+    """Returns a proxy dict for Telethon or None."""
     if account_id not in PROXY_MAP:
         logger.info(f"ℹ️ No hardcoded proxy for {account_id}, using direct connection.")
         return None
@@ -170,12 +165,6 @@ def parse_proxy(account_id):
             logger.warning(f"Invalid proxy format for {account_id}: {proxy_str}")
             return None
         ip, port, user, pwd = parts
-        # Create proxy object for Telethon (compatible with python-socks)
-        from telethon.network.connection.tcpfull import ConnectionTcpFull
-        from telethon.network import MTProtoPlainSender
-        # Telethon expects a tuple for proxy: (socks.SOCKS5, ip, port, True, user, pwd) but we'll use a different approach:
-        # We'll pass proxy as a dict to Telethon's client constructor (newer versions support dict)
-        # Telethon 1.35+ supports proxy as a dict: {'proxy_type': ProxyType.SOCKS5, 'addr': ip, 'port': port, 'username': user, 'password': pwd, 'rdns': True}
         return {
             'proxy_type': ProxyType.SOCKS5,
             'addr': ip,
@@ -220,7 +209,7 @@ async def harvester_engine():
                 StringSession(account['session_string']),
                 API_ID,
                 API_HASH,
-                proxy=proxy  # can be dict or None
+                proxy=proxy
             )
             try:
                 await client.connect()
@@ -489,7 +478,7 @@ async def admin_handler(event):
 # ==========================================
 # FASTAPI APP
 # ==========================================
-app = FastAPI(title="Agri Mastermind AI Engine", version="4.4.0")
+app = FastAPI(title="Agri Mastermind AI Engine", version="4.5.0")
 
 @app.on_event("startup")
 async def startup():
@@ -505,7 +494,7 @@ async def startup():
         await admin_bot.start(bot_token=BOT_TOKEN)
         logger.info("✅ Admin Bot Started!")
         try:
-            await admin_bot.send_message(ADMIN_USERNAME, "🚀 Agri Mastermind AI Engine v4.4 started with python-socks!")
+            await admin_bot.send_message(ADMIN_USERNAME, "🚀 Agri Mastermind AI Engine v4.5 started with python-socks!")
         except:
             pass
     except Exception as e:
@@ -516,7 +505,7 @@ async def startup():
 
 @app.get("/")
 async def root():
-    return {"status": "Agri Mastermind AI Engine v4.4", "running": is_engine_running}
+    return {"status": "Agri Mastermind AI Engine v4.5", "running": is_engine_running}
 
 @app.get("/health")
 async def health():
