@@ -1,5 +1,13 @@
 """
-Agri Mastermind AI Engine v4.7 – Proxy Fallback + Flood Handling
+Agri Mastermind AI Engine v5.0 – 24×7 Production Ready
+=========================================================
+- 8 hardcoded accounts with proxies (Webshare)
+- Proxy fallback (proxy -> direct)
+- Flood cooldown (24h)
+- No working hours (runs 24×7)
+- Auto‑seeding if database empty
+- Admin bot commands: status, pause, resume
+- Detailed logging for each section
 """
 
 import os
@@ -17,7 +25,7 @@ from telethon.tl.types import User, ChannelParticipantsAdmins, InputPeerUser
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
 
 # ==========================================
-# LOGGING
+# 1. LOGGING SETUP
 # ==========================================
 logging.basicConfig(
     format='%(asctime)s - [%(levelname)s] - %(name)s - %(message)s',
@@ -26,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# ENVIRONMENT VARIABLES
+# 2. ENVIRONMENT VARIABLES
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8857141734:AAGmL8gjCRZfbZyZeSaszs6_vcSXuGco0HE")
 API_ID = int(os.getenv("API_ID", 33239973))
@@ -35,27 +43,31 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://mailforfulltest_db_user:1vmiEQ
 
 TARGET_GROUP = os.getenv("TARGET_GROUP", "agriquizworld")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "agrikrishna")
-MAX_ADDS_PER_DAY = int(os.getenv("MAX_ADDS_PER_DAY", 20))
-COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", 24))
-IST = pytz.timezone('Asia/Kolkata')
+MAX_ADDS_PER_DAY = int(os.getenv("MAX_ADDS_PER_DAY", 20))   # per account per 24h
+COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", 24))       # flood cooldown
 
 # ==========================================
-# DATABASE
+# 3. DATABASE CONNECTION
 # ==========================================
 mongo_client = AsyncIOMotorClient(MONGO_URI)
-db = mongo_client['telegram_scraper_safe']
+db = mongo_client['telegram_scraper_safe']   # main database
 
-accounts_pool = db['accounts_pool']
-scraped_queue = db['scraped_queue']
-master_blacklist = db['global_added']
-system_config = db['system_config']
+# Collections
+accounts_pool = db['accounts_pool']           # Telegram accounts (session, status, cooldown)
+scraped_queue = db['scraped_queue']           # Pending users to add
+master_blacklist = db['global_added']         # Already added users (to avoid duplicates)
+system_config = db['system_config']           # System settings (max adds, source channels, pause)
 
+# Telegram admin bot client
 admin_bot = TelegramClient('admin_bot', API_ID, API_HASH)
+
+# Global flag to control background tasks
 is_engine_running = False
 
 # ==========================================
-# HARDCODED PROXY MAPPING (8 Accounts)
+# 4. HARDCODED PROXY MAPPING (8 Accounts)
 # ==========================================
+# Format: "account_id": "ip:port:username:password"
 PROXY_MAP = {
     "8787291649": "31.59.20.176:6754:fvxvljhz:dlmhyual43rju",
     "7238051659": "45.38.107.97:6014:fvxvljhz:dlmhyual43rju",
@@ -68,7 +80,7 @@ PROXY_MAP = {
 }
 
 # ==========================================
-# ACCOUNT SESSIONS (for seeding)
+# 5. ACCOUNT SESSIONS (for seeding)
 # ==========================================
 ACCOUNTS_DATA = [
     {
@@ -106,40 +118,42 @@ ACCOUNTS_DATA = [
 ]
 
 # ==========================================
-# SEED ACCOUNTS
+# 6. SEED ACCOUNTS (if database empty)
 # ==========================================
 async def seed_accounts():
+    """Insert all 8 accounts with session strings and proxy (None) – proxy will be taken from PROXY_MAP."""
     try:
         count = await accounts_pool.count_documents({})
         if count > 0:
             logger.info(f"✅ Accounts pool already has {count} accounts")
             return
+        # Build documents
         accounts_to_insert = []
         for acc in ACCOUNTS_DATA:
             accounts_to_insert.append({
                 "account_id": acc["account_id"],
                 "session_string": acc["session_string"],
-                "proxy": None,
-                "status": "ready",
+                "proxy": None,                 # we use PROXY_MAP, not stored in DB
+                "status": "ready",             # all start as ready
                 "cooldown_until": 0
             })
         await accounts_pool.insert_many(accounts_to_insert)
-        logger.info(f"✅ Seeded {len(accounts_to_insert)} accounts")
+        logger.info(f"✅ Seeded {len(accounts_to_insert)} accounts (all set to ready)")
     except Exception as e:
-        logger.error(f"Seed error: {e}")
+        logger.error(f"❌ Seed error: {e}")
 
 # ==========================================
-# UTILITY FUNCTIONS
+# 7. SYSTEM CONFIGURATION
 # ==========================================
-
 async def get_config():
+    """Fetch or create system config from MongoDB."""
     try:
         config = await system_config.find_one({"_id": "core_limits"})
         if not config:
             config = {
                 "_id": "core_limits",
                 "max_adds": MAX_ADDS_PER_DAY,
-                "min_delay": 60,
+                "min_delay": 60,            # seconds between adds
                 "max_delay": 120,
                 "is_paused": False,
                 "source_channels": ["Dream_Agri", "AGLAERT", "afo2023interview", "Gen_Agriculture", "IBPSSO25"],
@@ -147,53 +161,60 @@ async def get_config():
             }
             await system_config.insert_one(config)
         return config
-    except Exception:
-        return {"max_adds": MAX_ADDS_PER_DAY, "min_delay": 60, "max_delay": 120, "is_paused": False}
+    except Exception as e:
+        logger.error(f"Config error: {e}")
+        return {"max_adds": MAX_ADDS_PER_DAY, "min_delay": 60, "max_delay": 120, "is_paused": False, "source_channels": ["Dream_Agri"]}
 
-def is_working_hour():
-    return 9 <= datetime.now(IST).hour < 22
-
+# ==========================================
+# 8. PROXY PARSING (with fallback)
+# ==========================================
 def parse_proxy(account_id):
-    """Return proxy tuple or None."""
+    """Return proxy tuple (SOCKS5) or None (direct)."""
     if account_id not in PROXY_MAP:
         return None
     try:
         ip, port, user, pwd = PROXY_MAP[account_id].split(':')
         return (socks.SOCKS5, ip, int(port), True, user, pwd)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Proxy parse error for {account_id}: {e}")
         return None
 
+# ==========================================
+# 9. BLACKLIST CHECK
+# ==========================================
 async def is_blacklisted(user_id):
     try:
         return await master_blacklist.find_one({"user_id": user_id}) is not None
     except:
         return False
 
-async def connect_with_fallback(account, purpose="engine"):
-    """Try proxy first, then fallback to direct if proxy fails."""
+# ==========================================
+# 10. CONNECTION WITH FALLBACK (proxy -> direct)
+# ==========================================
+async def connect_with_fallback(account, purpose="Engine"):
+    """Try proxy, then direct if proxy fails."""
     proxy = parse_proxy(account['account_id'])
     if proxy:
         logger.info(f"📌 Trying proxy for {account['account_id']}: {proxy[1]}:{proxy[2]}")
     else:
-        logger.info(f"📌 Direct connection for {account['account_id']}")
-    
+        logger.info(f"📌 Direct connection for {account['account_id']} (no proxy)")
+
     client = TelegramClient(
         StringSession(account['session_string']),
         API_ID,
         API_HASH,
         proxy=proxy
     )
-    
+
     try:
         await client.connect()
         logger.info(f"✅ {purpose} connected: {account['account_id']} via {'proxy' if proxy else 'direct'}")
         return client, True
     except Exception as e:
         error_str = str(e)
-        # If proxy error, try without proxy
+        # If proxy error, retry without proxy
         if proxy and ("SOCKS5" in error_str or "GeneralProxyError" in error_str):
             logger.warning(f"⚠️ Proxy failed for {account['account_id']}, falling back to direct connection...")
-            # Retry without proxy
             fallback_client = TelegramClient(
                 StringSession(account['session_string']),
                 API_ID,
@@ -205,8 +226,7 @@ async def connect_with_fallback(account, purpose="engine"):
                 logger.info(f"✅ {purpose} connected (direct) for {account['account_id']} after proxy failure")
                 return fallback_client, True
             except Exception as e2:
-                logger.error(f"❌ Direct connection also failed for {account['account_id']}: {e2}")
-                # Mark account as proxy_error
+                logger.error(f"❌ Direct connection also failed: {e2}")
                 await accounts_pool.update_one(
                     {"_id": account['_id']},
                     {"$set": {"status": "proxy_error", "last_error": str(e2)[:200]}}
@@ -214,7 +234,7 @@ async def connect_with_fallback(account, purpose="engine"):
                 await client.disconnect()
                 return None, False
         else:
-            # Other error (non‑proxy)
+            # Non‑proxy error
             logger.error(f"❌ Connection error for {account['account_id']}: {e}")
             await accounts_pool.update_one(
                 {"_id": account['_id']},
@@ -224,38 +244,45 @@ async def connect_with_fallback(account, purpose="engine"):
             return None, False
 
 # ==========================================
-# HARVESTER ENGINE
+# 11. HARVESTER ENGINE (Scraping)
 # ==========================================
 async def harvester_engine():
-    logger.info("🌾 Harvester Engine Started!")
+    """Continuously scrapes members from source channels and stores in scraped_queue."""
+    logger.info("🌾 Harvester Engine Started (24×7 mode)!")
     global is_engine_running
+
     while is_engine_running:
         try:
             config = await get_config()
             if config.get("is_paused"):
+                logger.info("⏸️ Harvester paused by admin")
                 await asyncio.sleep(60)
                 continue
+
+            # Get a ready account
             account = await accounts_pool.find_one({"status": "ready"})
             if not account:
-                logger.info("⏳ No ready accounts")
+                logger.info("⏳ No ready accounts for harvesting")
                 await asyncio.sleep(120)
                 continue
-            
+
             client, ok = await connect_with_fallback(account, "Harvester")
             if not ok:
                 continue
-            
+
             try:
                 source_channels = config.get("source_channels", ["Dream_Agri"])
                 for channel in source_channels:
                     if not is_engine_running:
                         break
                     logger.info(f"🎯 Scanning: {channel}")
+                    # Fetch admins to exclude
                     try:
                         admins = await client.get_participants(channel, filter=ChannelParticipantsAdmins)
                         admin_ids = [a.id for a in admins]
                     except:
                         admin_ids = []
+
                     count = 0
                     try:
                         async for user in client.iter_participants(channel, limit=500):
@@ -265,6 +292,7 @@ async def harvester_engine():
                                 continue
                             if await is_blacklisted(user.id):
                                 continue
+                            # Avoid duplicates in queue
                             existing = await scraped_queue.find_one({"user_id": user.id})
                             if existing:
                                 continue
@@ -284,7 +312,8 @@ async def harvester_engine():
                     except Exception as e:
                         logger.error(f"Scrape error {channel}: {e}")
                     logger.info(f"✅ Scraped {count} users from {channel}")
-                    await asyncio.sleep(30)
+                    await asyncio.sleep(30)   # small break between channels
+
                 logger.info("🌾 Harvester cycle complete")
             except Exception as e:
                 logger.error(f"Harvester error on {account['account_id']}: {e}")
@@ -295,82 +324,98 @@ async def harvester_engine():
                     )
             finally:
                 await client.disconnect()
+
         except Exception as e:
             logger.error(f"Harvester loop error: {e}")
-        await asyncio.sleep(900)
+
+        await asyncio.sleep(900)   # 15 minutes between cycles
 
 # ==========================================
-# INJECTOR ENGINE
+# 12. INJECTOR ENGINE (Adding Users)
 # ==========================================
 async def injector_engine():
-    logger.info("💉 Injector Engine Started (Direct Add Only)!")
+    """Processes pending users: privacy check → direct add → cooldown on flood."""
+    logger.info("💉 Injector Engine Started (Direct Add Only, 24×7)!")
     global is_engine_running
+
     stats = {"attempted": 0, "successful": 0, "skipped": 0, "failed": 0}
+
     while is_engine_running:
         try:
-            if not is_working_hour():
-                logger.info("🌙 Outside working hours")
-                await asyncio.sleep(3600)
-                continue
             config = await get_config()
             if config.get("is_paused"):
+                logger.info("⏸️ Injector paused by admin")
                 await asyncio.sleep(60)
                 continue
+
+            # Reset cooldown accounts
             now_ts = datetime.now(pytz.utc).timestamp()
             await accounts_pool.update_many(
                 {"status": "cooling", "cooldown_until": {"$lt": now_ts}},
                 {"$set": {"status": "ready", "cooldown_until": 0}}
             )
+
             account = await accounts_pool.find_one({"status": "ready"})
             if not account:
-                logger.info("⏳ No ready accounts")
+                logger.info("⏳ No ready accounts for adding")
                 await asyncio.sleep(120)
                 continue
-            
+
             client, ok = await connect_with_fallback(account, "Injector")
             if not ok:
                 continue
-            
+
             try:
+                # Ensure account is a member of target group (auto‑join)
                 try:
                     await client(JoinChannelRequest(TARGET_GROUP))
                 except:
                     pass
+
                 target_entity = await client.get_entity(TARGET_GROUP)
                 max_adds = config.get("max_adds", MAX_ADDS_PER_DAY)
+
+                # Reset stats if we already reached daily limit for this account
                 if stats["successful"] >= max_adds:
                     stats = {"attempted": 0, "successful": 0, "skipped": 0, "failed": 0}
+
                 while stats["successful"] < max_adds:
                     user_doc = await scraped_queue.find_one({"status": "pending"})
                     if not user_doc:
-                        logger.info("📭 No pending users")
+                        logger.info("📭 No pending users in queue")
                         break
+
                     if await is_blacklisted(user_doc['user_id']):
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                         continue
+
                     stats["attempted"] += 1
+
+                    # ---------- Entity resolution & privacy check ----------
                     try:
                         user_id = user_doc['user_id']
                         access_hash = user_doc.get('access_hash')
                         username = user_doc.get('username')
+
                         if username:
                             user_entity = await client.get_entity(username)
                         elif access_hash:
                             user_entity = await client.get_entity(InputPeerUser(user_id, access_hash))
                         else:
                             user_entity = await client.get_entity(user_id)
-                        # Privacy check
+
+                        # Privacy check – try sending a dummy message
                         try:
                             await client.send_message(user_entity, "test")
                             valid = True
                         except errors.UserPrivacyRestrictedError:
                             stats["skipped"] += 1
-                            logger.info(f"⏭️ Skipped (privacy): {user_doc['name']}")
+                            logger.info(f"⏭️ Skipped (privacy restricted): {user_doc['name']}")
                             await scraped_queue.delete_one({"_id": user_doc['_id']})
                             continue
                         except errors.UserNotMutualContactError:
                             stats["skipped"] += 1
-                            logger.info(f"⏭️ Skipped (not mutual): {user_doc['name']}")
+                            logger.info(f"⏭️ Skipped (not mutual contact): {user_doc['name']}")
                             await scraped_queue.delete_one({"_id": user_doc['_id']})
                             continue
                         except:
@@ -379,11 +424,14 @@ async def injector_engine():
                         logger.warning(f"Entity resolution error: {e}")
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                         continue
-                    # Direct add
+
+                    # ---------- Direct add ----------
                     try:
                         await client(InviteToChannelRequest(target_entity, [user_entity]))
                         stats["successful"] += 1
                         logger.info(f"✅ Added: {user_doc['name']} ({stats['successful']}/{max_adds})")
+
+                        # Mark as added
                         await master_blacklist.insert_one({
                             "user_id": user_doc['user_id'],
                             "name": user_doc['name'],
@@ -391,22 +439,27 @@ async def injector_engine():
                             "added_at": datetime.now(pytz.utc)
                         })
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
+
+                        # Random delay between adds (60‑120 sec)
                         delay = random.randint(60, 120)
-                        logger.info(f"⏳ Waiting {delay}s...")
+                        logger.info(f"⏳ Waiting {delay}s before next add...")
                         await asyncio.sleep(delay)
+
                     except errors.PeerFloodError:
-                        logger.warning(f"🚫 FLOOD! Cooldown {COOLDOWN_HOURS}h")
+                        logger.warning(f"🚫 FLOOD! Cooldown {COOLDOWN_HOURS}h for account {account['account_id']}")
                         cooldown_time = (datetime.now(pytz.utc) + timedelta(hours=COOLDOWN_HOURS)).timestamp()
                         await accounts_pool.update_one(
                             {"_id": account['_id']},
                             {"$set": {"status": "cooling", "cooldown_until": cooldown_time}}
                         )
                         stats["failed"] += 1
-                        break
+                        break   # stop using this account
+
                     except errors.FloodWaitError as e:
                         wait = e.seconds + 10
-                        logger.info(f"⏳ FloodWait: {wait}s")
+                        logger.info(f"⏳ FloodWait: waiting {wait}s...")
                         await asyncio.sleep(wait)
+                        # Retry once
                         try:
                             await client(InviteToChannelRequest(target_entity, [user_entity]))
                             stats["successful"] += 1
@@ -419,26 +472,32 @@ async def injector_engine():
                         except:
                             stats["failed"] += 1
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
+
                     except Exception as e:
                         stats["failed"] += 1
                         logger.error(f"Add error: {e}")
                         await scraped_queue.delete_one({"_id": user_doc['_id']})
                         await asyncio.sleep(5)
+
+                    # Log progress every 5 adds
                     if stats["successful"] % 5 == 0:
                         logger.info(f"""
-📊 PROGRESS:
+📊 PROGRESS (Account: {account['account_id']}):
 ✅ Success: {stats['successful']}
 ⏭️ Skipped: {stats['skipped']}
 ❌ Failed: {stats['failed']}
 🎯 Target: {max_adds}
 """)
+
+                # If we reached max adds, cooldown this account
                 if stats["successful"] >= max_adds:
-                    logger.info(f"✅ Reached {max_adds} adds!")
+                    logger.info(f"✅ Reached {max_adds} adds for {account['account_id']}! Cooling down.")
                     cooldown_time = (datetime.now(pytz.utc) + timedelta(hours=COOLDOWN_HOURS)).timestamp()
                     await accounts_pool.update_one(
                         {"_id": account['_id']},
                         {"$set": {"status": "cooling", "cooldown_until": cooldown_time}}
                     )
+
             except Exception as e:
                 logger.error(f"Injector error on {account['account_id']}: {e}")
                 if "banned" in str(e).lower():
@@ -446,24 +505,34 @@ async def injector_engine():
                         {"_id": account['_id']},
                         {"$set": {"status": "banned"}}
                     )
+                else:
+                    await accounts_pool.update_one(
+                        {"_id": account['_id']},
+                        {"$set": {"status": "error", "last_error": str(e)[:200]}}
+                    )
             finally:
                 await client.disconnect()
+
         except Exception as e:
             logger.error(f"Injector loop error: {e}")
-        await asyncio.sleep(30)
+
+        await asyncio.sleep(30)   # short wait before looking for next account
 
 # ==========================================
-# ADMIN BOT COMMANDS
+# 13. ADMIN BOT COMMANDS
 # ==========================================
 @admin_bot.on(events.NewMessage(incoming=True))
 async def admin_handler(event):
+    """Listens for commands from the admin."""
     try:
         sender = await event.get_sender()
         if not sender or not sender.username:
             return
         if sender.username.lower() != ADMIN_USERNAME.lower():
             return
+
         text = event.raw_text.lower().strip()
+
         if "status" in text:
             ready = await accounts_pool.count_documents({"status": "ready"})
             cooling = await accounts_pool.count_documents({"status": "cooling"})
@@ -471,55 +540,68 @@ async def admin_handler(event):
             total = await master_blacklist.count_documents({})
             await event.reply(f"""
 📊 **System Status**
-🟢 Ready: {ready}
-🟡 Cooling: {cooling}
-📥 Pending: {pending}
-✅ Added: {total}
-🎯 Target/day: {MAX_ADDS_PER_DAY}
-📍 Group: @{TARGET_GROUP}
-""")
+🟢 Ready accounts: {ready}
+🟡 Cooling accounts: {cooling}
+📥 Pending queue: {pending}
+✅ Total added: {total}
+🎯 Target/day (per account): {MAX_ADDS_PER_DAY}
+📍 Target group: @{TARGET_GROUP}
+            """)
         elif "pause" in text:
             await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": True}})
-            await event.reply("🛑 Paused")
+            await event.reply("🛑 System paused.")
         elif "resume" in text:
             await system_config.update_one({"_id": "core_limits"}, {"$set": {"is_paused": False}})
-            await event.reply("▶️ Resumed")
+            await event.reply("▶️ System resumed.")
         else:
             await event.reply("Commands: status, pause, resume")
     except Exception as e:
         logger.error(f"Admin error: {e}")
 
 # ==========================================
-# FASTAPI APP
+# 14. FASTAPI APPLICATION
 # ==========================================
-app = FastAPI(title="Agri Mastermind AI Engine", version="4.7.0")
+app = FastAPI(title="Agri Mastermind AI Engine", version="5.0.0")
 
 @app.on_event("startup")
 async def startup():
     global is_engine_running
     is_engine_running = True
+
+    # Connect MongoDB
     try:
         await mongo_client.admin.command('ping')
         logger.info("✅ MongoDB Connected!")
     except Exception as e:
         logger.error(f"❌ MongoDB error: {e}")
+
+    # Seed accounts if pool is empty
     await seed_accounts()
+
+    # Start admin bot
     try:
         await admin_bot.start(bot_token=BOT_TOKEN)
         logger.info("✅ Admin Bot Started!")
         try:
-            await admin_bot.send_message(ADMIN_USERNAME, "🚀 Agri Mastermind AI Engine v4.7 started with proxy fallback!")
+            await admin_bot.send_message(ADMIN_USERNAME, "🚀 Agri Mastermind AI Engine v5.0 (24×7) started!")
         except:
             pass
     except Exception as e:
         logger.error(f"❌ Bot error: {e}")
+
+    # Launch background tasks
     asyncio.create_task(harvester_engine())
     asyncio.create_task(injector_engine())
-    logger.info("🚀 All Engines Started (Production Mode)!")
+    logger.info("🚀 All Engines Started (Production Mode – 24×7)!")
 
 @app.get("/")
 async def root():
-    return {"status": "Agri Mastermind AI Engine v4.7", "running": is_engine_running}
+    return {
+        "status": "Agri Mastermind AI Engine v5.0",
+        "running": is_engine_running,
+        "mode": "24×7",
+        "target_group": TARGET_GROUP
+    }
 
 @app.get("/health")
 async def health():
@@ -533,7 +615,8 @@ async def health():
         "cooling": cooling,
         "pending": pending,
         "added": total,
-        "running": is_engine_running
+        "running": is_engine_running,
+        "mode": "24×7"
     }
 
 if __name__ == "__main__":
