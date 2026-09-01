@@ -39,6 +39,7 @@ class Config:
     API_HASH = os.getenv("API_HASH", "")
     BOT_TOKEN = os.getenv("BOT_TOKEN", "")
     MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+    OLD_MONGO_URI = os.getenv("OLD_MONGO_URI", "") # Naya variable migration ke liye
     TARGET_GROUP = os.getenv("TARGET_GROUP", "")
     ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
     
@@ -108,7 +109,7 @@ class Database:
 db = Database(Config.MONGO_URI)
 
 # ==========================================
-# PART 3: PROXY POOL MOCK (For Integration)
+# PART 3: PROXY POOL MOCK
 # ==========================================
 class MockProxyPool:
     async def initialize(self): pass
@@ -411,7 +412,7 @@ async def admin_bot_handler(event):
         await event.reply("🤖 **Commands:**\n`status` - View stats\n`pause` - Stop processing\n`resume` - Start processing")
 
 # ==========================================
-# PART 7: FASTAPI & LIFESPAN
+# PART 7: FASTAPI, ENDPOINTS & LIFESPAN
 # ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -463,10 +464,30 @@ async def health_check():
         "stats": {"ready_accounts": ready, "cooling_accounts": cooling, "pending_queue": pending, "total_added": added}
     }
 
+# YAHAN NAYA ENDPOINT ADD KIYA HAI PURANE DB KO CHECK KARNE KE LIYE
+@app.get("/check-old-db")
+async def check_old_db():
+    if not Config.OLD_MONGO_URI:
+        return {"error": "OLD_MONGO_URI set nahi hai Render ke Environment variables mein."}
+    
+    temp_client = AsyncIOMotorClient(Config.OLD_MONGO_URI)
+    db_info = {}
+    try:
+        db_names = await temp_client.list_database_names()
+        for db_name in db_names:
+            if db_name not in ['admin', 'local', 'config']:
+                temp_db = temp_client[db_name]
+                cols = await temp_db.list_collection_names()
+                db_info[db_name] = cols
+        return {"success": True, "data": db_info}
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        temp_client.close()
+
 # ==========================================
 # PART 8: MAIN ENTRY POINT
 # ==========================================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    # Run the uvicorn server
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
