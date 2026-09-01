@@ -39,7 +39,7 @@ class Config:
     API_HASH = os.getenv("API_HASH", "")
     BOT_TOKEN = os.getenv("BOT_TOKEN", "")
     MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-    OLD_MONGO_URI = os.getenv("OLD_MONGO_URI", "") # Naya variable migration ke liye
+    OLD_MONGO_URI = os.getenv("OLD_MONGO_URI", "") # Purane DB ka URI
     TARGET_GROUP = os.getenv("TARGET_GROUP", "")
     ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
     
@@ -464,11 +464,11 @@ async def health_check():
         "stats": {"ready_accounts": ready, "cooling_accounts": cooling, "pending_queue": pending, "total_added": added}
     }
 
-# YAHAN NAYA ENDPOINT ADD KIYA HAI PURANE DB KO CHECK KARNE KE LIYE
+# CHECK OLD DB 
 @app.get("/check-old-db")
 async def check_old_db():
     if not Config.OLD_MONGO_URI:
-        return {"error": "OLD_MONGO_URI set nahi hai Render ke Environment variables mein."}
+        return {"error": "OLD_MONGO_URI set nahi hai"}
     
     temp_client = AsyncIOMotorClient(Config.OLD_MONGO_URI)
     db_info = {}
@@ -484,6 +484,80 @@ async def check_old_db():
         return {"error": str(e)}
     finally:
         temp_client.close()
+
+# YAHAN DATA MIGRATE KARNE KA NAYA ENDPOINT HAI
+@app.get("/run-migration")
+async def run_migration():
+    if not Config.OLD_MONGO_URI:
+        return {"error": "OLD_MONGO_URI set nahi hai"}
+    
+    # Purane DB se connect kar rahe hain
+    old_client = AsyncIOMotorClient(Config.OLD_MONGO_URI)
+    old_db = old_client['telegram_scraper_safe']
+    old_accounts_col = old_db['accounts_pool']
+    old_queue_col = old_db['scraped_queue']
+    
+    inserted_accounts = 0
+    inserted_users = 0
+    
+    try:
+        # 1. ACCOUNTS MIGRATE KARNA (11 IDs)
+        old_accounts = await old_accounts_col.find({}).to_list(length=None)
+        today_ist = datetime.now(Config.IST).strftime('%Y-%m-%d')
+        
+        for acc in old_accounts:
+            acc_id = str(acc.get('account_id', acc.get('phone', '')))
+            session_str = acc.get('session_string', acc.get('session', ''))
+            
+            if acc_id and session_str:
+                exists = await db.accounts_pool.find_one({"account_id": acc_id})
+                if not exists:
+                    await db.accounts_pool.insert_one({
+                        "account_id": acc_id,
+                        "session_string": session_str,
+                        "status": "ready",
+                        "cooldown_until": 0,
+                        "daily_adds": 0,
+                        "last_reset_date": today_ist,
+                        "last_add_time": None,
+                        "assigned_proxy": None,
+                        "failed_proxies": []
+                    })
+                    inserted_accounts += 1
+
+        # 2. USERS MIGRATE KARNA (Queue)
+        old_users = await old_queue_col.find({}).to_list(length=None)
+        
+        for user in old_users:
+            user_id = user.get('user_id', user.get('id', ''))
+            if user_id:
+                exists = await db.scraped_queue.find_one({"user_id": user_id})
+                if not exists:
+                    await db.scraped_queue.insert_one({
+                        "user_id": user_id,
+                        "access_hash": user.get('access_hash', None),
+                        "username": user.get('username', None),
+                        "name": user.get('name', user.get('first_name', '')),
+                        "source_channel": user.get('source_channel', 'migrated'),
+                        "scraped_at": datetime.now(pytz.utc),
+                        "status": "pending"
+                    })
+                    inserted_users += 1
+                    
+        # 3. CHANNELS UPDATE KARNA
+        sources = ["Dream_Agri", "AGLAERT", "afo2023interview", "Gen_Agriculture", "IBPSSO25"]
+        await db.system_config.update_one({"_id": "config"}, {"$set": {"source_channels": sources}}, upsert=True)
+        
+        return {
+            "success": True,
+            "message": "🎉 Data Migration Successfully Complete ho gaya!",
+            "accounts_added": inserted_accounts,
+            "users_added": inserted_users
+        }
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        old_client.close()
 
 # ==========================================
 # PART 8: MAIN ENTRY POINT
