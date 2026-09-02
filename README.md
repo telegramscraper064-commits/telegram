@@ -1,27 +1,34 @@
-# 🌾 Agri Mastermind AI Engine v3.0
+# Telegram Automation Engine v4 (Render active/standby)
 
-## 🎯 Features
+Harvester (source channels se members scrape) + Injector (target group me add) + Admin bot.
+Do Render accounts, **ek time pe sirf ek chalu** — `render_switcher.py` (GitHub Actions, har 10 min) ye guarantee karta hai.
 
-| Feature | Status |
-|---------|--------|
-| Direct Add Only | ✅ |
-| Privacy Check Before Add | ✅ |
-| Accurate Counting (Only Success) | ✅ |
-| 60-120 Second Gap Between Adds | ✅ |
-| Auto-Cooldown on Flood | ✅ |
-| 2 Accounts with Fresh Proxies | ✅ |
-| Admin Bot Commands | ✅ |
-| 24/7 Working with IST Hours | ✅ |
+## Files
+| File | Kaam |
+|---|---|
+| `main.py` | FastAPI app + Telethon engines (multi-instance safe: atomic account lock, dead-session detection) |
+| `render_switcher.py` | Render API se: ACC-1 down → ACC-1 confirm-suspend → ACC-2 resume. Dono running → ACC-2 suspend |
+| `.github/workflows/render_switcher.yml` | Switcher ka cron |
+| `requirements.txt` | Render build deps |
+| `.env.example` | Saare env vars ka template |
 
-## 📦 Environment Variables
+## Render setup (dono services same)
+- Build: `pip install -r requirements.txt`
+- Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Env: `.env.example` dekho. Sirf `INSTANCE_ID` alag rakho (`render-A` / `render-B`).
+- Render #2 ko shuru me **manually Suspend** kar do — switcher zaroorat pe resume karega.
 
-```env
-BOT_TOKEN=your_bot_token
-GEMINI_API_KEY=your_gemini_key
-API_ID=your_api_id
-API_HASH=your_api_hash
-MONGO_URI=your_mongodb_uri
-TARGET_GROUP=agriquizworld
-ADMIN_USERNAME=agrikrishna
-MAX_ADDS_PER_DAY=20
-COOLDOWN_HOURS=24
+## GitHub Secrets (switcher ke liye)
+`RENDER_API_KEY_1, SERVICE_ID_1, SERVICE_URL_1, RENDER_API_KEY_2, SERVICE_ID_2, SERVICE_URL_2, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID`
+
+## Admin bot commands
+`status` · `pause` · `resume` · `dead` · `unlock` · `revive <account_id>` · `help`
+
+## Session rules (session kill se bachne ke liye)
+1. Ek session string = ek jagah. Local testing ke liye alag session banao.
+2. `accounts_pool` me duplicate session string kabhi mat rakho (alag `account_id` se bhi nahi).
+3. Session `dead` ho jaye → nayi string generate karo → DB me replace → bot pe `revive <account_id>`.
+4. Baar-baar deploy mat karo — har deploy = ek overlap window.
+
+## Limits (main.py `Config`)
+15 adds/account/day · 3 per micro-batch · 90-150s gap · 30h cooldown after 15 or genuine flood.

@@ -19,7 +19,8 @@ ENV VARIABLES
 API_ID, API_HASH, MONGO_URI, TARGET_GROUP           (required)
 BOT_TOKEN, ADMIN_USERNAME                           (admin bot – optional)
 INSTANCE_ROLE     = both | harvester | injector     (default both)
-ENABLE_ADMIN_BOT  = true | false                    (default true  –  DUSRE instance pe false rakho)
+ENABLE_ADMIN_BOT  = true | false                    (default true; active/standby setup me dono pe true theek hai)
+ACTIVE_HOURS_IST  = 8-23                            (default 0-24 = hamesha; injector sirf in ghanto me add karega)
 INSTANCE_ID       = koi bhi unique naam             (default: Render instance id / hostname)
 STARTUP_DELAY     = seconds                         (default 15)
 SELF_PING_URL     = https://xyz.onrender.com/       (optional keep-alive)
@@ -107,6 +108,8 @@ class Config:
     COOLDOWN_HOURS = 30            # 15 add ke baad aaram
     FLOOD_COOLDOWN_HOURS = 30      # genuine flood ke baad aaram
     ADD_DELAY_RANGE = (90, 150)    # seconds, do adds ke beech
+    # Injector sirf in IST ghanto me chalega, e.g. "8-23" = 08:00 se 22:59. "0-24" = hamesha
+    ACTIVE_HOURS_IST = os.getenv("ACTIVE_HOURS_IST", "0-24").strip()
     ACCOUNT_GAP_RANGE = (15, 30)   # seconds, do accounts ke beech
 
     # Harvester rules
@@ -313,6 +316,13 @@ async def wake_cooled_accounts():
     )
     if r.modified_count:
         logger.info(f"☀️ Woke up {r.modified_count} cooled account(s)")
+    # Jo account 15 tak nahi pahuncha, uska counter last add ke 24h baad reset (rolling window, safe)
+    r2 = await db.accounts_pool.update_many(
+        {"status": "ready", "daily_adds": {"$gt": 0}, "last_add_time": {"$lt": now_ts() - 86400}},
+        {"$set": {"daily_adds": 0}},
+    )
+    if r2.modified_count:
+        logger.info(f"🔄 Daily counter reset for {r2.modified_count} account(s) (24h passed)")
 
 
 async def cleanup_stale_processing():
@@ -323,6 +333,17 @@ async def cleanup_stale_processing():
     )
     if r.modified_count:
         logger.info(f"🧹 Reset {r.modified_count} stale 'processing' user(s) to pending")
+
+
+def in_active_hours() -> bool:
+    try:
+        start, end = (int(x) for x in Config.ACTIVE_HOURS_IST.split("-"))
+    except Exception:
+        return True
+    if (start, end) == (0, 24):
+        return True
+    h = datetime.now(Config.IST).hour
+    return start <= h < end if start < end else (h >= start or h < end)
 
 
 async def is_paused() -> bool:
@@ -671,6 +692,11 @@ async def injector_engine():
                 await asyncio.sleep(60)
                 continue
 
+            if not in_active_hours():
+                logger.info(f"🌙 Outside ACTIVE_HOURS_IST={Config.ACTIVE_HOURS_IST}. Injector sleeping 10 min")
+                await asyncio.sleep(600)
+                continue
+
             await wake_cooled_accounts()
             await cleanup_stale_processing()
 
@@ -747,11 +773,11 @@ async def notify_admin(text: str):
         logger.warning(f"notify_admin failed: {e}")
 
 
-def _is_admin(event) -> bool:
+async def _is_admin(event) -> bool:
     if not Config.ADMIN_USERNAME:
         return False
     admin = Config.ADMIN_USERNAME.lstrip("@").lower()
-    sender = event.sender
+    sender = event.sender or await event.get_sender()
     if sender is None:
         return False
     if admin.isdigit() and str(sender.id) == admin:
@@ -792,7 +818,7 @@ if admin_client:
 
     @admin_client.on(events.NewMessage(incoming=True))
     async def admin_bot_handler(event):
-        if not _is_admin(event):
+        if not await _is_admin(event):
             return
         cmd = (event.raw_text or "").strip().lower()
         parts = cmd.split()

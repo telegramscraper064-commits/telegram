@@ -1,0 +1,42 @@
+name: Render Auto-Switcher
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'      # har 10 min (GitHub cron kabhi-kabhi 5-15 min late chalta hai, normal hai)
+  workflow_dispatch:            # Actions tab se manual run
+
+# Ek time pe sirf ek run — do runs overlap ho ke double action na le lein
+concurrency:
+  group: render-switcher
+  cancel-in-progress: false
+
+jobs:
+  switch:
+    name: Exactly-one-running check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -q requests
+
+      - name: Run switcher
+        env:
+          RENDER_API_KEY_1: ${{ secrets.RENDER_API_KEY_1 }}
+          SERVICE_ID_1:     ${{ secrets.SERVICE_ID_1 }}
+          SERVICE_URL_1:    ${{ secrets.SERVICE_URL_1 }}
+          RENDER_API_KEY_2: ${{ secrets.RENDER_API_KEY_2 }}
+          SERVICE_ID_2:     ${{ secrets.SERVICE_ID_2 }}
+          SERVICE_URL_2:    ${{ secrets.SERVICE_URL_2 }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          SWITCH_ON_HTTP_FAIL: 'false'   # true = HTTP dead pe bhi switch (flapping risk)
+        run: python render_switcher.py   # <-- file ka asli naam (pehle switcher.py / switch.py tha = crash)
