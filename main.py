@@ -25,6 +25,8 @@ STARTUP_DELAY     = seconds                         (default 15)
 SELF_PING_URL     = https://xyz.onrender.com/       (optional keep-alive)
 """
 
+from __future__ import annotations
+
 import os
 import time
 import uuid
@@ -88,12 +90,13 @@ class Config:
 
     INSTANCE_ROLE = os.getenv("INSTANCE_ROLE", "both").lower().strip()
     ENABLE_ADMIN_BOT = os.getenv("ENABLE_ADMIN_BOT", "true").lower() in ("1", "true", "yes")
-    INSTANCE_ID = (
-        os.getenv("INSTANCE_ID")
-        or os.getenv("RENDER_INSTANCE_ID")
-        or f"{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
-    )
-    STARTUP_DELAY = int(os.getenv("STARTUP_DELAY", "15") or 0)
+    # INSTANCE_NAME = readable (env INSTANCE_ID e.g. render-B)
+    # INSTANCE_ID   = NAME + per-process random suffix  -> deploy overlap me purana aur naya
+    #                 process alag "instance" hain, ek doosre ka lock kabhi nahi chhodte
+    INSTANCE_NAME = os.getenv("INSTANCE_ID") or os.getenv("RENDER_SERVICE_NAME") or socket.gethostname()
+    INSTANCE_ID = f"{INSTANCE_NAME}-{uuid.uuid4().hex[:6]}"
+    # Engines port khulne ke ITNE sec BAAD start honge (Render tab tak purana process kill kar chuka hoga)
+    STARTUP_DELAY = int(os.getenv("STARTUP_DELAY", "30") or 0)
     # TEST_MODE=true  -> DRY RUN: sab kuch chalega par asli InviteToChannel call NAHI hogi
     TEST_MODE = os.getenv("TEST_MODE", "false").lower() in ("1", "true", "yes")
     SELF_PING_URL = os.getenv("SELF_PING_URL", "").strip()
@@ -112,7 +115,7 @@ class Config:
     HARVEST_REST_SECONDS = 1800    # ek round ke baad aaram
 
     # Locking / safety
-    LOCK_TTL_SECONDS = 15 * 60     # itni der heartbeat na aaye to lock stale
+    LOCK_TTL_SECONDS = 3 * 60      # heartbeat 60s hai; 3 min na aaye to process mar chuka = lock stale
     LOCK_HEARTBEAT_SECONDS = 60
     PROCESSING_STALE_SECONDS = 30 * 60
 
@@ -124,7 +127,7 @@ class Config:
         if cls.INSTANCE_ROLE not in ("both", "harvester", "injector"):
             logger.warning(f"Unknown INSTANCE_ROLE={cls.INSTANCE_ROLE!r}, falling back to 'both'")
             cls.INSTANCE_ROLE = "both"
-        logger.info(f"🆔 INSTANCE_ID={cls.INSTANCE_ID} | ROLE={cls.INSTANCE_ROLE} | ADMIN_BOT={cls.ENABLE_ADMIN_BOT}")
+        logger.info(f"🆔 INSTANCE={cls.INSTANCE_ID} | ROLE={cls.INSTANCE_ROLE} | ADMIN_BOT={cls.ENABLE_ADMIN_BOT}")
         if cls.TEST_MODE:
             logger.warning("🧪 TEST_MODE=true -> DRY RUN. Koi user actually add NAHI hoga. Production ke liye TEST_MODE=false karo.")
 
@@ -623,6 +626,11 @@ async def inject_batch(client: TelegramClient, acc_id: str, account: dict) -> tu
                 {"_id": user_doc["_id"]},
                 {"$set": {"status": "added", "added_by": acc_id, "added_at": now_ts()}},
             )
+            # TURANT count karo — deploy/crash beech me ho to bhi 15/day limit sahi rahe
+            await db.accounts_pool.update_one(
+                {"account_id": acc_id},
+                {"$inc": {"daily_adds": 1, "total_added": 1}, "$set": {"last_add_time": now_ts()}},
+            )
             delay = random.randint(*Config.ADD_DELAY_RANGE)
             logger.info(f"✅ [{acc_id}] Added {uid}. Sleeping {delay}s")
             await asyncio.sleep(delay)
@@ -691,10 +699,11 @@ async def injector_engine():
                     continue
 
                 adds, cooled = await inject_batch(client, acc_id, account)
-                new_total = account.get("daily_adds", 0) + adds
 
-                update = {"last_add_time": now_ts(), "daily_adds": new_total}
-                await db.accounts_pool.update_one({"account_id": acc_id}, {"$set": update, "$inc": {"total_added": adds}})
+                # last_add_time set karo (0 adds pe bhi) taaki round-robin aage badhe
+                await db.accounts_pool.update_one({"account_id": acc_id}, {"$set": {"last_add_time": now_ts()}})
+                fresh = await db.accounts_pool.find_one({"account_id": acc_id}, {"daily_adds": 1}) or {}
+                new_total = fresh.get("daily_adds", 0)
 
                 if not cooled and new_total >= Config.MAX_ADDS_PER_DAY:
                     await cooldown_account(acc_id, Config.COOLDOWN_HOURS, f"Target {Config.MAX_ADDS_PER_DAY} completed")
@@ -724,7 +733,7 @@ async def injector_engine():
 # ==========================================
 # 🤖 PART 7: ADMIN BOT
 # ==========================================
-admin_client: TelegramClient | None = None
+admin_client = None  # type: TelegramClient | None
 if Config.BOT_TOKEN and Config.ENABLE_ADMIN_BOT and Config.API_ID and Config.API_HASH:
     admin_client = TelegramClient(StringSession(), Config.API_ID, Config.API_HASH)  # in-memory, no file
 
@@ -840,36 +849,46 @@ async def self_ping_loop():
 # ==========================================
 # 🚀 PART 9: LIFESPAN
 # ==========================================
+async def delayed_engine_start():
+    """Port khulne ke baad wait -> tab engines start (deploy-overlap protection jo sach me kaam kare)."""
+    try:
+        if Config.STARTUP_DELAY > 0:
+            logger.info(f"⏳ Engines start in {Config.STARTUP_DELAY}s (waiting for old instance to die)")
+            await asyncio.sleep(Config.STARTUP_DELAY)
+        if not is_engine_running:
+            return
+
+        if admin_client:
+            try:
+                await admin_client.start(bot_token=Config.BOT_TOKEN)
+                background_tasks.append(asyncio.create_task(admin_client.run_until_disconnected()))
+                logger.info("🤖 Admin bot online")
+            except Exception as e:
+                logger.error(f"Admin bot failed to start: {e}")
+
+        if Config.INSTANCE_ROLE in ("both", "harvester"):
+            background_tasks.append(asyncio.create_task(harvester_engine()))
+        if Config.INSTANCE_ROLE in ("both", "injector"):
+            background_tasks.append(asyncio.create_task(injector_engine()))
+        background_tasks.append(asyncio.create_task(self_ping_loop()))
+
+        await notify_admin(f"🚀 Instance `{Config.INSTANCE_ID}` started (role={Config.INSTANCE_ROLE})")
+    except asyncio.CancelledError:
+        pass
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global is_engine_running
     await db.connect()
-
-    # Deploy overlap se bachne ke liye — purane instance ko band hone ka time do
-    if Config.STARTUP_DELAY > 0:
-        logger.info(f"⏳ Startup delay {Config.STARTUP_DELAY}s (deploy-overlap protection)")
-        await asyncio.sleep(Config.STARTUP_DELAY)
-
-    # Agar pichhli baar ye hi INSTANCE_ID crash hua tha to uske locks chhodo
-    await release_all_my_locks()
-
     is_engine_running = True
 
-    if admin_client:
-        try:
-            await admin_client.start(bot_token=Config.BOT_TOKEN)
-            background_tasks.append(asyncio.create_task(admin_client.run_until_disconnected()))
-            logger.info("🤖 Admin bot online")
-        except Exception as e:
-            logger.error(f"Admin bot failed to start: {e}")
+    # NOTE: yahan koi lock release NAHI — purane process ka lock sirf wo khud (shutdown pe)
+    # chhodega, ya LOCK_TTL ke baad stale maana jayega. Isse deploy-overlap me
+    # naya process kabhi wahi account nahi uthata jo purana abhi use kar raha hai.
 
-    if Config.INSTANCE_ROLE in ("both", "harvester"):
-        background_tasks.append(asyncio.create_task(harvester_engine()))
-    if Config.INSTANCE_ROLE in ("both", "injector"):
-        background_tasks.append(asyncio.create_task(injector_engine()))
-    background_tasks.append(asyncio.create_task(self_ping_loop()))
-
-    await notify_admin(f"🚀 Instance `{Config.INSTANCE_ID}` started (role={Config.INSTANCE_ROLE})")
+    # Engines ko DELAYED background task me start karo, taaki lifespan turant complete ho,
+    # port khule, Render purane process ko kill kare, aur uske baad hi hum Telegram chhuein.
+    background_tasks.append(asyncio.create_task(delayed_engine_start()))
 
     yield
 
@@ -895,7 +914,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"status": "online", "instance": Config.INSTANCE_ID, "role": Config.INSTANCE_ROLE, "version": "v4-multi-instance-safe", "test_mode": Config.TEST_MODE}
 
