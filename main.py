@@ -20,6 +20,7 @@ API_ID, API_HASH, MONGO_URI, TARGET_GROUP           (required)
 BOT_TOKEN, ADMIN_USERNAME                           (admin bot – optional)
 INSTANCE_ROLE     = both | harvester | injector     (default both)
 ENABLE_ADMIN_BOT  = true | false                    (default true; active/standby setup me dono pe true theek hai)
+HARVEST_INTERVAL_SECONDS = 10800   (3h)  QUEUE_TARGET_PENDING = 1500  HARVEST_MAX_NEW_PER_RUN = 2000
 ACTIVE_HOURS_IST  = 8-23                            (default 0-24 = hamesha; injector sirf in ghanto me add karega)
 INSTANCE_ID       = koi bhi unique naam             (default: Render instance id / hostname)
 STARTUP_DELAY     = seconds                         (default 15)
@@ -43,6 +44,7 @@ import pytz
 from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument, ASCENDING
+from pymongo.errors import BulkWriteError
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -112,10 +114,12 @@ class Config:
     ACTIVE_HOURS_IST = os.getenv("ACTIVE_HOURS_IST", "0-24").strip()
     ACCOUNT_GAP_RANGE = (15, 30)   # seconds, do accounts ke beech
 
-    # Harvester rules
-    HARVEST_MSG_LIMIT = 1000       # per channel
-    HARVEST_MSG_DELAY = 0.5        # seconds per message
-    HARVEST_REST_SECONDS = 1800    # ek round ke baad aaram
+    # Harvester rules (bandwidth-aware: Render free = 100GB/mo, aapka target 5GB/account)
+    HARVEST_INITIAL_LIMIT = int(os.getenv("HARVEST_INITIAL_LIMIT", "1000"))   # naye channel pe pehli baar itne msgs
+    HARVEST_MAX_NEW_PER_RUN = int(os.getenv("HARVEST_MAX_NEW_PER_RUN", "2000"))  # checkpoint ke baad max naye msgs/run
+    HARVEST_INTERVAL_SECONDS = int(os.getenv("HARVEST_INTERVAL_SECONDS", "10800"))  # 3h (DB me checkpoint, deploy pe reset nahi)
+    QUEUE_TARGET_PENDING = int(os.getenv("QUEUE_TARGET_PENDING", "1500"))   # itne pending hain to harvest SKIP
+    CHANNEL_FAIL_LIMIT = 3          # lagataar itni baar fail = channel auto-disable
 
     # Locking / safety
     LOCK_TTL_SECONDS = 3 * 60      # heartbeat 60s hai; 3 min na aaye to process mar chuka = lock stale
@@ -194,20 +198,34 @@ class Database:
         self.scraped_queue = self.db["scraped_queue"]
         self.master_blacklist = self.db["master_blacklist"]
         self.system_config = self.db["system_config"]
+        self.harvest_state = self.db["harvest_state"]      # per-channel checkpoint
         await self.client.admin.command("ping")
         logger.info("✅ Connected to MongoDB")
         await self._ensure_indexes()
         await self._ensure_config()
 
     async def _ensure_indexes(self):
-        try:
-            await self.accounts_pool.create_index([("account_id", ASCENDING)], unique=True)
-            await self.accounts_pool.create_index([("status", ASCENDING), ("locked_by", ASCENDING)])
-            await self.scraped_queue.create_index([("user_id", ASCENDING)])
-            await self.scraped_queue.create_index([("status", ASCENDING)])
-            await self.master_blacklist.create_index([("user_id", ASCENDING)], unique=True)
-        except Exception as e:
-            logger.warning(f"Index creation warning: {e}")
+        async def idx(col, keys, **kw):
+            try:
+                await col.create_index(keys, **kw)
+            except Exception as e:
+                if getattr(e, "code", None) == 86:      # same name, different spec -> purana drop, naya banao
+                    name = "_".join(f"{k}_{v}" for k, v in keys)
+                    try:
+                        await col.drop_index(name)
+                        await col.create_index(keys, **kw)
+                        logger.info(f"Index {col.name}.{name} recreated")
+                        return
+                    except Exception as e2:
+                        e = e2
+                logger.warning(f"Index {col.name} {keys} warning: {str(e)[:120]}")
+
+        await idx(self.accounts_pool, [("account_id", ASCENDING)], unique=True)
+        await idx(self.accounts_pool, [("status", ASCENDING), ("locked_by", ASCENDING)])
+        await idx(self.scraped_queue, [("user_id", ASCENDING)], unique=True)
+        await idx(self.scraped_queue, [("status", ASCENDING), ("_id", ASCENDING)])
+        await idx(self.master_blacklist, [("user_id", ASCENDING)], unique=True)
+        await idx(self.harvest_state, [("channel", ASCENDING)], unique=True)
 
     async def _ensure_config(self):
         await self.system_config.update_one(
@@ -477,56 +495,140 @@ async def attempt_add(client: TelegramClient, target_entity, user_entity):
 
 
 # ==========================================
-# 🕷️ PART 5: HARVESTER ENGINE
+# 🕷️ PART 5: HARVESTER ENGINE  (checkpointed, bandwidth-aware)
 # ==========================================
-async def harvest_once(client: TelegramClient, account_id: str, channels: list[str]) -> int:
-    total_new = 0
-    for channel in channels:
-        new_in_channel = 0
-        seen_in_run: set[int] = set()
+#  harvest_state  { channel, last_msg_id, last_msg_date, last_run, runs, total_users,
+#                   fail_count, disabled, last_error }
+#  system_config  { harvest_last_round }   -> deploy/restart pe round dobara nahi chalta
+#
+#  Bandwidth kaise bachti hai:
+#   1) min_id checkpoint -> sirf NAYE messages download (pehle har round 5000 msgs re-download)
+#   2) queue full (>= QUEUE_TARGET_PENDING) -> harvest hi nahi
+#   3) Mongo batching -> per channel 3 queries (pehle per user 2)
+#   4) round timestamp DB me -> deploy ke turant baad round repeat nahi
+#   5) channel 3x fail -> auto-disable (bekaar retries band)
+
+def _channel_key(ch: str) -> str:
+    return str(ch).strip().lstrip("@").lower()
+
+
+async def get_channel_state(channel: str) -> dict:
+    key = _channel_key(channel)
+    st = await db.harvest_state.find_one({"channel": key})
+    if not st:
+        st = {"channel": key, "last_msg_id": 0, "last_msg_date": None, "last_run": 0,
+              "runs": 0, "total_users": 0, "fail_count": 0, "disabled": False, "last_error": ""}
+        await db.harvest_state.update_one({"channel": key}, {"$setOnInsert": st}, upsert=True)
+    return st
+
+
+async def harvest_channel(client: TelegramClient, account_id: str, channel: str) -> int:
+    """Ek channel: checkpoint se aage ke messages padho, naye users queue me daalo. Returns new-user count."""
+    st = await get_channel_state(channel)
+    key = st["channel"]
+    if st.get("disabled"):
+        return 0
+
+    last_id = int(st.get("last_msg_id") or 0)
+    first_time = last_id == 0
+    limit = Config.HARVEST_INITIAL_LIMIT if first_time else Config.HARVEST_MAX_NEW_PER_RUN
+
+    # ---- Phase 1: sirf naye messages padho, senders memory me collect karo ----
+    senders: dict[int, User] = {}
+    newest_id, newest_date, msgs_read = last_id, st.get("last_msg_date"), 0
+    async for message in client.iter_messages(channel, limit=limit, min_id=last_id):
+        msgs_read += 1
+        if message.id > newest_id:
+            newest_id, newest_date = message.id, message.date
+        sid = message.sender_id
+        if not sid or sid < 0 or sid in senders:
+            continue
+        sender = message.sender
+        if sender is None:
+            continue                      # extra API call nahi karenge (bandwidth)
+        if isinstance(sender, User) and not sender.bot and not sender.deleted:
+            senders[sid] = sender
+        if msgs_read % 200 == 0:
+            await asyncio.sleep(1)        # gentle pacing, flood se bachne ke liye
+
+    if not senders:
+        await db.harvest_state.update_one({"channel": key}, {"$set": {
+            "last_msg_id": newest_id, "last_msg_date": newest_date, "last_run": now_ts(),
+            "fail_count": 0, "last_error": ""}, "$inc": {"runs": 1}})
+        logger.info(f"🕷️ {key}: {msgs_read} new msgs, +0 users (checkpoint {last_id}→{newest_id})")
+        return 0
+
+    # ---- Phase 2: 2 batch queries se filter (per-user queries nahi) ----
+    ids = list(senders.keys())
+    known = set()
+    async for d in db.master_blacklist.find({"user_id": {"$in": ids}}, {"user_id": 1}):
+        known.add(d["user_id"])
+    async for d in db.scraped_queue.find({"user_id": {"$in": ids}}, {"user_id": 1}):
+        known.add(d["user_id"])
+
+    docs = []
+    for uid, u in senders.items():
+        if uid in known:
+            continue
+        docs.append({
+            "user_id": uid,
+            "access_hash": getattr(u, "access_hash", None),
+            "username": getattr(u, "username", None),
+            "name": f"{u.first_name or ''} {u.last_name or ''}".strip(),
+            "source_channel": channel,
+            "scraped_by": account_id,
+            "scraped_at": datetime.now(pytz.utc),
+            "status": "pending",
+        })
+
+    inserted = 0
+    if docs:
         try:
-            async for message in client.iter_messages(channel, limit=Config.HARVEST_MSG_LIMIT):
-                sender_id = message.sender_id
-                if not sender_id or sender_id in seen_in_run or sender_id < 0:
-                    continue
-                seen_in_run.add(sender_id)
+            r = await db.scraped_queue.insert_many(docs, ordered=False)
+            inserted = len(r.inserted_ids)
+        except BulkWriteError as e:        # dup keys (race with another instance) -> count what went in
+            inserted = int(e.details.get("nInserted", 0)) if getattr(e, "details", None) else 0
+        except Exception as e:
+            logger.warning(f"insert_many failed: {type(e).__name__}: {e}")
 
-                sender = message.sender  # response ke users list se aata hai, extra API call nahi
-                if sender is None:
-                    try:
-                        sender = await message.get_sender()
-                    except Exception:
-                        continue
-                if not isinstance(sender, User) or sender.bot or sender.deleted:
-                    continue
+    # ---- Phase 3: checkpoint save (sirf successful read ke baad) ----
+    await db.harvest_state.update_one({"channel": key}, {"$set": {
+        "last_msg_id": newest_id, "last_msg_date": newest_date, "last_run": now_ts(),
+        "fail_count": 0, "last_error": ""}, "$inc": {"runs": 1, "total_users": inserted}})
+    logger.info(f"🕷️ {key}: {msgs_read} new msgs, {len(senders)} senders, +{inserted} new users "
+                f"(checkpoint {last_id}→{newest_id})")
+    return inserted
 
-                if await db.master_blacklist.find_one({"user_id": sender.id}):
-                    continue
-                if await db.scraped_queue.find_one({"user_id": sender.id}):
-                    continue
 
-                await db.scraped_queue.insert_one({
-                    "user_id": sender.id,
-                    "access_hash": getattr(sender, "access_hash", None),
-                    "username": getattr(sender, "username", None),
-                    "name": f"{sender.first_name or ''} {sender.last_name or ''}".strip(),
-                    "source_channel": channel,
-                    "scraped_by": account_id,
-                    "scraped_at": datetime.now(pytz.utc),
-                    "status": "pending",
-                })
-                new_in_channel += 1
-                await asyncio.sleep(Config.HARVEST_MSG_DELAY)
+async def mark_channel_failed(channel: str, err: str):
+    key = _channel_key(channel)
+    st = await db.harvest_state.find_one_and_update(
+        {"channel": key},
+        {"$inc": {"fail_count": 1}, "$set": {"last_error": err[:200], "last_run": now_ts()}},
+        upsert=True, return_document=ReturnDocument.AFTER)
+    if st and st.get("fail_count", 0) >= Config.CHANNEL_FAIL_LIMIT and not st.get("disabled"):
+        await db.harvest_state.update_one({"channel": key}, {"$set": {"disabled": True}})
+        logger.error(f"🚫 Channel {key} DISABLED after {Config.CHANNEL_FAIL_LIMIT} failures: {err[:100]}")
+        await notify_admin(f"🚫 Source channel `{key}` disable kar diya ({Config.CHANNEL_FAIL_LIMIT}x fail):\n{err[:150]}\n\n`channel enable {key}` se wapas on karo.")
+
+
+async def harvest_round(client: TelegramClient, account_id: str, channels: list[str]) -> int:
+    total = 0
+    for channel in channels:
+        try:
+            total += await harvest_channel(client, account_id, channel)
+            await asyncio.sleep(random.randint(3, 8))       # channels ke beech gap
         except FloodWaitError as e:
-            logger.warning(f"Harvester FloodWait {e.seconds}s on {channel}; skipping channel")
+            logger.warning(f"Harvester FloodWait {e.seconds}s on {channel}; skipping rest of round")
             await asyncio.sleep(min(e.seconds, 300))
+            break
         except DEAD_SESSION_ERRORS:
             raise
         except Exception as e:
-            logger.warning(f"Harvester skip channel {channel}: {type(e).__name__}: {e}")
-        logger.info(f"🕷️ {channel}: +{new_in_channel} new users")
-        total_new += new_in_channel
-    return total_new
+            err = f"{type(e).__name__}: {e}"
+            logger.warning(f"Harvester channel {channel} failed: {err}")
+            await mark_channel_failed(channel, err)
+    return total
 
 
 async def harvester_engine():
@@ -541,36 +643,48 @@ async def harvester_engine():
             channels = cfg.get("source_channels", [])
             if not channels:
                 logger.info("Harvester: no source_channels configured")
-                await asyncio.sleep(120)
+                await asyncio.sleep(300)
                 continue
 
-            # ready/cooling dono chalenge scraping ke liye; sabse purana harvest wala pehle
-            account = await claim_account(
-                {"status": {"$in": ["ready", "cooling"]}},
-                sort_field="last_harvest_time",
-            )
+            # (a) Round interval DB me — deploy/restart pe repeat nahi
+            last_round = float(cfg.get("harvest_last_round") or 0)
+            wait = Config.HARVEST_INTERVAL_SECONDS - (now_ts() - last_round)
+            if wait > 0:
+                await asyncio.sleep(min(wait, 600))
+                continue
+
+            # (b) Queue full? to harvest skip (sabse bada bandwidth saver)
+            pending = await db.scraped_queue.count_documents({"status": "pending"})
+            if pending >= Config.QUEUE_TARGET_PENDING:
+                logger.info(f"🕷️ Queue has {pending} pending (target {Config.QUEUE_TARGET_PENDING}). Skipping harvest, check in 30 min")
+                await db.system_config.update_one({"_id": "config"}, {"$set": {"harvest_last_round": now_ts() - Config.HARVEST_INTERVAL_SECONDS + 1800}})
+                await asyncio.sleep(1800)
+                continue
+
+            account = await claim_account({"status": {"$in": ["ready", "cooling"]}}, sort_field="last_harvest_time")
             if not account:
                 logger.info("Harvester: no free account, retry in 5 min")
                 await asyncio.sleep(300)
                 continue
 
             acc_id = account["account_id"]
-            logger.info(f"🕷️ Harvester using {acc_id}")
+            logger.info(f"🕷️ Harvester round using {acc_id} | pending={pending}")
             client = make_client(account["session_string"])
             hb = asyncio.create_task(lock_heartbeat(acc_id))
             try:
                 if not await safe_connect(client, acc_id):
                     continue
-                added = await harvest_once(client, acc_id, channels)
+                added = await harvest_round(client, acc_id, channels)
                 await db.accounts_pool.update_one(
                     {"account_id": acc_id},
-                    {"$set": {"last_harvest_time": now_ts()}, "$inc": {"total_harvested": added}},
-                )
-                logger.info(f"🕷️ Harvest round done: +{added} users. Resting {Config.HARVEST_REST_SECONDS}s")
+                    {"$set": {"last_harvest_time": now_ts()}, "$inc": {"total_harvested": added}})
+                await db.system_config.update_one({"_id": "config"}, {"$set": {"harvest_last_round": now_ts()}})
+                logger.info(f"🕷️ Round done: +{added} users. Next in {Config.HARVEST_INTERVAL_SECONDS // 60} min")
             except DEAD_SESSION_ERRORS as e:
                 await mark_dead(acc_id, f"{type(e).__name__}: {e}")
             except Exception as e:
                 logger.error(f"Harvester error ({acc_id}): {type(e).__name__}: {e}")
+                await asyncio.sleep(120)
             finally:
                 hb.cancel()
                 try:
@@ -578,8 +692,6 @@ async def harvester_engine():
                 except Exception:
                     pass
                 await release_account(acc_id)
-
-            await asyncio.sleep(Config.HARVEST_REST_SECONDS)
 
         except asyncio.CancelledError:
             break
@@ -799,7 +911,7 @@ async def build_status_text() -> str:
         f"⏸ Paused: {'YES' if paused else 'no'}",
         "",
         f"🟢 Ready: {ready}   ❄️ Cooling: {cooling}   💀 Dead: {dead}   🔒 In use: {locked}",
-        f"📥 Pending queue: {pending}",
+        f"📥 Pending queue: {pending} (harvest target {Config.QUEUE_TARGET_PENDING})",
         f"✅ Total added: {added}",
         "",
     ]
@@ -851,9 +963,46 @@ if admin_client:
             )
             await event.reply("✅ Revived" if r.matched_count else "❌ account_id not found")
 
+        elif parts[0] == "harvest":
+            if len(parts) == 2 and parts[1] == "now":
+                await db.system_config.update_one({"_id": "config"}, {"$set": {"harvest_last_round": 0}})
+                await event.reply("🕷️ Next harvest round will start within 10 min.")
+                return
+            cfg = await db.system_config.find_one({"_id": "config"}) or {}
+            last = float(cfg.get("harvest_last_round") or 0)
+            ago = f"{(now_ts() - last) / 60:.0f} min ago" if last else "never"
+            pending = await db.scraped_queue.count_documents({"status": "pending"})
+            lines = [f"🕷️ **Harvest** — last round {ago} | pending {pending}/{Config.QUEUE_TARGET_PENDING}", ""]
+            async for st in db.harvest_state.find().sort("channel", 1):
+                flag = "🚫" if st.get("disabled") else "•"
+                lr = f"{(now_ts() - st['last_run']) / 60:.0f}m" if st.get("last_run") else "-"
+                lines.append(f"{flag} `{st['channel']}` ckpt={st.get('last_msg_id', 0)} users={st.get('total_users', 0)} "
+                             f"runs={st.get('runs', 0)} last={lr} fails={st.get('fail_count', 0)}")
+            await event.reply("\n".join(lines))
+
+        elif parts[0] == "channel" and len(parts) == 3:
+            action, key = parts[1], _channel_key(parts[2])
+            if action == "add":
+                await db.system_config.update_one({"_id": "config"}, {"$addToSet": {"source_channels": parts[2].lstrip("@")}})
+                await event.reply(f"✅ `{key}` added to source_channels")
+            elif action == "remove":
+                cfg = await db.system_config.find_one({"_id": "config"}) or {}
+                keep = [c for c in cfg.get("source_channels", []) if _channel_key(c) != key]
+                await db.system_config.update_one({"_id": "config"}, {"$set": {"source_channels": keep}})
+                await event.reply(f"🗑 `{key}` removed")
+            elif action == "enable":
+                await db.harvest_state.update_one({"channel": key}, {"$set": {"disabled": False, "fail_count": 0}})
+                await event.reply(f"✅ `{key}` enabled")
+            elif action == "reset":
+                await db.harvest_state.update_one({"channel": key}, {"$set": {"last_msg_id": 0, "disabled": False, "fail_count": 0}})
+                await event.reply(f"🔄 `{key}` checkpoint reset (next run re-reads last {Config.HARVEST_INITIAL_LIMIT} msgs)")
+            else:
+                await event.reply("channel add|remove|enable|reset <name>")
+
         elif parts[0] in ("help", "/start"):
             await event.reply(
-                "Commands:\n`status`\n`pause`\n`resume`\n`dead`\n`unlock`\n`revive <account_id>`"
+                "Commands:\n`status`\n`harvest` / `harvest now`\n`channel add|remove|enable|reset <name>`\n"
+                "`pause` / `resume`\n`dead`\n`revive <account_id>`\n`unlock`"
             )
 
 

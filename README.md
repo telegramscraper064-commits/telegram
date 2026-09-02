@@ -22,7 +22,15 @@ Do Render accounts, **ek time pe sirf ek chalu** — `render_switcher.py` (GitHu
 `RENDER_API_KEY_1, SERVICE_ID_1, SERVICE_URL_1, RENDER_API_KEY_2, SERVICE_ID_2, SERVICE_URL_2, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID`
 
 ## Admin bot commands
-`status` · `pause` · `resume` · `dead` · `unlock` · `revive <account_id>` · `help`
+`status` · `harvest` · `harvest now` · `channel add|remove|enable|reset <name>` · `pause` · `resume` · `dead` · `revive <account_id>` · `unlock` · `help`
+
+## Harvester (bandwidth-aware, checkpointed)
+- Har channel ka `last_msg_id` `harvest_state` collection me save — agli baar Telegram se **sirf naye messages** (`min_id`) aate hain.
+- Queue me `QUEUE_TARGET_PENDING` (1500) se zyada pending ho to harvest **skip** — bekaar download nahi.
+- Round har 3h; timestamp DB me, isliye deploy/restart pe round dobara nahi chalta.
+- Mongo per-channel batch queries (per-user nahi) — Atlas traffic bhi kam.
+- Channel 3x lagataar fail → auto-disable + Telegram alert; `channel enable <name>` se wapas.
+- Estimated bandwidth: pehla round ~5 MB, uske baad har round < 0.5 MB → mahine me < 100 MB harvester ka.
 
 ## Session rules (session kill se bachne ke liye)
 1. Ek session string = ek jagah. Local testing ke liye alag session banao.
