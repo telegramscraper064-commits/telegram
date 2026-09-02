@@ -39,4 +39,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           SWITCH_ON_HTTP_FAIL: 'false'   # true = HTTP dead pe bhi switch (flapping risk)
+          PREFERRED: '1'                 # dono running ho to 2 suspend; dono resumable ho to 1 resume
         run: python render_switcher.py   # <-- file ka asli naam (pehle switcher.py / switch.py tha = crash)

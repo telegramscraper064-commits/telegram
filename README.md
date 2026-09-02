@@ -7,7 +7,7 @@ Do Render accounts, **ek time pe sirf ek chalu** — `render_switcher.py` (GitHu
 | File | Kaam |
 |---|---|
 | `main.py` | FastAPI app + Telethon engines (multi-instance safe: atomic account lock, dead-session detection) |
-| `render_switcher.py` | Render API se: ACC-1 down → ACC-1 confirm-suspend → ACC-2 resume. Dono running → ACC-2 suspend |
+| `render_switcher.py` | Symmetric: jo bhi service gire, dusri (resumable) auto-resume. Dono running → non-preferred suspend. Manual resume kabhi nahi |
 | `.github/workflows/render_switcher.yml` | Switcher ka cron |
 | `requirements.txt` | Render build deps |
 | `.env.example` | Saare env vars ka template |
