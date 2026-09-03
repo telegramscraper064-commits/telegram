@@ -79,6 +79,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("engine")
+VERSION = "4.2.0-harvest-checkpoint"   # har release pe badlo -> GET / aur status se verify hota hai kaunsa code live hai
 
 
 class Config:
@@ -134,6 +135,7 @@ class Config:
         if cls.INSTANCE_ROLE not in ("both", "harvester", "injector"):
             logger.warning(f"Unknown INSTANCE_ROLE={cls.INSTANCE_ROLE!r}, falling back to 'both'")
             cls.INSTANCE_ROLE = "both"
+        logger.info(f"🏷️ VERSION={VERSION}")
         logger.info(f"🆔 INSTANCE={cls.INSTANCE_ID} | ROLE={cls.INSTANCE_ROLE} | ADMIN_BOT={cls.ENABLE_ADMIN_BOT}")
         if cls.TEST_MODE:
             logger.warning("🧪 TEST_MODE=true -> DRY RUN. Koi user actually add NAHI hoga. Production ke liye TEST_MODE=false karo.")
@@ -907,7 +909,7 @@ async def build_status_text() -> str:
     added = await db.master_blacklist.count_documents({})
     paused = await is_paused()
     lines = [
-        "📊 **Engine v4 Status**",
+        f"📊 **Engine {VERSION}**",
         f"⏸ Paused: {'YES' if paused else 'no'}",
         "",
         f"🟢 Ready: {ready}   ❄️ Cooling: {cooling}   💀 Dead: {dead}   🔒 In use: {locked}",
@@ -1091,7 +1093,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"status": "online", "instance": Config.INSTANCE_ID, "role": Config.INSTANCE_ROLE, "version": "v4-multi-instance-safe", "test_mode": Config.TEST_MODE}
+    return {"status": "online", "instance": Config.INSTANCE_ID, "role": Config.INSTANCE_ROLE, "version": VERSION, "test_mode": Config.TEST_MODE}
 
 
 @app.get("/health")
