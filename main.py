@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.1.0-self-regulating"
+VERSION = "5.1.1-self-regulating"
 
 
 class Config:
@@ -562,6 +562,7 @@ async def health_loop():
     await asyncio.sleep(60)
     while is_engine_running:
         try:
+            await lifecycle_tick()   # state flips (resting→active etc.) injector ke cap-sleep pe depend na karein
             await health_sweep()
         except asyncio.CancelledError:
             break
