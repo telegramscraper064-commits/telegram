@@ -1,32 +1,43 @@
 """
-Telegram Automation Engine  —  v4 (Multi-Instance Safe)
-=======================================================
-Fixes over v3:
-  1. ATOMIC ACCOUNT LOCK  -> do Render instances kabhi ek hi session ek saath use nahi karenge
-                             (yahi wajah thi "authorization key used under two different IPs" error ki)
-  2. DEAD DETECTION       -> AuthKeyDuplicated / SessionRevoked / Banned  => DB me status="dead" (auto)
-  3. LOCK HEARTBEAT       -> lambe harvest ke dauran lock zinda rehta hai; crash hone par lock TTL se expire
-  4. STALE CLEANUP        -> crash ke baad "processing" me atke users wapas "pending"
-  5. HARVESTER ROTATION   -> har baar sabse purana harvest kiya account uthta hai (pehla document nahi)
-  6. INVITE LINK SUPPORT  -> TARGET_GROUP  @username  ya  t.me/+xxxx  dono chalega
-  7. ENTITY RESOLVE FIX   -> access_hash account-specific hota hai; fallback: username -> hash -> participant search
-  8. ADMIN COMMANDS       -> status / pause / resume / dead / unlock
-  9. STARTUP DELAY        -> deploy overlap (purana + naya instance) se bachne ke liye
- 10. In-memory bot session (koi .session file nahi)
+Telegram Automation Engine — v5.0 "Self-Regulating"
+====================================================
+Har account ek CHHOTA STATE MACHINE hai jo SpamBot se apna asli haal padhta hai
+aur us hisaab se khud ko dheema/tez/idle karta hai. Koi "dead" label nahi —
+sirf tab jab session sach me revoke ho.
 
-ENV VARIABLES
--------------
-API_ID, API_HASH, MONGO_URI, TARGET_GROUP           (required)
-BOT_TOKEN, ADMIN_USERNAME                           (admin bot – optional)
-INSTANCE_ROLE     = both | harvester | injector     (default both)
-ENABLE_ADMIN_BOT  = true | false                    (default true; active/standby setup me dono pe true theek hai)
-HARVEST_INTERVAL_SECONDS = 10800   (3h)  QUEUE_TARGET_PENDING = 1500  HARVEST_MAX_NEW_PER_RUN = 2000
-ACTIVE_HOURS_IST  = 8-23                            (default 0-24 = hamesha; injector sirf in ghanto me add karega)
-INSTANCE_ID       = koi bhi unique naam             (default: Render instance id / hostname)
-STARTUP_DELAY     = seconds                         (default 15)
-SELF_PING_URL     = https://xyz.onrender.com/       (optional keep-alive)
+ACCOUNT STATES  (accounts_pool.state)
+  active       : add kar sakta hai. tier (1..4) = kitna aggressive
+  resting      : self-chosen aaram (batch ke baad, group throttle, warm-up gap)
+  limited      : Telegram ne report-based limit lagayi; limited_until tak sirf harvest
+  flagged      : SpamBot "harsh response" (number-level). Add nahi, harvest haan.
+                 har 24h re-check; clear hote hi active tier-1 se wapas
+  probation    : limit/flag hatne ke baad pehle 3 din: tier-1 (2 adds/din)
+  session_dead : AuthKeyDuplicated / revoked / unauthorized — sirf ye "sach me dead"
+
+TIERS (per account, per day)          adds/day   batch   gap-in-batch
+  1  probation / naya                    2         1-2     150-200s
+  2  normal                              4         2       150-200s
+  3  proven (7 din clean)                6         2       150-200s
+  4  veteran (14 din clean, 0 strikes)   8         2       150-200s
+  Strike aane pe tier -1 (min 1). 7 din clean pe tier +1 (max 4).
+
+HUMAN PACING (aapki spec)
+  - Ek account ek session me sirf 2 adds, beech me 150-200s
+  - Uske baad account disconnect, 3-4 min gap, tab DUSRA account
+  - Ek hi account 45 min se pehle dobara nahi (round-robin depth)
+  - Kabhi-kabhi (15%) ek "idle" turn — kuch nahi karta, sirf wait (human irregularity)
+  - Sirf ACTIVE_HOURS_IST me; raat me kuch nahi
+  - Global cap: poore system se GLOBAL_MAX_ADDS_PER_DAY (default 20)
+
+IDENTITY DEDUPE
+  Startup pe har session ka tg_user_id nikalta hai; ek hi Telegram user do entries me ho to
+  doosri auto-disable (duplicate=true) — ek account do sessions se kabhi nahi chalega.
+
+ENV: API_ID API_HASH MONGO_URI TARGET_GROUP BOT_TOKEN ADMIN_USERNAME
+     INSTANCE_ROLE=both|harvester|injector  INSTANCE_ID  ENABLE_ADMIN_BOT
+     STARTUP_DELAY=30  TEST_MODE=false  ACTIVE_HOURS_IST=8-23  GLOBAL_MAX_ADDS_PER_DAY=20
+     HARVEST_INTERVAL_SECONDS QUEUE_TARGET_PENDING HARVEST_MAX_NEW_PER_RUN  SELF_PING_URL
 """
-
 from __future__ import annotations
 
 import os
@@ -51,41 +62,26 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import InputPeerUser, User
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 from telethon.errors import (
-    FloodWaitError,
-    PeerFloodError,
-    UserPrivacyRestrictedError,
-    UserNotMutualContactError,
-    UserAlreadyParticipantError,
-    UserChannelsTooMuchError,
-    UserKickedError,
-    UserBannedInChannelError,
-    ChatWriteForbiddenError,
-    ChatAdminRequiredError,
-    InviteHashExpiredError,
-    AuthKeyDuplicatedError,
-    AuthKeyUnregisteredError,
-    SessionRevokedError,
-    UserDeactivatedError,
-    UserDeactivatedBanError,
-    PhoneNumberBannedError,
+    FloodWaitError, PeerFloodError, UserPrivacyRestrictedError, UserNotMutualContactError,
+    UserAlreadyParticipantError, UserChannelsTooMuchError, UserKickedError, UserBannedInChannelError,
+    ChatWriteForbiddenError, ChatAdminRequiredError, InviteHashExpiredError,
+    AuthKeyDuplicatedError, AuthKeyUnregisteredError, SessionRevokedError,
+    UserDeactivatedError, UserDeactivatedBanError, PhoneNumberBannedError,
 )
 
-# ==========================================
-# ⚙️ PART 1: CONFIGURATION
-# ==========================================
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+# ==========================================================
+# CONFIG
+# ==========================================================
+logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+                    format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "4.3.1-spambot-aware"   # har release pe badlo -> GET / aur status se verify hota hai kaunsa code live hai
+VERSION = "5.0.0-self-regulating"
 
 
 class Config:
     IST = pytz.timezone("Asia/Kolkata")
-
     API_ID = int(os.getenv("API_ID", "0") or 0)
     API_HASH = os.getenv("API_HASH", "")
     BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -95,44 +91,47 @@ class Config:
 
     INSTANCE_ROLE = os.getenv("INSTANCE_ROLE", "both").lower().strip()
     ENABLE_ADMIN_BOT = os.getenv("ENABLE_ADMIN_BOT", "true").lower() in ("1", "true", "yes")
-    # INSTANCE_NAME = readable (env INSTANCE_ID e.g. render-B)
-    # INSTANCE_ID   = NAME + per-process random suffix  -> deploy overlap me purana aur naya
-    #                 process alag "instance" hain, ek doosre ka lock kabhi nahi chhodte
     INSTANCE_NAME = os.getenv("INSTANCE_ID") or os.getenv("RENDER_SERVICE_NAME") or socket.gethostname()
     INSTANCE_ID = f"{INSTANCE_NAME}-{uuid.uuid4().hex[:6]}"
-    # Engines port khulne ke ITNE sec BAAD start honge (Render tab tak purana process kill kar chuka hoga)
     STARTUP_DELAY = int(os.getenv("STARTUP_DELAY", "30") or 0)
-    # TEST_MODE=true  -> DRY RUN: sab kuch chalega par asli InviteToChannel call NAHI hogi
     TEST_MODE = os.getenv("TEST_MODE", "false").lower() in ("1", "true", "yes")
     SELF_PING_URL = os.getenv("SELF_PING_URL", "").strip()
+    ACTIVE_HOURS_IST = os.getenv("ACTIVE_HOURS_IST", "8-23").strip()
 
-    # Injector rules
-    MAX_ADDS_PER_DAY = int(os.getenv("MAX_ADDS_PER_DAY", "8"))   # ek account se max (15 pe accounts limited hue)
-    MICRO_BATCH_SIZE = 3           # ek baari me kitne add
-    COOLDOWN_HOURS = 30            # 15 add ke baad aaram
-    FLOOD_COOLDOWN_HOURS = 48      # flood + SpamBot parse fail -> fallback
-    GROUP_THROTTLE_HOURS = 6       # flood aaya par SpamBot bola "no limits" => group-level throttle
-    # Circuit breaker: itne PeerFlood itni der me => poora injector pause
+    # ---- human pacing (aapki spec) ----
+    ADDS_PER_SESSION = 2                    # ek baar connect me max 2 adds
+    IN_SESSION_GAP = (150, 200)             # do adds ke beech
+    BETWEEN_ACCOUNTS_GAP = (180, 240)       # account switch gap 3-4 min
+    SAME_ACCOUNT_MIN_GAP = 45 * 60          # ek account 45 min se pehle dobara nahi
+    IDLE_TURN_PROB = 0.15                   # 15% turns "kuch nahi" (irregularity)
+    IDLE_TURN_SLEEP = (300, 600)
+    GLOBAL_MAX_ADDS_PER_DAY = int(os.getenv("GLOBAL_MAX_ADDS_PER_DAY", "20"))
+
+    # ---- tiers ----
+    TIER_DAILY = {1: 2, 2: 4, 3: 6, 4: 8}
+    TIER_BATCH = {1: 1, 2: 2, 3: 2, 4: 2}
+    TIER_UP_DAYS = 7
+    PROBATION_DAYS = 3
+
+    # ---- flood / limit handling ----
+    GROUP_THROTTLE_REST_HOURS = 6
+    UNKNOWN_FLOOD_REST_HOURS = 24
+    FLAGGED_RECHECK_HOURS = 24
+    LIMITED_BUFFER_HOURS = 2
     BREAKER_WINDOW_SECONDS = 3600
     BREAKER_FLOOD_COUNT = 2
     BREAKER_PAUSE_HOURS = 12
-    # System-wide cap: poore setup se ek din me max itne adds (group pe report-rate control)
-    GLOBAL_MAX_ADDS_PER_DAY = int(os.getenv("GLOBAL_MAX_ADDS_PER_DAY", "20"))
-    SPAMBOT_CHECK_INTERVAL_HOURS = 12   # idle accounts ka periodic health check
-    ADD_DELAY_RANGE = (240, 480)   # seconds, do adds ke beech (4-8 min; 90-150 se reports zyada aaye)
-    # Injector sirf in IST ghanto me chalega, e.g. "8-23" = 08:00 se 22:59. "0-24" = hamesha
-    ACTIVE_HOURS_IST = os.getenv("ACTIVE_HOURS_IST", "0-24").strip()
-    ACCOUNT_GAP_RANGE = (15, 30)   # seconds, do accounts ke beech
+    HEALTH_CHECK_HOURS = 12
 
-    # Harvester rules (bandwidth-aware: Render free = 100GB/mo, aapka target 5GB/account)
-    HARVEST_INITIAL_LIMIT = int(os.getenv("HARVEST_INITIAL_LIMIT", "1000"))   # naye channel pe pehli baar itne msgs
-    HARVEST_MAX_NEW_PER_RUN = int(os.getenv("HARVEST_MAX_NEW_PER_RUN", "2000"))  # checkpoint ke baad max naye msgs/run
-    HARVEST_INTERVAL_SECONDS = int(os.getenv("HARVEST_INTERVAL_SECONDS", "10800"))  # 3h (DB me checkpoint, deploy pe reset nahi)
-    QUEUE_TARGET_PENDING = int(os.getenv("QUEUE_TARGET_PENDING", "1500"))   # itne pending hain to harvest SKIP
-    CHANNEL_FAIL_LIMIT = 3          # lagataar itni baar fail = channel auto-disable
+    # ---- harvester (bandwidth-aware) ----
+    HARVEST_INITIAL_LIMIT = int(os.getenv("HARVEST_INITIAL_LIMIT", "1000"))
+    HARVEST_MAX_NEW_PER_RUN = int(os.getenv("HARVEST_MAX_NEW_PER_RUN", "2000"))
+    HARVEST_INTERVAL_SECONDS = int(os.getenv("HARVEST_INTERVAL_SECONDS", "10800"))
+    QUEUE_TARGET_PENDING = int(os.getenv("QUEUE_TARGET_PENDING", "1500"))
+    CHANNEL_FAIL_LIMIT = 3
 
-    # Locking / safety
-    LOCK_TTL_SECONDS = 3 * 60      # heartbeat 60s hai; 3 min na aaye to process mar chuka = lock stale
+    # ---- locking ----
+    LOCK_TTL_SECONDS = 3 * 60
     LOCK_HEARTBEAT_SECONDS = 60
     PROCESSING_STALE_SECONDS = 30 * 60
 
@@ -142,41 +141,34 @@ class Config:
         if missing:
             logger.error(f"❌ Missing ENV: {', '.join(missing)}")
         if cls.INSTANCE_ROLE not in ("both", "harvester", "injector"):
-            logger.warning(f"Unknown INSTANCE_ROLE={cls.INSTANCE_ROLE!r}, falling back to 'both'")
             cls.INSTANCE_ROLE = "both"
         logger.info(f"🏷️ VERSION={VERSION}")
-        logger.info(f"🆔 INSTANCE={cls.INSTANCE_ID} | ROLE={cls.INSTANCE_ROLE} | ADMIN_BOT={cls.ENABLE_ADMIN_BOT}")
+        logger.info(f"🆔 INSTANCE={cls.INSTANCE_ID} | ROLE={cls.INSTANCE_ROLE} | ADMIN_BOT={cls.ENABLE_ADMIN_BOT} | CAP={cls.GLOBAL_MAX_ADDS_PER_DAY}/day")
         if cls.TEST_MODE:
-            logger.warning("🧪 TEST_MODE=true -> DRY RUN. Koi user actually add NAHI hoga. Production ke liye TEST_MODE=false karo.")
+            logger.warning("🧪 TEST_MODE=true -> DRY RUN, koi add nahi hoga")
 
 
 Config.validate()
 
-# Errors jinke aane par session PERMANENTLY dead maani jayegi
-DEAD_SESSION_ERRORS = (
-    AuthKeyDuplicatedError,
-    AuthKeyUnregisteredError,
-    SessionRevokedError,
-    UserDeactivatedError,
-    UserDeactivatedBanError,
-    PhoneNumberBannedError,
-)
-
-# Errors jinke aane par user ko permanently skip karna hai (dobara try nahi)
-SKIP_USER_ERRORS = (
-    UserPrivacyRestrictedError,
-    UserNotMutualContactError,
-    UserChannelsTooMuchError,
-    UserKickedError,
-    UserBannedInChannelError,
-)
+DEAD_SESSION_ERRORS = (AuthKeyDuplicatedError, AuthKeyUnregisteredError, SessionRevokedError,
+                       UserDeactivatedError, UserDeactivatedBanError, PhoneNumberBannedError)
+SKIP_USER_ERRORS = (UserPrivacyRestrictedError, UserNotMutualContactError, UserChannelsTooMuchError,
+                    UserKickedError, UserBannedInChannelError)
 
 is_engine_running = False
-background_tasks: list[asyncio.Task] = []
+background_tasks: list = []
 
 
 def now_ts() -> float:
     return time.time()
+
+
+def ist(ts) -> str:
+    return datetime.fromtimestamp(ts, Config.IST).strftime("%d %b %H:%M") if ts else "-"
+
+
+def rnd(rng) -> int:
+    return random.randint(*rng)
 
 
 _DEVICES = [
@@ -189,31 +181,19 @@ _DEVICES = [
 
 
 def make_client(session_string: str, account_id: str = "") -> TelegramClient:
-    # Har account ka alag (par stable) device fingerprint — sab "Engine v4" dikhna red flag tha
     dev, sysv, appv = _DEVICES[sum(map(ord, account_id)) % len(_DEVICES)] if account_id else _DEVICES[0]
-    return TelegramClient(
-        StringSession(session_string),
-        Config.API_ID,
-        Config.API_HASH,
-        connection_retries=3,
-        retry_delay=5,
-        auto_reconnect=False,      # dead session pe baar-baar reconnect mat karo
-        device_model=dev,
-        system_version=sysv,
-        app_version=appv,
-        lang_code="en",
-        system_lang_code="en-IN",
-    )
+    return TelegramClient(StringSession(session_string), Config.API_ID, Config.API_HASH,
+                          connection_retries=3, retry_delay=5, auto_reconnect=False,
+                          device_model=dev, system_version=sysv, app_version=appv,
+                          lang_code="en", system_lang_code="en-IN")
 
 
-# ==========================================
-# 🗄️ PART 2: DATABASE
-# ==========================================
+# ==========================================================
+# DATABASE
+# ==========================================================
 class Database:
     def __init__(self, uri: str, db_name: str = "telegram_automation"):
-        self.uri = uri
-        self.db_name = db_name
-        self.client = None
+        self.uri, self.db_name, self.client = uri, db_name, None
 
     async def connect(self):
         self.client = AsyncIOMotorClient(self.uri, serverSelectionTimeoutMS=8000)
@@ -222,41 +202,36 @@ class Database:
         self.scraped_queue = self.db["scraped_queue"]
         self.master_blacklist = self.db["master_blacklist"]
         self.system_config = self.db["system_config"]
-        self.harvest_state = self.db["harvest_state"]      # per-channel checkpoint
+        self.harvest_state = self.db["harvest_state"]
+        self.events = self.db["events"]              # audit log (adds, floods, state changes)
         await self.client.admin.command("ping")
         logger.info("✅ Connected to MongoDB")
         await self._ensure_indexes()
-        await self._ensure_config()
+        await self.system_config.update_one({"_id": "config"},
+                                            {"$setOnInsert": {"source_channels": [], "is_paused": False}}, upsert=True)
 
     async def _ensure_indexes(self):
         async def idx(col, keys, **kw):
             try:
                 await col.create_index(keys, **kw)
             except Exception as e:
-                if getattr(e, "code", None) == 86:      # same name, different spec -> purana drop, naya banao
+                if getattr(e, "code", None) == 86:
                     name = "_".join(f"{k}_{v}" for k, v in keys)
                     try:
                         await col.drop_index(name)
                         await col.create_index(keys, **kw)
-                        logger.info(f"Index {col.name}.{name} recreated")
                         return
                     except Exception as e2:
                         e = e2
-                logger.warning(f"Index {col.name} {keys} warning: {str(e)[:120]}")
-
+                logger.warning(f"Index {col.name} {keys}: {str(e)[:100]}")
         await idx(self.accounts_pool, [("account_id", ASCENDING)], unique=True)
-        await idx(self.accounts_pool, [("status", ASCENDING), ("locked_by", ASCENDING)])
+        await idx(self.accounts_pool, [("state", ASCENDING), ("locked_by", ASCENDING)])
         await idx(self.scraped_queue, [("user_id", ASCENDING)], unique=True)
         await idx(self.scraped_queue, [("status", ASCENDING), ("_id", ASCENDING)])
         await idx(self.master_blacklist, [("user_id", ASCENDING)], unique=True)
+        await idx(self.master_blacklist, [("added_at", ASCENDING)])
         await idx(self.harvest_state, [("channel", ASCENDING)], unique=True)
-
-    async def _ensure_config(self):
-        await self.system_config.update_one(
-            {"_id": "config"},
-            {"$setOnInsert": {"source_channels": [], "is_paused": False}},
-            upsert=True,
-        )
+        await idx(self.events, [("t", ASCENDING)], expireAfterSeconds=30 * 86400)
 
     async def disconnect(self):
         if self.client:
@@ -266,156 +241,223 @@ class Database:
 db = Database(Config.MONGO_URI)
 
 
-# ==========================================
-# 🔒 PART 3: ACCOUNT LOCKING (multi-instance safe)
-# ==========================================
-def _lock_free_filter() -> dict:
-    """Account free hai agar: lock nahi hai, ya lock stale (heartbeat purana) hai."""
-    stale_before = now_ts() - Config.LOCK_TTL_SECONDS
-    return {
-        "$or": [
-            {"locked_by": None},
-            {"locked_by": {"$exists": False}},
-            {"locked_at": {"$lt": stale_before}},
-        ]
-    }
+async def log_event(kind: str, account_id: str = "", **data):
+    try:
+        await db.events.insert_one({"t": now_ts(), "kind": kind, "acc": account_id, "inst": Config.INSTANCE_ID, **data})
+    except Exception:
+        pass
 
 
-async def claim_account(extra_filter: dict, sort_field: str):
-    """
-    Atomically ek account pakdo. find_one_and_update ek single atomic op hai,
-    isliye do instances kabhi ek hi document nahi utha sakte.
-    """
-    query = {"$and": [extra_filter, _lock_free_filter()]}
+# ==========================================================
+# ACCOUNT STATE MACHINE
+# ==========================================================
+STATE_ACTIVE, STATE_RESTING, STATE_LIMITED, STATE_FLAGGED, STATE_PROBATION, STATE_DEAD = \
+    "active", "resting", "limited", "flagged", "probation", "session_dead"
+ADD_CAPABLE = (STATE_ACTIVE, STATE_PROBATION, STATE_RESTING)     # resting -> rest_until pass hone pe
+HARVEST_CAPABLE = (STATE_ACTIVE, STATE_PROBATION, STATE_RESTING, STATE_LIMITED, STATE_FLAGGED)
+
+
+def _lock_free() -> dict:
+    return {"$or": [{"locked_by": None}, {"locked_by": {"$exists": False}},
+                    {"locked_at": {"$lt": now_ts() - Config.LOCK_TTL_SECONDS}}]}
+
+
+async def claim_account(extra: dict, sort_field: str):
     return await db.accounts_pool.find_one_and_update(
-        query,
+        {"$and": [extra, _lock_free(), {"duplicate": {"$ne": True}}]},
         {"$set": {"locked_by": Config.INSTANCE_ID, "locked_at": now_ts()}},
-        sort=[(sort_field, ASCENDING)],
-        return_document=ReturnDocument.AFTER,
-    )
+        sort=[(sort_field, ASCENDING)], return_document=ReturnDocument.AFTER)
 
 
 async def release_account(account_id: str):
-    await db.accounts_pool.update_one(
-        {"account_id": account_id, "locked_by": Config.INSTANCE_ID},
-        {"$set": {"locked_by": None, "locked_at": 0}},
-    )
+    await db.accounts_pool.update_one({"account_id": account_id, "locked_by": Config.INSTANCE_ID},
+                                      {"$set": {"locked_by": None, "locked_at": 0}})
 
 
 async def release_all_my_locks():
-    r = await db.accounts_pool.update_many(
-        {"locked_by": Config.INSTANCE_ID},
-        {"$set": {"locked_by": None, "locked_at": 0}},
-    )
-    if r.modified_count:
-        logger.info(f"🔓 Released {r.modified_count} lock(s) held by {Config.INSTANCE_ID}")
+    await db.accounts_pool.update_many({"locked_by": Config.INSTANCE_ID}, {"$set": {"locked_by": None, "locked_at": 0}})
 
 
 async def lock_heartbeat(account_id: str):
-    """Jab tak account use ho raha hai, locked_at refresh karta raho."""
     try:
         while True:
             await asyncio.sleep(Config.LOCK_HEARTBEAT_SECONDS)
-            await db.accounts_pool.update_one(
-                {"account_id": account_id, "locked_by": Config.INSTANCE_ID},
-                {"$set": {"locked_at": now_ts()}},
-            )
+            await db.accounts_pool.update_one({"account_id": account_id, "locked_by": Config.INSTANCE_ID},
+                                              {"$set": {"locked_at": now_ts()}})
     except asyncio.CancelledError:
         pass
 
 
-async def mark_dead(account_id: str, reason: str):
-    await db.accounts_pool.update_one(
-        {"account_id": account_id},
-        {"$set": {
-            "status": "dead",
-            "last_error": reason[:300],
-            "dead_at": now_ts(),
-            "locked_by": None,
-            "locked_at": 0,
-        }},
-    )
-    logger.error(f"💀 Account {account_id} marked DEAD: {reason}")
-    await notify_admin(f"💀 Session DEAD: `{account_id}`\n{reason[:200]}\n\nNayi session string DB me daalo.")
+async def set_state(account_id: str, state: str, reason: str = "", **extra):
+    upd = {"state": state, "state_reason": reason[:200], "state_since": now_ts(), **extra}
+    await db.accounts_pool.update_one({"account_id": account_id}, {"$set": upd})
+    logger.info(f"🔁 {account_id} → {state.upper()} {('(' + reason[:80] + ')') if reason else ''}")
+    await log_event("state", account_id, state=state, reason=reason[:200])
 
 
-SPAMBOT_LIMITED_RE = re.compile(r"limited until (\d{1,2} \w+ \d{4}), (\d{1,2}:\d{2}) UTC", re.I)
+async def mark_session_dead(account_id: str, reason: str):
+    await set_state(account_id, STATE_DEAD, reason, locked_by=None, locked_at=0, dead_at=now_ts())
+    await notify_admin(f"💀 SESSION DEAD `{account_id}`\n{reason[:200]}\n\nYe sach me revoke hui hai — nayi string chahiye, phir `revive {account_id}`.")
+
+
+async def migrate_legacy_statuses():
+    """v4 'status' field -> v5 'state'. Ek baar chalta hai, idempotent."""
+    cur = db.accounts_pool.find({"state": {"$exists": False}})
+    async for a in cur:
+        old = a.get("status", "ready")
+        err = str(a.get("last_error", ""))
+        if old == "dead" and "SpamBot" in err:
+            st, why = STATE_FLAGGED, "migrated: number flagged by SpamBot"
+        elif old == "dead":
+            st, why = STATE_DEAD, "migrated: " + err
+        elif a.get("limited_until") and a["limited_until"] > now_ts():
+            st, why = STATE_LIMITED, "migrated: " + err
+        elif old == "cooling":
+            st, why = STATE_RESTING, "migrated: " + err
+        else:
+            st, why = STATE_ACTIVE, "migrated"
+        await db.accounts_pool.update_one({"account_id": a["account_id"]}, {"$set": {
+            "state": st, "state_reason": why, "state_since": now_ts(),
+            "tier": a.get("tier", 2), "rest_until": a.get("cooldown_until", 0) if st == STATE_RESTING else 0,
+            "strikes": a.get("limit_strikes", 0), "clean_since": now_ts(), "last_used": a.get("last_add_time") or 0,
+        }})
+        logger.info(f"🧬 migrated {a['account_id']}: {old} → {st}")
+
+
+async def dedupe_identities():
+    """Har session ka asli tg_user_id nikaalo; ek user ki 2 entries ho to doosri disable."""
+    seen: dict[int, str] = {}
+    async for a in db.accounts_pool.find({"state": {"$ne": STATE_DEAD}}).sort("account_id", 1):
+        acc = a["account_id"]
+        uid = a.get("tg_user_id")
+        if not uid:
+            c = make_client(a["session_string"], acc)
+            try:
+                await c.connect()
+                if not await c.is_user_authorized():
+                    await mark_session_dead(acc, "not authorized at identity check")
+                    continue
+                me = await c.get_me()
+                uid = me.id
+                await db.accounts_pool.update_one({"account_id": acc}, {"$set": {
+                    "tg_user_id": me.id, "phone": me.phone, "first_name": me.first_name, "tg_username": me.username}})
+            except DEAD_SESSION_ERRORS as e:
+                await mark_session_dead(acc, f"{type(e).__name__}")
+                continue
+            except Exception as e:
+                logger.warning(f"identity check {acc}: {type(e).__name__}: {e}")
+                continue
+            finally:
+                try:
+                    await c.disconnect()
+                except Exception:
+                    pass
+            await asyncio.sleep(2)
+        if uid in seen:
+            await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"duplicate": True, "duplicate_of": seen[uid]}})
+            logger.error(f"👥 DUPLICATE: `{acc}` is the same Telegram user as `{seen[uid]}` → disabled")
+            await notify_admin(f"👥 `{acc}` aur `{seen[uid]}` EK HI Telegram account hain (id {uid}). `{acc}` disable kar diya — ek account 2 sessions se kabhi mat chalao. Isko pool se delete kar do.")
+        else:
+            seen[uid] = acc
+            if a.get("duplicate"):
+                await db.accounts_pool.update_one({"account_id": acc}, {"$unset": {"duplicate": "", "duplicate_of": ""}})
+
+
+# ==========================================================
+# SPAMBOT — account ka asli haal padho
+# ==========================================================
+_LIMITED_RE = re.compile(r"limited until (\d{1,2} \w+ \d{4}), (\d{1,2}:\d{2}) UTC", re.I)
 
 
 async def ask_spambot(client: TelegramClient) -> dict:
-    """
-    @SpamBot se account ka asli status. Returns
-      {"verdict": "ok"|"limited"|"harsh_number"|"unknown", "until": ts|None, "text": str}
-    """
+    """{"verdict": ok|limited|flagged|unknown, "until": ts|None, "text": str}"""
     try:
         await client.send_message("SpamBot", "/start")
-        await asyncio.sleep(4)
+        await asyncio.sleep(random.uniform(4, 7))
         msgs = await client.get_messages("SpamBot", limit=3)
         text = " ".join((m.message or "") for m in msgs if m and not m.out)
         low = text.lower()
         if "no limits" in low or "free as a bird" in low:
-            return {"verdict": "ok", "until": None, "text": text[:300]}
-        if "harsh response" in low or "some phone numbers" in low:
-            return {"verdict": "harsh_number", "until": None, "text": text[:300]}
-        m = SPAMBOT_LIMITED_RE.search(text)
+            return {"verdict": "ok", "until": None, "text": text[:400]}
+        m = _LIMITED_RE.search(text)
         if m:
             dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%d %b %Y %H:%M").replace(tzinfo=pytz.utc)
-            return {"verdict": "limited", "until": dt.timestamp(), "text": text[:300]}
+            return {"verdict": "limited", "until": dt.timestamp(), "text": text[:400]}
+        if "harsh response" in low or "some phone numbers" in low:
+            return {"verdict": "flagged", "until": None, "text": text[:400]}
         if "limited" in low:
-            return {"verdict": "limited", "until": None, "text": text[:300]}
-        return {"verdict": "unknown", "until": None, "text": text[:300]}
+            return {"verdict": "limited", "until": None, "text": text[:400]}
+        return {"verdict": "unknown", "until": None, "text": text[:400]}
     except Exception as e:
-        return {"verdict": "unknown", "until": None, "text": f"spambot check failed: {type(e).__name__}: {e}"}
+        return {"verdict": "unknown", "until": None, "text": f"spambot failed: {type(e).__name__}: {e}"}
+
+
+async def apply_verdict(account_id: str, info: dict, context: str) -> str:
+    """SpamBot verdict -> state transition. Returns new state."""
+    a = await db.accounts_pool.find_one({"account_id": account_id}) or {}
+    v = info["verdict"]
+    base = {"spambot_text": info["text"], "spambot_checked_at": now_ts()}
+
+    if v == "limited":
+        until = info["until"] or (now_ts() + 48 * 3600)
+        strikes = a.get("strikes", 0) + (1 if a.get("state") != STATE_LIMITED else 0)
+        tier = max(1, a.get("tier", 2) - 1)
+        await set_state(account_id, STATE_LIMITED, f"{context}; till {ist(until)}", limited_until=until,
+                        strikes=strikes, tier=tier, clean_since=0, **base)
+        await notify_admin(f"⛔ `{account_id}` LIMITED till *{ist(until)} IST* (strike #{strikes}, tier→{tier})\n{context}")
+        return STATE_LIMITED
+
+    if v == "flagged":
+        await set_state(account_id, STATE_FLAGGED, f"{context}; number flagged", tier=1, clean_since=0,
+                        flagged_recheck_at=now_ts() + Config.FLAGGED_RECHECK_HOURS * 3600, **base)
+        if a.get("state") != STATE_FLAGGED:
+            await notify_admin(f"🚩 `{account_id}` FLAGGED (SpamBot: harsh response). Add band, harvest chalu. Har 24h re-check; clear hote hi khud wapas.\nTip: is account se SpamBot me 'submit a complaint' karo.")
+        return STATE_FLAGGED
+
+    if v == "ok":
+        prev = a.get("state")
+        if prev in (STATE_LIMITED, STATE_FLAGGED):
+            # wapas aaya -> probation, tier 1
+            await set_state(account_id, STATE_PROBATION, f"cleared after {prev}", tier=1, limited_until=0,
+                            probation_until=now_ts() + Config.PROBATION_DAYS * 86400, clean_since=now_ts(),
+                            rest_until=0, daily_adds=0, **base)
+            await notify_admin(f"✅ `{account_id}` clear ho gaya ({prev} → probation, 2 adds/din for {Config.PROBATION_DAYS} din)")
+            return STATE_PROBATION
+        if context.startswith("flood"):
+            # clean account pe flood = group-level throttle
+            await set_state(account_id, STATE_RESTING, "group throttle (SpamBot: clean)",
+                            rest_until=now_ts() + Config.GROUP_THROTTLE_REST_HOURS * 3600, **base)
+            return STATE_RESTING
+        await db.accounts_pool.update_one({"account_id": account_id}, {"$set": base})
+        return prev or STATE_ACTIVE
+
+    # unknown
+    if context.startswith("flood"):
+        await set_state(account_id, STATE_RESTING, f"{context}; SpamBot unknown",
+                        rest_until=now_ts() + Config.UNKNOWN_FLOOD_REST_HOURS * 3600, **base)
+        return STATE_RESTING
+    await db.accounts_pool.update_one({"account_id": account_id}, {"$set": base})
+    return a.get("state", STATE_ACTIVE)
 
 
 async def handle_flood(client: TelegramClient, account_id: str, code: str):
-    """
-    PeerFlood/genuine flood aaya -> SpamBot se pucho kitni der ka hai -> exact cooldown.
-    Returns verdict string.
-    """
     info = await ask_spambot(client)
-    v = info["verdict"]
-    if v == "limited" and info["until"]:
-        hrs = max(1.0, (info["until"] - now_ts()) / 3600 + 1)      # +1h buffer
-        until_ist = datetime.fromtimestamp(info["until"], Config.IST).strftime("%d %b %H:%M IST")
-        await db.accounts_pool.update_one({"account_id": account_id}, {"$set": {
-            "status": "cooling", "cooldown_until": info["until"] + 3600, "limited_until": info["until"],
-            "last_error": f"LIMITED till {until_ist}", "spambot_text": info["text"], "spambot_checked_at": now_ts()},
-            "$inc": {"limit_strikes": 1}})
-        logger.warning(f"⛔ {account_id} LIMITED by Telegram till {until_ist} ({hrs:.0f}h). Cooling exactly till then.")
-        await notify_admin(f"⛔ `{account_id}` Telegram-limited till *{until_ist}*\n(reports se). Us waqt tak cooling. "
-                           f"Strike #{(await db.accounts_pool.find_one({'account_id': account_id}) or {}).get('limit_strikes', 1)}")
-    elif v == "harsh_number":
-        await db.accounts_pool.update_one({"account_id": account_id}, {"$set": {
-            "status": "dead", "last_error": "SpamBot: phone number flagged (harsh response)",
-            "spambot_text": info["text"], "spambot_checked_at": now_ts(), "dead_at": now_ts()}})
-        logger.error(f"💀 {account_id}: number flagged by Telegram anti-spam. Marked dead.")
-        await notify_admin(f"💀 `{account_id}` — SpamBot bola number hi flagged hai. Pool se hata do, ye kabhi add nahi kar payega.")
-    elif v == "ok":
-        # Account clean hai -> flood GROUP-level throttle thi. Account thoda aaram, aur breaker trigger
-        await cooldown_account(account_id, Config.GROUP_THROTTLE_HOURS, f"group throttle ({code}); SpamBot: no limits")
-        await db.accounts_pool.update_one({"account_id": account_id}, {"$set": {"spambot_text": info["text"], "spambot_checked_at": now_ts()}})
-        logger.warning(f"🟡 {account_id} flood but SpamBot says clean => GROUP throttle. {Config.GROUP_THROTTLE_HOURS}h rest.")
-    else:
-        await cooldown_account(account_id, Config.FLOOD_COOLDOWN_HOURS, f"{code}; SpamBot unknown")
-        await db.accounts_pool.update_one({"account_id": account_id}, {"$set": {"spambot_text": info["text"], "spambot_checked_at": now_ts()}})
-    await record_flood_event(account_id, v)
-    return v
+    st = await apply_verdict(account_id, info, f"flood:{code}")
+    await log_event("flood", account_id, code=code, verdict=info["verdict"], new_state=st)
+    await record_flood_for_breaker(account_id, info["verdict"])
+    return st
 
 
-async def record_flood_event(account_id: str, verdict: str):
-    """Circuit breaker: window me itne floods => poora injector pause."""
+async def record_flood_for_breaker(account_id: str, verdict: str):
     await db.system_config.update_one({"_id": "config"}, {"$push": {"flood_events": {"t": now_ts(), "acc": account_id, "v": verdict}}})
     cfg = await db.system_config.find_one({"_id": "config"}) or {}
     recent = [e for e in cfg.get("flood_events", []) if e["t"] > now_ts() - Config.BREAKER_WINDOW_SECONDS]
     await db.system_config.update_one({"_id": "config"}, {"$set": {"flood_events": recent[-50:]}})
-    if len(recent) >= Config.BREAKER_FLOOD_COUNT and not cfg.get("breaker_until", 0) > now_ts():
+    if len(recent) >= Config.BREAKER_FLOOD_COUNT and float(cfg.get("breaker_until") or 0) < now_ts():
         until = now_ts() + Config.BREAKER_PAUSE_HOURS * 3600
         await db.system_config.update_one({"_id": "config"}, {"$set": {"breaker_until": until}})
-        until_ist = datetime.fromtimestamp(until, Config.IST).strftime("%d %b %H:%M IST")
-        logger.error(f"🔌 CIRCUIT BREAKER: {len(recent)} floods in {Config.BREAKER_WINDOW_SECONDS // 60} min. Injector paused till {until_ist}")
-        await notify_admin(f"🔌 *CIRCUIT BREAKER*\n{len(recent)} accounts pe flood {Config.BREAKER_WINDOW_SECONDS // 60} min me. "
-                           f"Injector *{until_ist}* tak paused — baaki accounts bacha liye.\n`resume` se force-on kar sakte ho (recommended nahi).")
+        logger.error(f"🔌 BREAKER: {len(recent)} floods/{Config.BREAKER_WINDOW_SECONDS // 60}min → injector paused till {ist(until)}")
+        await notify_admin(f"🔌 *CIRCUIT BREAKER* — {len(recent)} accounts pe flood 1h me. Injector *{ist(until)} IST* tak paused.\n`breaker reset` se force-on.")
 
 
 async def breaker_active() -> bool:
@@ -423,195 +465,151 @@ async def breaker_active() -> bool:
     return float(cfg.get("breaker_until") or 0) > now_ts()
 
 
-async def global_adds_today() -> int:
-    return await db.master_blacklist.count_documents({"added_at": {"$gt": now_ts() - 86400}})
+# ==========================================================
+# LIFECYCLE TICK — har loop me states ko aage badhao
+# ==========================================================
+async def lifecycle_tick():
+    now = now_ts()
+    # resting -> active/probation jab rest khatam
+    async for a in db.accounts_pool.find({"state": STATE_RESTING, "rest_until": {"$lte": now}}):
+        back = STATE_PROBATION if a.get("probation_until", 0) > now else STATE_ACTIVE
+        await set_state(a["account_id"], back, "rest over", rest_until=0)
+    # probation -> active
+    async for a in db.accounts_pool.find({"state": STATE_PROBATION, "probation_until": {"$lte": now}}):
+        await set_state(a["account_id"], STATE_ACTIVE, "probation done", tier=max(1, a.get("tier", 1)))
+    # limited: time nikal gaya -> SpamBot verify sweep karega (yahan sirf flag)
+    # tier up: 7 din clean
+    async for a in db.accounts_pool.find({"state": STATE_ACTIVE, "tier": {"$lt": 4}, "clean_since": {"$gt": 0, "$lte": now - Config.TIER_UP_DAYS * 86400}}):
+        await db.accounts_pool.update_one({"account_id": a["account_id"]}, {"$set": {"tier": a.get("tier", 1) + 1, "clean_since": now}})
+        logger.info(f"⬆️ {a['account_id']} tier {a.get('tier', 1)} → {a.get('tier', 1) + 1}")
+    # daily counter reset (IST midnight se)
+    today = datetime.now(Config.IST).strftime("%Y-%m-%d")
+    await db.accounts_pool.update_many({"day_key": {"$ne": today}}, {"$set": {"daily_adds": 0, "day_key": today}})
+    # stale processing
+    await db.scraped_queue.update_many(
+        {"status": "processing", "processing_at": {"$lt": now - Config.PROCESSING_STALE_SECONDS}},
+        {"$set": {"status": "pending"}, "$unset": {"processing_at": "", "processing_by": ""}})
 
 
-async def spambot_health_sweep():
-    """Har 12h: cooling/ready accounts ka SpamBot status refresh (limited ho to exact time set)."""
-    cutoff = now_ts() - Config.SPAMBOT_CHECK_INTERVAL_HOURS * 3600
-    async for a in db.accounts_pool.find({"status": {"$in": ["ready", "cooling"]},
-                                          "$or": [{"spambot_checked_at": {"$exists": False}}, {"spambot_checked_at": {"$lt": cutoff}}]}):
-        acc_id = a["account_id"]
-        locked = await claim_account({"account_id": acc_id}, "last_add_time")
-        if not locked:
+async def health_sweep():
+    """SpamBot re-check: limited jinka time nikal gaya, flagged jinka recheck due, aur 12h purane sab."""
+    now = now_ts()
+    q = {"state": {"$nin": [STATE_DEAD]}, "duplicate": {"$ne": True}, "$or": [
+        {"state": STATE_LIMITED, "limited_until": {"$lte": now}},
+        {"state": STATE_FLAGGED, "flagged_recheck_at": {"$lte": now}},
+        {"spambot_checked_at": {"$exists": False}},
+        {"spambot_checked_at": {"$lt": now - Config.HEALTH_CHECK_HOURS * 3600}},
+    ]}
+    async for a in db.accounts_pool.find(q):
+        acc = a["account_id"]
+        if not await claim_account({"account_id": acc}, "last_used"):
             continue
-        client = make_client(a["session_string"], acc_id)
+        client = make_client(a["session_string"], acc)
         try:
-            if not await safe_connect(client, acc_id):
+            await client.connect()
+            if not await client.is_user_authorized():
+                await mark_session_dead(acc, "unauthorized at health check")
                 continue
             info = await ask_spambot(client)
-            upd = {"spambot_text": info["text"], "spambot_checked_at": now_ts()}
-            if info["verdict"] == "limited" and info["until"]:
-                upd.update({"status": "cooling", "cooldown_until": info["until"] + 3600, "limited_until": info["until"],
-                            "last_error": "LIMITED till " + datetime.fromtimestamp(info["until"], Config.IST).strftime("%d %b %H:%M IST")})
-            elif info["verdict"] == "harsh_number":
-                upd.update({"status": "dead", "last_error": "SpamBot: phone number flagged", "dead_at": now_ts()})
-            elif info["verdict"] == "ok" and a["status"] == "cooling" and "flood" in str(a.get("last_error", "")):
-                # Flood-cooling tha par Telegram bolta hai clean => group throttle thi; 6h se zyada mat rok
-                new_cd = min(float(a.get("cooldown_until") or 0), now_ts() + Config.GROUP_THROTTLE_HOURS * 3600)
-                upd.update({"cooldown_until": new_cd, "last_error": "group throttle; SpamBot: no limits"})
-            await db.accounts_pool.update_one({"account_id": acc_id}, {"$set": upd})
-            logger.info(f"🩺 SpamBot {acc_id}: {info['verdict']}")
+            await apply_verdict(acc, info, "health")
+            if a["state"] == STATE_FLAGGED and info["verdict"] == "flagged":
+                await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"flagged_recheck_at": now_ts() + Config.FLAGGED_RECHECK_HOURS * 3600}})
+            if a["state"] == STATE_LIMITED and info["verdict"] == "limited" and not info["until"]:
+                await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"limited_until": now_ts() + 12 * 3600}})
+            logger.info(f"🩺 {acc}: {info['verdict']}")
         except DEAD_SESSION_ERRORS as e:
-            await mark_dead(acc_id, f"{type(e).__name__}: {e}")
+            await mark_session_dead(acc, type(e).__name__)
         except Exception as e:
-            logger.warning(f"health sweep {acc_id}: {type(e).__name__}: {e}")
+            logger.warning(f"health {acc}: {type(e).__name__}: {e}")
         finally:
             try:
                 await client.disconnect()
             except Exception:
                 pass
-            await release_account(acc_id)
-        await asyncio.sleep(random.randint(20, 40))
+            await release_account(acc)
+        await asyncio.sleep(random.randint(20, 45))
 
 
-async def health_sweep_loop():
-    """Independent task: cap/breaker/pause se affected nahi. Start pe ek baar, phir har 12h."""
-    await asyncio.sleep(90)   # engines settle ho jayein
+async def health_loop():
+    await asyncio.sleep(60)
     while is_engine_running:
         try:
-            await spambot_health_sweep()
+            await health_sweep()
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.warning(f"health sweep loop error: {type(e).__name__}: {e}")
-        await asyncio.sleep(1800)   # har 30 min dekho kis account ka 12h check due hai
+            logger.warning(f"health loop: {type(e).__name__}: {e}")
+        await asyncio.sleep(1800)
 
 
-async def cooldown_account(account_id: str, hours: float, reason: str):
-    await db.accounts_pool.update_one(
-        {"account_id": account_id},
-        {"$set": {
-            "status": "cooling",
-            "cooldown_until": now_ts() + hours * 3600,
-            "last_error": reason[:300],
-        }},
-    )
-    logger.info(f"❄️ Account {account_id} COOLING for {hours}h. Reason: {reason}")
-
-
-async def wake_cooled_accounts():
-    r = await db.accounts_pool.update_many(
-        {"status": "cooling", "cooldown_until": {"$gt": 0, "$lt": now_ts()}},
-        {"$set": {"status": "ready", "daily_adds": 0, "cooldown_until": 0, "last_error": ""}},
-    )
-    if r.modified_count:
-        logger.info(f"☀️ Woke up {r.modified_count} cooled account(s)")
-    # Jo account 15 tak nahi pahuncha, uska counter last add ke 24h baad reset (rolling window, safe)
-    r2 = await db.accounts_pool.update_many(
-        {"status": "ready", "daily_adds": {"$gt": 0}, "last_add_time": {"$lt": now_ts() - 86400}},
-        {"$set": {"daily_adds": 0}},
-    )
-    if r2.modified_count:
-        logger.info(f"🔄 Daily counter reset for {r2.modified_count} account(s) (24h passed)")
-
-
-async def cleanup_stale_processing():
-    """Crash ke baad 'processing' me atke users wapas pending."""
-    r = await db.scraped_queue.update_many(
-        {"status": "processing", "processing_at": {"$lt": now_ts() - Config.PROCESSING_STALE_SECONDS}},
-        {"$set": {"status": "pending"}, "$unset": {"processing_at": ""}},
-    )
-    if r.modified_count:
-        logger.info(f"🧹 Reset {r.modified_count} stale 'processing' user(s) to pending")
-
-
+# ==========================================================
+# TELEGRAM HELPERS
+# ==========================================================
 def in_active_hours() -> bool:
     try:
-        start, end = (int(x) for x in Config.ACTIVE_HOURS_IST.split("-"))
+        s, e = (int(x) for x in Config.ACTIVE_HOURS_IST.split("-"))
     except Exception:
         return True
-    if (start, end) == (0, 24):
+    if (s, e) == (0, 24):
         return True
     h = datetime.now(Config.IST).hour
-    return start <= h < end if start < end else (h >= start or h < end)
+    return s <= h < e if s < e else (h >= s or h < e)
 
 
 async def is_paused() -> bool:
-    cfg = await db.system_config.find_one({"_id": "config"})
+    cfg = await db.system_config.find_one({"_id": "config"}, {"is_paused": 1})
     return bool(cfg and cfg.get("is_paused"))
 
 
-# ==========================================
-# 🛠️ PART 4: TELEGRAM HELPERS
-# ==========================================
-async def safe_connect(client: TelegramClient, account_id: str) -> bool:
-    """
-    Connect + authorize check. Dead session hone par DB me mark karke False.
-    """
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            await mark_dead(account_id, "Session not authorized (logged out / revoked)")
-            return False
-        return True
-    except DEAD_SESSION_ERRORS as e:
-        await mark_dead(account_id, f"{type(e).__name__}: {e}")
-        return False
+async def global_adds_today() -> int:
+    return await db.master_blacklist.count_documents({"added_at": {"$gt": now_ts() - 86400}})
 
 
 async def join_target(client: TelegramClient):
-    """@username, t.me/xxx, ya t.me/+invite sab handle karega. Entity return karta hai."""
     target = Config.TARGET_GROUP.strip()
-    invite_hash = None
+    inv = None
     if "joinchat/" in target:
-        invite_hash = target.split("joinchat/")[-1].strip("/")
+        inv = target.split("joinchat/")[-1].strip("/")
     elif "/+" in target:
-        invite_hash = target.split("/+")[-1].strip("/")
+        inv = target.split("/+")[-1].strip("/")
     elif target.startswith("+"):
-        invite_hash = target[1:]
-
-    if invite_hash:
+        inv = target[1:]
+    if inv:
         try:
-            result = await client(ImportChatInviteRequest(invite_hash))
-            return result.chats[0]
+            return (await client(ImportChatInviteRequest(inv))).chats[0]
         except UserAlreadyParticipantError:
-            # already member: entity fetch via dialogs cache
-            from telethon.tl.functions.messages import CheckChatInviteRequest
-            info = await client(CheckChatInviteRequest(invite_hash))
+            info = await client(CheckChatInviteRequest(inv))
             return await client.get_entity(getattr(info, "chat", None) or info)
         except InviteHashExpiredError:
-            raise RuntimeError("TARGET_GROUP invite link expired")
-    else:
-        try:
-            await client(JoinChannelRequest(target))
-        except UserAlreadyParticipantError:
-            pass
-        return await client.get_entity(target)
-
-
-async def resolve_entity(client: TelegramClient, user_doc: dict):
-    """
-    NOTE: access_hash ACCOUNT-SPECIFIC hota hai. Jis account ne scrape kiya, uska hash
-    doosre account pe kaam nahi karta. Isliye order:
-      1) username  2) stored access_hash (agar same account)  3) participant search in source channel
-    """
-    uid = user_doc.get("user_id")
-
-    if user_doc.get("username"):
-        try:
-            ent = await client.get_entity(user_doc["username"])
-            if isinstance(ent, User) and ent.id == uid:
-                return ent
-        except Exception:
-            pass
-
-    if user_doc.get("access_hash"):
-        try:
-            ent = await client.get_entity(InputPeerUser(uid, user_doc["access_hash"]))
-            if isinstance(ent, User):
-                return ent
-        except Exception:
-            pass
-
+            raise RuntimeError("TARGET_GROUP invite expired")
     try:
-        return await client.get_entity(uid)  # sirf tab chalega jab cache me ho
+        await client(JoinChannelRequest(target))
+    except UserAlreadyParticipantError:
+        pass
+    return await client.get_entity(target)
+
+
+async def resolve_entity(client: TelegramClient, doc: dict):
+    uid = doc.get("user_id")
+    if doc.get("username"):
+        try:
+            e = await client.get_entity(doc["username"])
+            if isinstance(e, User) and e.id == uid:
+                return e
+        except Exception:
+            pass
+    if doc.get("access_hash"):
+        try:
+            e = await client.get_entity(InputPeerUser(uid, doc["access_hash"]))
+            if isinstance(e, User):
+                return e
+        except Exception:
+            pass
+    try:
+        return await client.get_entity(uid)
     except Exception:
         pass
-
-    src = user_doc.get("source_channel")
-    name = (user_doc.get("name") or "").strip().split(" ")[0]
+    src, name = doc.get("source_channel"), (doc.get("name") or "").strip().split(" ")[0]
     if src and name:
         try:
             async for p in client.iter_participants(src, search=name, limit=200):
@@ -622,56 +620,41 @@ async def resolve_entity(client: TelegramClient, user_doc: dict):
     return None
 
 
-async def attempt_add(client: TelegramClient, target_entity, user_entity):
-    """
-    Returns (success: bool, code: str)
-      codes: ok | flood_genuine_<sec> | flood_retry_failed | skip_user:<err> | admin_required | error:<msg>
-    """
+async def attempt_add(client: TelegramClient, target, user):
     if Config.TEST_MODE:
-        logger.info(f"🧪 [DRY RUN] would add user {getattr(user_entity, 'id', '?')} -> {Config.TARGET_GROUP}")
+        logger.info(f"🧪 [DRY] would add {getattr(user, 'id', '?')}")
         await asyncio.sleep(2)
         return True, "ok"
     try:
-        await client(InviteToChannelRequest(target_entity, [user_entity]))
+        await client(InviteToChannelRequest(target, [user]))
         return True, "ok"
     except FloodWaitError as e:
-        if e.seconds > 3600:
-            return False, f"flood_genuine_{e.seconds}"
-        logger.info(f"⏳ Minor FloodWait ({e.seconds}s). Waiting...")
-        await asyncio.sleep(e.seconds + 10)
+        if e.seconds > 1800:
+            return False, f"flood_wait_{e.seconds}"
+        logger.info(f"⏳ FloodWait {e.seconds}s, waiting")
+        await asyncio.sleep(e.seconds + random.randint(10, 30))
         try:
-            await client(InviteToChannelRequest(target_entity, [user_entity]))
+            await client(InviteToChannelRequest(target, [user]))
             return True, "ok"
         except SKIP_USER_ERRORS as ex:
             return False, f"skip_user:{type(ex).__name__}"
         except Exception:
             return False, "flood_retry_failed"
     except PeerFloodError:
-        return False, "flood_genuine_peer"
+        return False, "flood_peer"
     except SKIP_USER_ERRORS as e:
         return False, f"skip_user:{type(e).__name__}"
     except (ChatAdminRequiredError, ChatWriteForbiddenError) as e:
         return False, f"admin_required:{type(e).__name__}"
     except DEAD_SESSION_ERRORS:
-        raise  # upar handle hoga -> mark_dead
+        raise
     except Exception as e:
         return False, f"error:{type(e).__name__}: {e}"
 
 
-# ==========================================
-# 🕷️ PART 5: HARVESTER ENGINE  (checkpointed, bandwidth-aware)
-# ==========================================
-#  harvest_state  { channel, last_msg_id, last_msg_date, last_run, runs, total_users,
-#                   fail_count, disabled, last_error }
-#  system_config  { harvest_last_round }   -> deploy/restart pe round dobara nahi chalta
-#
-#  Bandwidth kaise bachti hai:
-#   1) min_id checkpoint -> sirf NAYE messages download (pehle har round 5000 msgs re-download)
-#   2) queue full (>= QUEUE_TARGET_PENDING) -> harvest hi nahi
-#   3) Mongo batching -> per channel 3 queries (pehle per user 2)
-#   4) round timestamp DB me -> deploy ke turant baad round repeat nahi
-#   5) channel 3x fail -> auto-disable (bekaar retries band)
-
+# ==========================================================
+# HARVESTER (checkpointed, bandwidth-aware) — v4.2 logic
+# ==========================================================
 def _channel_key(ch: str) -> str:
     return str(ch).strip().lstrip("@").lower()
 
@@ -680,174 +663,123 @@ async def get_channel_state(channel: str) -> dict:
     key = _channel_key(channel)
     st = await db.harvest_state.find_one({"channel": key})
     if not st:
-        st = {"channel": key, "last_msg_id": 0, "last_msg_date": None, "last_run": 0,
-              "runs": 0, "total_users": 0, "fail_count": 0, "disabled": False, "last_error": ""}
+        st = {"channel": key, "last_msg_id": 0, "last_msg_date": None, "last_run": 0, "runs": 0,
+              "total_users": 0, "fail_count": 0, "disabled": False, "last_error": ""}
         await db.harvest_state.update_one({"channel": key}, {"$setOnInsert": st}, upsert=True)
     return st
 
 
 async def harvest_channel(client: TelegramClient, account_id: str, channel: str) -> int:
-    """Ek channel: checkpoint se aage ke messages padho, naye users queue me daalo. Returns new-user count."""
     st = await get_channel_state(channel)
     key = st["channel"]
     if st.get("disabled"):
         return 0
-
     last_id = int(st.get("last_msg_id") or 0)
-    first_time = last_id == 0
-    limit = Config.HARVEST_INITIAL_LIMIT if first_time else Config.HARVEST_MAX_NEW_PER_RUN
-
-    # ---- Phase 1: sirf naye messages padho, senders memory me collect karo ----
+    limit = Config.HARVEST_INITIAL_LIMIT if last_id == 0 else Config.HARVEST_MAX_NEW_PER_RUN
     senders: dict[int, User] = {}
-    newest_id, newest_date, msgs_read = last_id, st.get("last_msg_date"), 0
-    async for message in client.iter_messages(channel, limit=limit, min_id=last_id):
-        msgs_read += 1
-        if message.id > newest_id:
-            newest_id, newest_date = message.id, message.date
-        sid = message.sender_id
+    newest_id, newest_date, n = last_id, st.get("last_msg_date"), 0
+    async for m in client.iter_messages(channel, limit=limit, min_id=last_id):
+        n += 1
+        if m.id > newest_id:
+            newest_id, newest_date = m.id, m.date
+        sid = m.sender_id
         if not sid or sid < 0 or sid in senders:
             continue
-        sender = message.sender
-        if sender is None:
-            continue                      # extra API call nahi karenge (bandwidth)
-        if isinstance(sender, User) and not sender.bot and not sender.deleted:
-            senders[sid] = sender
-        if msgs_read % 200 == 0:
-            await asyncio.sleep(1)        # gentle pacing, flood se bachne ke liye
-
-    if not senders:
-        await db.harvest_state.update_one({"channel": key}, {"$set": {
-            "last_msg_id": newest_id, "last_msg_date": newest_date, "last_run": now_ts(),
-            "fail_count": 0, "last_error": ""}, "$inc": {"runs": 1}})
-        logger.info(f"🕷️ {key}: {msgs_read} new msgs, +0 users (checkpoint {last_id}→{newest_id})")
-        return 0
-
-    # ---- Phase 2: 2 batch queries se filter (per-user queries nahi) ----
-    ids = list(senders.keys())
-    known = set()
-    async for d in db.master_blacklist.find({"user_id": {"$in": ids}}, {"user_id": 1}):
-        known.add(d["user_id"])
-    async for d in db.scraped_queue.find({"user_id": {"$in": ids}}, {"user_id": 1}):
-        known.add(d["user_id"])
-
-    docs = []
-    for uid, u in senders.items():
-        if uid in known:
-            continue
-        docs.append({
-            "user_id": uid,
-            "access_hash": getattr(u, "access_hash", None),
-            "username": getattr(u, "username", None),
-            "name": f"{u.first_name or ''} {u.last_name or ''}".strip(),
-            "source_channel": channel,
-            "scraped_by": account_id,
-            "scraped_at": datetime.now(pytz.utc),
-            "status": "pending",
-        })
-
+        s = m.sender
+        if isinstance(s, User) and not s.bot and not s.deleted:
+            senders[sid] = s
+        if n % 200 == 0:
+            await asyncio.sleep(1)
     inserted = 0
-    if docs:
-        try:
-            r = await db.scraped_queue.insert_many(docs, ordered=False)
-            inserted = len(r.inserted_ids)
-        except BulkWriteError as e:        # dup keys (race with another instance) -> count what went in
-            inserted = int(e.details.get("nInserted", 0)) if getattr(e, "details", None) else 0
-        except Exception as e:
-            logger.warning(f"insert_many failed: {type(e).__name__}: {e}")
-
-    # ---- Phase 3: checkpoint save (sirf successful read ke baad) ----
+    if senders:
+        ids = list(senders)
+        known = set()
+        async for d in db.master_blacklist.find({"user_id": {"$in": ids}}, {"user_id": 1}):
+            known.add(d["user_id"])
+        async for d in db.scraped_queue.find({"user_id": {"$in": ids}}, {"user_id": 1}):
+            known.add(d["user_id"])
+        docs = [{"user_id": uid, "access_hash": getattr(u, "access_hash", None), "username": getattr(u, "username", None),
+                 "name": f"{u.first_name or ''} {u.last_name or ''}".strip(), "source_channel": channel,
+                 "scraped_by": account_id, "scraped_at": datetime.now(pytz.utc), "status": "pending"}
+                for uid, u in senders.items() if uid not in known]
+        if docs:
+            try:
+                inserted = len((await db.scraped_queue.insert_many(docs, ordered=False)).inserted_ids)
+            except BulkWriteError as e:
+                inserted = int(e.details.get("nInserted", 0)) if getattr(e, "details", None) else 0
     await db.harvest_state.update_one({"channel": key}, {"$set": {
-        "last_msg_id": newest_id, "last_msg_date": newest_date, "last_run": now_ts(),
-        "fail_count": 0, "last_error": ""}, "$inc": {"runs": 1, "total_users": inserted}})
-    logger.info(f"🕷️ {key}: {msgs_read} new msgs, {len(senders)} senders, +{inserted} new users "
-                f"(checkpoint {last_id}→{newest_id})")
+        "last_msg_id": newest_id, "last_msg_date": newest_date, "last_run": now_ts(), "fail_count": 0, "last_error": ""},
+        "$inc": {"runs": 1, "total_users": inserted}})
+    logger.info(f"🕷️ {key}: {n} new msgs, +{inserted} users (ckpt {last_id}→{newest_id})")
     return inserted
 
 
 async def mark_channel_failed(channel: str, err: str):
     key = _channel_key(channel)
-    st = await db.harvest_state.find_one_and_update(
-        {"channel": key},
+    st = await db.harvest_state.find_one_and_update({"channel": key},
         {"$inc": {"fail_count": 1}, "$set": {"last_error": err[:200], "last_run": now_ts()}},
         upsert=True, return_document=ReturnDocument.AFTER)
     if st and st.get("fail_count", 0) >= Config.CHANNEL_FAIL_LIMIT and not st.get("disabled"):
         await db.harvest_state.update_one({"channel": key}, {"$set": {"disabled": True}})
-        logger.error(f"🚫 Channel {key} DISABLED after {Config.CHANNEL_FAIL_LIMIT} failures: {err[:100]}")
-        await notify_admin(f"🚫 Source channel `{key}` disable kar diya ({Config.CHANNEL_FAIL_LIMIT}x fail):\n{err[:150]}\n\n`channel enable {key}` se wapas on karo.")
-
-
-async def harvest_round(client: TelegramClient, account_id: str, channels: list[str]) -> int:
-    total = 0
-    for channel in channels:
-        try:
-            total += await harvest_channel(client, account_id, channel)
-            await asyncio.sleep(random.randint(3, 8))       # channels ke beech gap
-        except FloodWaitError as e:
-            logger.warning(f"Harvester FloodWait {e.seconds}s on {channel}; skipping rest of round")
-            await asyncio.sleep(min(e.seconds, 300))
-            break
-        except DEAD_SESSION_ERRORS:
-            raise
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            logger.warning(f"Harvester channel {channel} failed: {err}")
-            await mark_channel_failed(channel, err)
-    return total
+        await notify_admin(f"🚫 Channel `{key}` disabled ({Config.CHANNEL_FAIL_LIMIT}x fail): {err[:120]}\n`channel enable {key}`")
 
 
 async def harvester_engine():
-    logger.info("🕷️ Harvester engine started")
+    logger.info("🕷️ Harvester started")
     while is_engine_running:
         try:
             if await is_paused():
                 await asyncio.sleep(60)
                 continue
-
             cfg = await db.system_config.find_one({"_id": "config"}) or {}
             channels = cfg.get("source_channels", [])
             if not channels:
-                logger.info("Harvester: no source_channels configured")
                 await asyncio.sleep(300)
                 continue
-
-            # (a) Round interval DB me — deploy/restart pe repeat nahi
-            last_round = float(cfg.get("harvest_last_round") or 0)
-            wait = Config.HARVEST_INTERVAL_SECONDS - (now_ts() - last_round)
+            wait = Config.HARVEST_INTERVAL_SECONDS - (now_ts() - float(cfg.get("harvest_last_round") or 0))
             if wait > 0:
                 await asyncio.sleep(min(wait, 600))
                 continue
-
-            # (b) Queue full? to harvest skip (sabse bada bandwidth saver)
             pending = await db.scraped_queue.count_documents({"status": "pending"})
             if pending >= Config.QUEUE_TARGET_PENDING:
-                logger.info(f"🕷️ Queue has {pending} pending (target {Config.QUEUE_TARGET_PENDING}). Skipping harvest, check in 30 min")
+                logger.info(f"🕷️ Queue {pending} ≥ {Config.QUEUE_TARGET_PENDING}. Skip harvest, recheck 30 min")
                 await db.system_config.update_one({"_id": "config"}, {"$set": {"harvest_last_round": now_ts() - Config.HARVEST_INTERVAL_SECONDS + 1800}})
                 await asyncio.sleep(1800)
                 continue
-
-            account = await claim_account({"status": {"$in": ["ready", "cooling"]}}, sort_field="last_harvest_time")
+            # limited/flagged accounts ko harvest me PREFER karo (unka add band hai, ye kaam de sakte hain)
+            account = await claim_account({"state": {"$in": [STATE_LIMITED, STATE_FLAGGED]}}, "last_harvest_time") \
+                or await claim_account({"state": {"$in": list(HARVEST_CAPABLE)}}, "last_harvest_time")
             if not account:
-                logger.info("Harvester: no free account, retry in 5 min")
                 await asyncio.sleep(300)
                 continue
-
-            acc_id = account["account_id"]
-            logger.info(f"🕷️ Harvester round using {acc_id} | pending={pending}")
-            client = make_client(account["session_string"], acc_id)
-            hb = asyncio.create_task(lock_heartbeat(acc_id))
+            acc = account["account_id"]
+            logger.info(f"🕷️ Harvest round via {acc} ({account.get('state')}) | pending={pending}")
+            client = make_client(account["session_string"], acc)
+            hb = asyncio.create_task(lock_heartbeat(acc))
             try:
-                if not await safe_connect(client, acc_id):
+                await client.connect()
+                if not await client.is_user_authorized():
+                    await mark_session_dead(acc, "unauthorized")
                     continue
-                added = await harvest_round(client, acc_id, channels)
-                await db.accounts_pool.update_one(
-                    {"account_id": acc_id},
-                    {"$set": {"last_harvest_time": now_ts()}, "$inc": {"total_harvested": added}})
+                total = 0
+                for ch in channels:
+                    try:
+                        total += await harvest_channel(client, acc, ch)
+                        await asyncio.sleep(random.randint(3, 8))
+                    except FloodWaitError as e:
+                        await asyncio.sleep(min(e.seconds, 300))
+                        break
+                    except DEAD_SESSION_ERRORS:
+                        raise
+                    except Exception as e:
+                        await mark_channel_failed(ch, f"{type(e).__name__}: {e}")
+                await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"last_harvest_time": now_ts()}, "$inc": {"total_harvested": total}})
                 await db.system_config.update_one({"_id": "config"}, {"$set": {"harvest_last_round": now_ts()}})
-                logger.info(f"🕷️ Round done: +{added} users. Next in {Config.HARVEST_INTERVAL_SECONDS // 60} min")
+                logger.info(f"🕷️ Round done +{total}. Next in {Config.HARVEST_INTERVAL_SECONDS // 60} min")
             except DEAD_SESSION_ERRORS as e:
-                await mark_dead(acc_id, f"{type(e).__name__}: {e}")
+                await mark_session_dead(acc, type(e).__name__)
             except Exception as e:
-                logger.error(f"Harvester error ({acc_id}): {type(e).__name__}: {e}")
+                logger.error(f"Harvester ({acc}): {type(e).__name__}: {e}")
                 await asyncio.sleep(120)
             finally:
                 hb.cancel()
@@ -855,201 +787,156 @@ async def harvester_engine():
                     await client.disconnect()
                 except Exception:
                     pass
-                await release_account(acc_id)
-
+                await release_account(acc)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Harvester loop error: {type(e).__name__}: {e}")
+            logger.error(f"Harvester loop: {type(e).__name__}: {e}")
             await asyncio.sleep(60)
-    logger.info("🕷️ Harvester engine stopped")
 
 
-# ==========================================
-# 💉 PART 6: INJECTOR ENGINE (ROUND-ROBIN)
-# ==========================================
-async def inject_batch(client: TelegramClient, acc_id: str, account: dict) -> tuple[int, bool]:
-    """
-    Returns (successful_adds, account_cooled)
-    """
-    target_entity = await join_target(client)
-    remaining = Config.MAX_ADDS_PER_DAY - account.get("daily_adds", 0)
+# ==========================================================
+# INJECTOR — human-paced, tier-aware
+# ==========================================================
+async def pick_injector_account():
+    """Add-capable, apni daily tier limit ke andar, 45 min se use nahi hua. Sabse purana pehle."""
+    now = now_ts()
+    q = {"state": {"$in": [STATE_ACTIVE, STATE_PROBATION]},
+         "last_used": {"$not": {"$gt": now - Config.SAME_ACCOUNT_MIN_GAP}},
+         "$expr": {"$lt": [{"$ifNull": ["$daily_adds", 0]},
+                           {"$switch": {"branches": [{"case": {"$eq": ["$tier", t]}, "then": d} for t, d in Config.TIER_DAILY.items()],
+                                        "default": Config.TIER_DAILY[1]}}]}}
+    return await claim_account(q, "last_used")
+
+
+async def inject_session(client: TelegramClient, acc: str, account: dict) -> tuple[int, str]:
+    """Ek connect = max ADDS_PER_SESSION adds (tier-1 = 1). Returns (adds, outcome)."""
+    target = await join_target(client)
+    tier = account.get("tier", 2)
+    per_session = min(Config.ADDS_PER_SESSION, Config.TIER_BATCH.get(tier, 2))
+    daily_left = Config.TIER_DAILY.get(tier, 2) - account.get("daily_adds", 0)
     global_left = Config.GLOBAL_MAX_ADDS_PER_DAY - await global_adds_today()
-    batch_limit = max(0, min(Config.MICRO_BATCH_SIZE, remaining, global_left))
-    success_count = 0
-
-    for _ in range(batch_limit):
-        user_doc = await db.scraped_queue.find_one_and_update(
-            {"status": "pending"},
-            {"$set": {"status": "processing", "processing_at": now_ts(), "processing_by": acc_id}},
-            sort=[("_id", ASCENDING)],
-        )
-        if not user_doc:
-            logger.info("💉 Queue empty")
-            break
-
-        uid = user_doc["user_id"]
-
+    todo = max(0, min(per_session, daily_left, global_left))
+    done = 0
+    for i in range(todo):
+        doc = await db.scraped_queue.find_one_and_update(
+            {"status": "pending"}, {"$set": {"status": "processing", "processing_at": now_ts(), "processing_by": acc}},
+            sort=[("_id", ASCENDING)])
+        if not doc:
+            return done, "queue_empty"
+        uid = doc["user_id"]
         if await db.master_blacklist.find_one({"user_id": uid}):
-            await db.scraped_queue.update_one({"_id": user_doc["_id"]}, {"$set": {"status": "added"}})
+            await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "added"}})
             continue
-
-        user_entity = await resolve_entity(client, user_doc)
-        if not user_entity:
-            await db.scraped_queue.update_one(
-                {"_id": user_doc["_id"]},
-                {"$set": {"status": "invalid", "reason": "unresolvable"}},
-            )
-            logger.info(f"⚪ {uid} unresolvable, marked invalid")
+        # human: thoda "dekhna" pehle
+        await asyncio.sleep(random.uniform(3, 9))
+        user = await resolve_entity(client, doc)
+        if not user:
+            await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "invalid", "reason": "unresolvable"}})
             continue
-
-        success, code = await attempt_add(client, target_entity, user_entity)
-
-        if success and Config.TEST_MODE:
-            success_count += 1
-            await db.scraped_queue.update_one(
-                {"_id": user_doc["_id"]},
-                {"$set": {"status": "pending"}, "$unset": {"processing_at": "", "processing_by": ""}},
-            )
-            await asyncio.sleep(5)
-            continue
-
-        if success:
-            success_count += 1
+        ok, code = await attempt_add(client, target, user)
+        if ok:
+            done += 1
             try:
-                await db.master_blacklist.insert_one({"user_id": uid, "added_by": acc_id, "added_at": now_ts()})
+                await db.master_blacklist.insert_one({"user_id": uid, "added_by": acc, "added_at": now_ts()})
             except Exception:
-                pass  # duplicate key = already there
-            await db.scraped_queue.update_one(
-                {"_id": user_doc["_id"]},
-                {"$set": {"status": "added", "added_by": acc_id, "added_at": now_ts()}},
-            )
-            # TURANT count karo — deploy/crash beech me ho to bhi 15/day limit sahi rahe
-            await db.accounts_pool.update_one(
-                {"account_id": acc_id},
-                {"$inc": {"daily_adds": 1, "total_added": 1}, "$set": {"last_add_time": now_ts()}},
-            )
-            delay = random.randint(*Config.ADD_DELAY_RANGE)
-            logger.info(f"✅ [{acc_id}] Added {uid}. Sleeping {delay}s")
-            await asyncio.sleep(delay)
+                pass
+            await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "added", "added_by": acc, "added_at": now_ts()}})
+            await db.accounts_pool.update_one({"account_id": acc}, {"$inc": {"daily_adds": 1, "total_added": 1}, "$set": {"last_used": now_ts()}})
+            await log_event("add", acc, user_id=uid)
+            logger.info(f"✅ [{acc} T{tier}] added {uid} ({done}/{todo})")
+            if i < todo - 1:
+                gap = rnd(Config.IN_SESSION_GAP)
+                logger.info(f"   ⏸ in-session gap {gap}s")
+                await asyncio.sleep(gap)
             continue
-
-        # ---- failure paths ----
         if code.startswith("skip_user"):
-            await db.scraped_queue.update_one(
-                {"_id": user_doc["_id"]}, {"$set": {"status": "invalid", "reason": code}}
-            )
-            logger.info(f"⚪ {uid} skipped: {code}")
-            await asyncio.sleep(random.randint(5, 15))
+            await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "invalid", "reason": code}})
+            await asyncio.sleep(random.uniform(5, 15))
             continue
-
-        # baaki sab: user wapas pending
-        await db.scraped_queue.update_one(
-            {"_id": user_doc["_id"]},
-            {"$set": {"status": "pending"}, "$unset": {"processing_at": "", "processing_by": ""}},
-        )
-        logger.warning(f"❌ [{acc_id}] Add failed for {uid}: {code}")
-
-        if code.startswith("flood_genuine"):
-            await handle_flood(client, acc_id, code)
-            return success_count, True
+        await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "pending"}, "$unset": {"processing_at": "", "processing_by": ""}})
+        logger.warning(f"❌ [{acc}] {uid}: {code}")
+        if code.startswith("flood"):
+            await handle_flood(client, acc, code)
+            return done, "flood"
         if code.startswith("admin_required"):
-            # is account ko target me add permission nahi — baaki batch waste mat karo
-            await cooldown_account(acc_id, 6, code)
-            return success_count, True
-
-    return success_count, False
+            await set_state(acc, STATE_RESTING, code, rest_until=now_ts() + 6 * 3600)
+            return done, "admin_required"
+        return done, "error"
+    return done, "ok"
 
 
 async def injector_engine():
-    logger.info("💉 Injector engine started")
+    logger.info("💉 Injector started (human-paced)")
     while is_engine_running:
         try:
-            if await is_paused():
-                await asyncio.sleep(60)
-                continue
-
-            if not in_active_hours():
-                logger.info(f"🌙 Outside ACTIVE_HOURS_IST={Config.ACTIVE_HOURS_IST}. Injector sleeping 10 min")
+            await lifecycle_tick()
+            if await is_paused() or not in_active_hours():
                 await asyncio.sleep(600)
                 continue
-
-            await wake_cooled_accounts()
-            await cleanup_stale_processing()
-
             if await breaker_active():
-                logger.info("🔌 Circuit breaker active. Injector sleeping 30 min")
+                logger.info("🔌 breaker active, sleeping 30 min")
                 await asyncio.sleep(1800)
                 continue
-
             today = await global_adds_today()
             if today >= Config.GLOBAL_MAX_ADDS_PER_DAY:
-                logger.info(f"🧯 Global cap reached ({today}/{Config.GLOBAL_MAX_ADDS_PER_DAY} in 24h). Sleeping 1h")
+                logger.info(f"🧯 global cap {today}/{Config.GLOBAL_MAX_ADDS_PER_DAY}; sleeping 1h")
                 await asyncio.sleep(3600)
                 continue
-
-            pending = await db.scraped_queue.count_documents({"status": "pending"})
-            if pending == 0:
-                logger.info("💉 Nothing pending in queue. Sleeping 10 min")
+            if await db.scraped_queue.count_documents({"status": "pending"}) == 0:
                 await asyncio.sleep(600)
                 continue
-
-            # ROUND-ROBIN: sabse purana last_add_time (null pehle) — atomic lock ke saath
-            account = await claim_account(
-                {"status": "ready", "daily_adds": {"$lt": Config.MAX_ADDS_PER_DAY}},
-                sort_field="last_add_time",
-            )
-            if not account:
-                logger.info("😴 No free/ready account (all cooling, locked or at limit). Sleeping 1h")
-                await asyncio.sleep(3600)
+            if random.random() < Config.IDLE_TURN_PROB:
+                z = rnd(Config.IDLE_TURN_SLEEP)
+                logger.info(f"🧘 idle turn {z}s (human irregularity)")
+                await asyncio.sleep(z)
                 continue
-
-            acc_id = account["account_id"]
-            logger.info(f"🔄 Picked {acc_id} | adds today: {account.get('daily_adds', 0)}")
-            client = make_client(account["session_string"], acc_id)
-            hb = asyncio.create_task(lock_heartbeat(acc_id))
+            account = await pick_injector_account()
+            if not account:
+                logger.info("😴 no eligible account right now (tier caps / 45-min gap / states). Sleeping 15 min")
+                await asyncio.sleep(900)
+                continue
+            acc = account["account_id"]
+            logger.info(f"🔄 {acc} [T{account.get('tier', 2)} {account.get('state')}] daily {account.get('daily_adds', 0)}/{Config.TIER_DAILY.get(account.get('tier', 2), 2)} | global {today}/{Config.GLOBAL_MAX_ADDS_PER_DAY}")
+            client = make_client(account["session_string"], acc)
+            hb = asyncio.create_task(lock_heartbeat(acc))
             try:
-                if not await safe_connect(client, acc_id):
+                await client.connect()
+                if not await client.is_user_authorized():
+                    await mark_session_dead(acc, "unauthorized")
                     continue
-
-                adds, cooled = await inject_batch(client, acc_id, account)
-
-                # last_add_time set karo (0 adds pe bhi) taaki round-robin aage badhe
-                await db.accounts_pool.update_one({"account_id": acc_id}, {"$set": {"last_add_time": now_ts()}})
-                fresh = await db.accounts_pool.find_one({"account_id": acc_id}, {"daily_adds": 1}) or {}
-                new_total = fresh.get("daily_adds", 0)
-
-                if not cooled and new_total >= Config.MAX_ADDS_PER_DAY:
-                    await cooldown_account(acc_id, Config.COOLDOWN_HOURS, f"Target {Config.MAX_ADDS_PER_DAY} completed")
-
+                adds, outcome = await inject_session(client, acc, account)
+                await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"last_used": now_ts(), "last_outcome": outcome}})
+                if outcome in ("ok", "queue_empty", "error") and adds > 0 and account.get("state") == STATE_ACTIVE and not account.get("clean_since"):
+                    await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"clean_since": now_ts()}})
+                logger.info(f"   session done: {adds} adds, outcome={outcome}")
             except DEAD_SESSION_ERRORS as e:
-                await mark_dead(acc_id, f"{type(e).__name__}: {e}")
+                await mark_session_dead(acc, type(e).__name__)
             except Exception as e:
-                logger.error(f"⚠️ Injector crash for {acc_id}: {type(e).__name__}: {e}")
+                logger.error(f"⚠️ injector {acc}: {type(e).__name__}: {e}")
             finally:
                 hb.cancel()
                 try:
                     await client.disconnect()
                 except Exception:
                     pass
-                await release_account(acc_id)
-
-            await asyncio.sleep(random.randint(*Config.ACCOUNT_GAP_RANGE))
-
+                await release_account(acc)
+            gap = rnd(Config.BETWEEN_ACCOUNTS_GAP)
+            logger.info(f"⏭ next account in {gap}s")
+            await asyncio.sleep(gap)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Injector loop error: {type(e).__name__}: {e}")
+            logger.error(f"Injector loop: {type(e).__name__}: {e}")
             await asyncio.sleep(60)
-    logger.info("💉 Injector engine stopped")
 
 
-# ==========================================
-# 🤖 PART 7: ADMIN BOT
-# ==========================================
-admin_client = None  # type: TelegramClient | None
+# ==========================================================
+# ADMIN BOT
+# ==========================================================
+admin_client = None
 if Config.BOT_TOKEN and Config.ENABLE_ADMIN_BOT and Config.API_ID and Config.API_HASH:
-    admin_client = TelegramClient(StringSession(), Config.API_ID, Config.API_HASH)  # in-memory, no file
+    admin_client = TelegramClient(StringSession(), Config.API_ID, Config.API_HASH)
 
 
 async def notify_admin(text: str):
@@ -1058,220 +945,189 @@ async def notify_admin(text: str):
     try:
         await admin_client.send_message(Config.ADMIN_USERNAME, text)
     except Exception as e:
-        logger.warning(f"notify_admin failed: {e}")
+        logger.warning(f"notify_admin: {e}")
 
 
 async def _is_admin(event) -> bool:
     if not Config.ADMIN_USERNAME:
         return False
     admin = Config.ADMIN_USERNAME.lstrip("@").lower()
-    sender = event.sender or await event.get_sender()
-    if sender is None:
+    s = event.sender or await event.get_sender()
+    if s is None:
         return False
-    if admin.isdigit() and str(sender.id) == admin:
+    if admin.isdigit() and str(s.id) == admin:
         return True
-    return bool(getattr(sender, "username", None)) and sender.username.lower() == admin
+    return bool(getattr(s, "username", None)) and s.username.lower() == admin
 
 
-async def build_status_text() -> str:
-    pool = db.accounts_pool
-    ready = await pool.count_documents({"status": "ready"})
-    cooling = await pool.count_documents({"status": "cooling"})
-    dead = await pool.count_documents({"status": "dead"})
-    locked = await pool.count_documents({"locked_by": {"$nin": [None, ""]}})
-    pending = await db.scraped_queue.count_documents({"status": "pending"})
-    added = await db.master_blacklist.count_documents({})
-    paused = await is_paused()
+STATE_ICON = {STATE_ACTIVE: "🟢", STATE_PROBATION: "🟡", STATE_RESTING: "💤", STATE_LIMITED: "⛔",
+              STATE_FLAGGED: "🚩", STATE_DEAD: "💀"}
+
+
+async def build_status() -> str:
     cfg = await db.system_config.find_one({"_id": "config"}) or {}
     br = float(cfg.get("breaker_until") or 0)
-    br_txt = datetime.fromtimestamp(br, Config.IST).strftime("%d %b %H:%M IST") if br > now_ts() else "off"
     today = await global_adds_today()
-    lines = [
-        f"📊 **Engine {VERSION}**",
-        f"⏸ Paused: {'YES' if paused else 'no'}   🔌 Breaker: {br_txt}",
-        f"📈 Adds last 24h: {today}/{Config.GLOBAL_MAX_ADDS_PER_DAY} (global cap)",
-        "",
-        f"🟢 Ready: {ready}   ❄️ Cooling: {cooling}   💀 Dead: {dead}   🔒 In use: {locked}",
-        f"📥 Pending queue: {pending} (harvest target {Config.QUEUE_TARGET_PENDING})",
-        f"✅ Total added: {added}",
-        "",
-    ]
-    async for a in pool.find({}, {"session_string": 0}).sort("account_id", 1):
-        cd = a.get("cooldown_until") or 0
-        cd_txt = ""
-        if a.get("status") == "cooling" and cd:
-            hrs = max(0, (cd - now_ts()) / 3600)
-            cd_txt = f" ({hrs:.1f}h left)"
-        lock_txt = f" 🔒{a.get('locked_by')}" if a.get("locked_by") else ""
-        lim = a.get("limited_until")
-        lim_txt = " ⛔" + datetime.fromtimestamp(lim, Config.IST).strftime("till %d %b %H:%M") if lim and lim > now_ts() else ""
-        strikes = f" strikes={a['limit_strikes']}" if a.get("limit_strikes") else ""
-        lines.append(f"• `{a['account_id']}` {a.get('status')}{cd_txt}{lim_txt} adds={a.get('daily_adds', 0)}{strikes}{lock_txt}")
+    counts = {}
+    async for a in db.accounts_pool.find({}, {"state": 1, "duplicate": 1}):
+        k = "dup" if a.get("duplicate") else a.get("state", "?")
+        counts[k] = counts.get(k, 0) + 1
+    pending = await db.scraped_queue.count_documents({"status": "pending"})
+    lines = [f"📊 **Engine {VERSION}**",
+             f"⏸ {'PAUSED' if await is_paused() else 'running'} | 🔌 breaker {ist(br) if br > now_ts() else 'off'} | 🕐 {'active hrs' if in_active_hours() else 'night'}",
+             f"📈 adds 24h: {today}/{Config.GLOBAL_MAX_ADDS_PER_DAY} | 📥 pending {pending} | ✅ total {await db.master_blacklist.count_documents({})}",
+             " ".join(f"{STATE_ICON.get(k, '•')}{k}:{v}" for k, v in sorted(counts.items())), ""]
+    async for a in db.accounts_pool.find({}, {"session_string": 0}).sort("account_id", 1):
+        st = a.get("state", "?")
+        if a.get("duplicate"):
+            lines.append(f"👥 `{a['account_id']}` DUPLICATE of {a.get('duplicate_of')} — delete karo")
+            continue
+        extra = ""
+        if st == STATE_LIMITED:
+            extra = f" till {ist(a.get('limited_until'))}"
+        elif st == STATE_RESTING:
+            extra = f" till {ist(a.get('rest_until'))}"
+        elif st == STATE_FLAGGED:
+            extra = f" recheck {ist(a.get('flagged_recheck_at'))}"
+        elif st == STATE_PROBATION:
+            extra = f" till {ist(a.get('probation_until'))}"
+        t = a.get("tier", 2)
+        lock = f" 🔒" if a.get("locked_by") else ""
+        lines.append(f"{STATE_ICON.get(st, '•')} `{a['account_id']}` {st}{extra} | T{t} {a.get('daily_adds', 0)}/{Config.TIER_DAILY.get(t, 2)} | strikes {a.get('strikes', 0)}{lock}")
     return "\n".join(lines)
 
 
 if admin_client:
-
     @admin_client.on(events.NewMessage(incoming=True))
-    async def admin_bot_handler(event):
+    async def admin_handler(event):
         if not await _is_admin(event):
             return
-        cmd = (event.raw_text or "").strip().lower()
-        parts = cmd.split()
+        parts = (event.raw_text or "").strip().lower().split()
         if not parts:
             return
-
-        if parts[0] == "status":
-            await event.reply(await build_status_text())
-
-        elif parts[0] == "pause":
+        c = parts[0]
+        if c == "status":
+            await event.reply(await build_status())
+        elif c == "pause":
             await db.system_config.update_one({"_id": "config"}, {"$set": {"is_paused": True}})
-            await event.reply("⏸ Engine paused (current batch will finish).")
-
-        elif parts[0] == "resume":
+            await event.reply("⏸ paused")
+        elif c == "resume":
             await db.system_config.update_one({"_id": "config"}, {"$set": {"is_paused": False}})
-            await event.reply("▶️ Engine resumed.")
-
-        elif parts[0] == "dead":
-            dead = [a["account_id"] async for a in db.accounts_pool.find({"status": "dead"}, {"account_id": 1})]
-            await event.reply("💀 Dead accounts:\n" + ("\n".join(f"• `{d}`" for d in dead) if dead else "none"))
-
-        elif parts[0] == "unlock":
-            r = await db.accounts_pool.update_many({}, {"$set": {"locked_by": None, "locked_at": 0}})
-            await event.reply(f"🔓 Force-unlocked {r.modified_count} account(s). (Sirf tab use karo jab koi instance crash hua ho)")
-
-        elif parts[0] == "revive" and len(parts) == 2:
-            r = await db.accounts_pool.update_one(
-                {"account_id": parts[1]},
-                {"$set": {"status": "ready", "daily_adds": 0, "cooldown_until": 0, "last_error": ""}},
-            )
-            await event.reply("✅ Revived" if r.matched_count else "❌ account_id not found")
-
-        elif parts[0] == "spamcheck":
-            await event.reply("🩺 SpamBot sweep started for all accounts (2-5 min)...")
+            await event.reply("▶️ resumed")
+        elif c == "spamcheck":
+            await event.reply("🩺 SpamBot sweep on all accounts (3-6 min)…")
             await db.accounts_pool.update_many({}, {"$unset": {"spambot_checked_at": ""}})
-            try:
-                await spambot_health_sweep()
-            except Exception as e:
-                await event.reply(f"sweep error: {e}")
-                return
-            lines = ["🩺 **SpamBot results**"]
-            async for a in db.accounts_pool.find({}, {"account_id": 1, "status": 1, "last_error": 1, "spambot_text": 1}).sort("account_id", 1):
-                t = (a.get("spambot_text") or "")[:70].replace("\n", " ")
-                lines.append(f"• `{a['account_id']}` {a.get('status')} — {t}")
-            await event.reply("\n".join(lines))
-
-        elif parts[0] == "breaker" and len(parts) == 2 and parts[1] == "reset":
+            await health_sweep()
+            await event.reply(await build_status())
+        elif c == "breaker" and len(parts) == 2 and parts[1] == "reset":
             await db.system_config.update_one({"_id": "config"}, {"$set": {"breaker_until": 0, "flood_events": []}})
-            await event.reply("🔌 Breaker reset. Injector resumes on next loop.")
-
-        elif parts[0] == "harvest":
+            await event.reply("🔌 breaker reset")
+        elif c == "revive" and len(parts) == 2:
+            r = await db.accounts_pool.update_one({"account_id": parts[1]}, {"$set": {
+                "state": STATE_PROBATION, "tier": 1, "probation_until": now_ts() + Config.PROBATION_DAYS * 86400,
+                "rest_until": 0, "limited_until": 0, "daily_adds": 0, "state_reason": "manual revive"},
+                "$unset": {"tg_user_id": "", "duplicate": "", "duplicate_of": ""}})
+            await event.reply("✅ revived → probation (identity re-check next start)" if r.matched_count else "❌ not found")
+        elif c == "tier" and len(parts) == 3 and parts[2].isdigit():
+            r = await db.accounts_pool.update_one({"account_id": parts[1]}, {"$set": {"tier": max(1, min(4, int(parts[2])))}})
+            await event.reply("✅ tier set" if r.matched_count else "❌ not found")
+        elif c == "cap" and len(parts) == 2 and parts[1].isdigit():
+            Config.GLOBAL_MAX_ADDS_PER_DAY = int(parts[1])
+            await event.reply(f"✅ global cap = {Config.GLOBAL_MAX_ADDS_PER_DAY}/day (is process ke liye; permanent ke liye env)")
+        elif c == "delete" and len(parts) == 2:
+            r = await db.accounts_pool.delete_one({"account_id": parts[1]})
+            await event.reply("🗑 deleted" if r.deleted_count else "❌ not found")
+        elif c == "unlock":
+            r = await db.accounts_pool.update_many({}, {"$set": {"locked_by": None, "locked_at": 0}})
+            await event.reply(f"🔓 {r.modified_count} unlocked")
+        elif c == "events":
+            n = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 15
+            lines = ["🧾 **Recent events**"]
+            async for e in db.events.find().sort("t", -1).limit(n):
+                lines.append(f"{ist(e['t'])} {e['kind']} `{e.get('acc', '')}` {e.get('state', '') or e.get('code', '') or e.get('user_id', '')} {e.get('verdict', '')}")
+            await event.reply("\n".join(lines))
+        elif c == "harvest":
             if len(parts) == 2 and parts[1] == "now":
                 await db.system_config.update_one({"_id": "config"}, {"$set": {"harvest_last_round": 0}})
-                await event.reply("🕷️ Next harvest round will start within 10 min.")
+                await event.reply("🕷️ next round within 10 min")
                 return
             cfg = await db.system_config.find_one({"_id": "config"}) or {}
             last = float(cfg.get("harvest_last_round") or 0)
-            ago = f"{(now_ts() - last) / 60:.0f} min ago" if last else "never"
             pending = await db.scraped_queue.count_documents({"status": "pending"})
-            lines = [f"🕷️ **Harvest** — last round {ago} | pending {pending}/{Config.QUEUE_TARGET_PENDING}", ""]
+            lines = [f"🕷️ last round {ist(last) if last else 'never'} | pending {pending}/{Config.QUEUE_TARGET_PENDING}", ""]
             async for st in db.harvest_state.find().sort("channel", 1):
-                flag = "🚫" if st.get("disabled") else "•"
-                lr = f"{(now_ts() - st['last_run']) / 60:.0f}m" if st.get("last_run") else "-"
-                lines.append(f"{flag} `{st['channel']}` ckpt={st.get('last_msg_id', 0)} users={st.get('total_users', 0)} "
-                             f"runs={st.get('runs', 0)} last={lr} fails={st.get('fail_count', 0)}")
+                lines.append(f"{'🚫' if st.get('disabled') else '•'} `{st['channel']}` ckpt={st.get('last_msg_id', 0)} users={st.get('total_users', 0)} runs={st.get('runs', 0)} fails={st.get('fail_count', 0)}")
             await event.reply("\n".join(lines))
-
-        elif parts[0] == "channel" and len(parts) == 3:
-            action, key = parts[1], _channel_key(parts[2])
-            if action == "add":
+        elif c == "channel" and len(parts) == 3:
+            act, key = parts[1], _channel_key(parts[2])
+            if act == "add":
                 await db.system_config.update_one({"_id": "config"}, {"$addToSet": {"source_channels": parts[2].lstrip("@")}})
-                await event.reply(f"✅ `{key}` added to source_channels")
-            elif action == "remove":
+            elif act == "remove":
                 cfg = await db.system_config.find_one({"_id": "config"}) or {}
-                keep = [c for c in cfg.get("source_channels", []) if _channel_key(c) != key]
-                await db.system_config.update_one({"_id": "config"}, {"$set": {"source_channels": keep}})
-                await event.reply(f"🗑 `{key}` removed")
-            elif action == "enable":
+                await db.system_config.update_one({"_id": "config"}, {"$set": {"source_channels": [x for x in cfg.get("source_channels", []) if _channel_key(x) != key]}})
+            elif act == "enable":
                 await db.harvest_state.update_one({"channel": key}, {"$set": {"disabled": False, "fail_count": 0}})
-                await event.reply(f"✅ `{key}` enabled")
-            elif action == "reset":
+            elif act == "reset":
                 await db.harvest_state.update_one({"channel": key}, {"$set": {"last_msg_id": 0, "disabled": False, "fail_count": 0}})
-                await event.reply(f"🔄 `{key}` checkpoint reset (next run re-reads last {Config.HARVEST_INITIAL_LIMIT} msgs)")
-            else:
-                await event.reply("channel add|remove|enable|reset <name>")
-
-        elif parts[0] in ("help", "/start"):
-            await event.reply(
-                "Commands:\n`status`\n`spamcheck`\n`breaker reset`\n`harvest` / `harvest now`\n`channel add|remove|enable|reset <name>`\n"
-                "`pause` / `resume`\n`dead`\n`revive <account_id>`\n`unlock`"
-            )
+            await event.reply(f"✅ channel {act} {key}")
+        elif c in ("help", "/start"):
+            await event.reply("`status` `spamcheck` `events [n]` `pause` `resume` `breaker reset`\n"
+                              "`revive <id>` `tier <id> <1-4>` `cap <n>` `delete <id>` `unlock`\n"
+                              "`harvest` `harvest now` `channel add|remove|enable|reset <name>`")
 
 
-# ==========================================
-# 🔁 PART 8: KEEP-ALIVE (optional)
-# ==========================================
+# ==========================================================
+# LIFESPAN
+# ==========================================================
 async def self_ping_loop():
     if not Config.SELF_PING_URL:
         return
-    logger.info(f"🔁 Self-ping enabled -> {Config.SELF_PING_URL}")
     while is_engine_running:
         try:
             await asyncio.to_thread(lambda: urllib.request.urlopen(Config.SELF_PING_URL, timeout=20).read())
-        except Exception as e:
-            logger.debug(f"self-ping failed: {e}")
-        await asyncio.sleep(600)  # 10 min (Render 15 min spin-down se pehle)
+        except Exception:
+            pass
+        await asyncio.sleep(600)
 
 
-# ==========================================
-# 🚀 PART 9: LIFESPAN
-# ==========================================
 async def delayed_engine_start():
-    """Port khulne ke baad wait -> tab engines start (deploy-overlap protection jo sach me kaam kare)."""
     try:
         if Config.STARTUP_DELAY > 0:
-            logger.info(f"⏳ Engines start in {Config.STARTUP_DELAY}s (waiting for old instance to die)")
+            logger.info(f"⏳ Engines start in {Config.STARTUP_DELAY}s (old instance dying)")
             await asyncio.sleep(Config.STARTUP_DELAY)
         if not is_engine_running:
             return
-
         if admin_client:
             try:
                 await admin_client.start(bot_token=Config.BOT_TOKEN)
                 background_tasks.append(asyncio.create_task(admin_client.run_until_disconnected()))
                 logger.info("🤖 Admin bot online")
             except Exception as e:
-                logger.error(f"Admin bot failed to start: {e}")
-
+                logger.error(f"Admin bot: {e}")
+        await migrate_legacy_statuses()
+        try:
+            await dedupe_identities()
+        except Exception as e:
+            logger.warning(f"dedupe: {type(e).__name__}: {e}")
         if Config.INSTANCE_ROLE in ("both", "harvester"):
             background_tasks.append(asyncio.create_task(harvester_engine()))
         if Config.INSTANCE_ROLE in ("both", "injector"):
             background_tasks.append(asyncio.create_task(injector_engine()))
-            background_tasks.append(asyncio.create_task(health_sweep_loop()))
+            background_tasks.append(asyncio.create_task(health_loop()))
         background_tasks.append(asyncio.create_task(self_ping_loop()))
-
-        await notify_admin(f"🚀 Instance `{Config.INSTANCE_ID}` started (role={Config.INSTANCE_ROLE})")
+        await notify_admin(f"🚀 `{Config.INSTANCE_ID}` up — {VERSION} (role={Config.INSTANCE_ROLE}, cap {Config.GLOBAL_MAX_ADDS_PER_DAY}/day)")
     except asyncio.CancelledError:
         pass
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global is_engine_running
     await db.connect()
     is_engine_running = True
-
-    # NOTE: yahan koi lock release NAHI — purane process ka lock sirf wo khud (shutdown pe)
-    # chhodega, ya LOCK_TTL ke baad stale maana jayega. Isse deploy-overlap me
-    # naya process kabhi wahi account nahi uthata jo purana abhi use kar raha hai.
-
-    # Engines ko DELAYED background task me start karo, taaki lifespan turant complete ho,
-    # port khule, Render purane process ko kill kare, aur uske baad hi hum Telegram chhuein.
     background_tasks.append(asyncio.create_task(delayed_engine_start()))
-
     yield
-
-    # ---- shutdown ----
-    logger.info("🛑 Shutting down engine...")
+    logger.info("🛑 shutting down")
     is_engine_running = False
     for t in background_tasks:
         t.cancel()
@@ -1286,7 +1142,6 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
     await db.disconnect()
-    logger.info("👋 Shutdown complete")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1300,12 +1155,12 @@ async def root():
 @app.get("/health")
 async def health():
     try:
-        ready = await db.accounts_pool.count_documents({"status": "ready"})
-        cooling = await db.accounts_pool.count_documents({"status": "cooling"})
-        dead = await db.accounts_pool.count_documents({"status": "dead"})
-        pending = await db.scraped_queue.count_documents({"status": "pending"})
-        return {"ok": True, "ready": ready, "cooling": cooling, "dead": dead, "pending": pending,
-                "paused": await is_paused(), "instance": Config.INSTANCE_ID}
+        counts = {}
+        async for a in db.accounts_pool.find({}, {"state": 1}):
+            counts[a.get("state", "?")] = counts.get(a.get("state", "?"), 0) + 1
+        return {"ok": True, "version": VERSION, "states": counts, "adds_24h": await global_adds_today(),
+                "pending": await db.scraped_queue.count_documents({"status": "pending"}),
+                "paused": await is_paused(), "breaker": await breaker_active(), "instance": Config.INSTANCE_ID}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 

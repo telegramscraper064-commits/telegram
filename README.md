@@ -39,13 +39,18 @@ Do Render accounts, **ek time pe sirf ek chalu** — `render_switcher.py` (GitHu
 3. Session `dead` ho jaye → nayi string generate karo → DB me replace → bot pe `revive <account_id>`.
 4. Baar-baar deploy mat karo — har deploy = ek overlap window.
 
-## Limits (main.py `Config`) — v4.3 safe-slow
-8 adds/account/day · **20 adds/day system-wide** (`GLOBAL_MAX_ADDS_PER_DAY`) · 3 per micro-batch · 4-8 min gap · 30h cooldown after cap.
+## v5 — Self-regulating account state machine
+| State | Add | Harvest | Kaise nikle |
+|---|---|---|---|
+| 🟢 active | tier ke hisaab se | ✅ | — |
+| 🟡 probation | 2/din, 1 per session | ✅ | 3 din baad active |
+| 💤 resting | ✗ | ✅ | rest_until pe khud |
+| ⛔ limited | ✗ | ✅ | limited_until + SpamBot verify → probation |
+| 🚩 flagged | ✗ | ✅ | har 24h SpamBot; clear → probation |
+| 💀 session_dead | ✗ | ✗ | nayi string + `revive` |
 
-## SpamBot-aware cooldown (v4.3)
-Flood aate hi usi session se `@SpamBot /start` → jawab parse:
-- `limited until <date>` → exact us time (+1h) tak cooling, `limited_until` + `limit_strikes` DB me, alert
-- `no limits` → account clean, GROUP throttle thi → 6h rest + circuit breaker count
-- `harsh response / some phone numbers` → number flagged → `dead`
-- Circuit breaker: 1h me 2 floods → poora injector 12h pause (`breaker reset` se force-on)
-- Har 12h idle accounts ka SpamBot health-check; `spamcheck` command se on-demand
+Tiers: T1=2/din, T2=4, T3=6, T4=8. Strike → tier−1. 7 din clean → tier+1.
+Pacing: 2 adds/session, 150–200s gap, account switch 3–4 min, same account ≥45 min gap, 15% idle turns, 8–23 IST.
+Global cap 20/din. Startup pe identity dedupe (ek Telegram user ki 2 entries → doosri disable).
+
+Bot: `status` `spamcheck` `events` `pause` `resume` `breaker reset` `revive <id>` `tier <id> <1-4>` `cap <n>` `delete <id>` `harvest` `channel …`
