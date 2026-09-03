@@ -30,6 +30,7 @@ SELF_PING_URL     = https://xyz.onrender.com/       (optional keep-alive)
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 import socket
@@ -79,7 +80,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("engine")
-VERSION = "4.2.0-harvest-checkpoint"   # har release pe badlo -> GET / aur status se verify hota hai kaunsa code live hai
+VERSION = "4.3.0-spambot-aware"   # har release pe badlo -> GET / aur status se verify hota hai kaunsa code live hai
 
 
 class Config:
@@ -106,11 +107,19 @@ class Config:
     SELF_PING_URL = os.getenv("SELF_PING_URL", "").strip()
 
     # Injector rules
-    MAX_ADDS_PER_DAY = 15          # ek account se max
+    MAX_ADDS_PER_DAY = int(os.getenv("MAX_ADDS_PER_DAY", "8"))   # ek account se max (15 pe accounts limited hue)
     MICRO_BATCH_SIZE = 3           # ek baari me kitne add
     COOLDOWN_HOURS = 30            # 15 add ke baad aaram
-    FLOOD_COOLDOWN_HOURS = 30      # genuine flood ke baad aaram
-    ADD_DELAY_RANGE = (90, 150)    # seconds, do adds ke beech
+    FLOOD_COOLDOWN_HOURS = 48      # flood + SpamBot parse fail -> fallback
+    GROUP_THROTTLE_HOURS = 6       # flood aaya par SpamBot bola "no limits" => group-level throttle
+    # Circuit breaker: itne PeerFlood itni der me => poora injector pause
+    BREAKER_WINDOW_SECONDS = 3600
+    BREAKER_FLOOD_COUNT = 2
+    BREAKER_PAUSE_HOURS = 12
+    # System-wide cap: poore setup se ek din me max itne adds (group pe report-rate control)
+    GLOBAL_MAX_ADDS_PER_DAY = int(os.getenv("GLOBAL_MAX_ADDS_PER_DAY", "20"))
+    SPAMBOT_CHECK_INTERVAL_HOURS = 12   # idle accounts ka periodic health check
+    ADD_DELAY_RANGE = (240, 480)   # seconds, do adds ke beech (4-8 min; 90-150 se reports zyada aaye)
     # Injector sirf in IST ghanto me chalega, e.g. "8-23" = 08:00 se 22:59. "0-24" = hamesha
     ACTIVE_HOURS_IST = os.getenv("ACTIVE_HOURS_IST", "0-24").strip()
     ACCOUNT_GAP_RANGE = (15, 30)   # seconds, do accounts ke beech
@@ -170,7 +179,18 @@ def now_ts() -> float:
     return time.time()
 
 
-def make_client(session_string: str) -> TelegramClient:
+_DEVICES = [
+    ("Samsung SM-A515F", "Android 13", "10.14.5"), ("Xiaomi Redmi Note 11", "Android 12", "10.12.0"),
+    ("Google Pixel 6a", "Android 14", "10.15.1"), ("OnePlus Nord CE 2", "Android 13", "10.13.2"),
+    ("Realme RMX3521", "Android 12", "10.11.1"), ("Vivo V2109", "Android 13", "10.14.5"),
+    ("OPPO CPH2239", "Android 12", "10.12.0"), ("Motorola moto g52", "Android 13", "10.13.2"),
+    ("Samsung SM-M336B", "Android 14", "10.15.1"), ("Xiaomi POCO X4 Pro", "Android 13", "10.14.5"),
+]
+
+
+def make_client(session_string: str, account_id: str = "") -> TelegramClient:
+    # Har account ka alag (par stable) device fingerprint — sab "Engine v4" dikhna red flag tha
+    dev, sysv, appv = _DEVICES[sum(map(ord, account_id)) % len(_DEVICES)] if account_id else _DEVICES[0]
     return TelegramClient(
         StringSession(session_string),
         Config.API_ID,
@@ -178,9 +198,11 @@ def make_client(session_string: str) -> TelegramClient:
         connection_retries=3,
         retry_delay=5,
         auto_reconnect=False,      # dead session pe baar-baar reconnect mat karo
-        device_model="Engine v4",
-        system_version="Linux",
-        app_version="4.0",
+        device_model=dev,
+        system_version=sysv,
+        app_version=appv,
+        lang_code="en",
+        system_lang_code="en-IN",
     )
 
 
@@ -315,6 +337,131 @@ async def mark_dead(account_id: str, reason: str):
     )
     logger.error(f"💀 Account {account_id} marked DEAD: {reason}")
     await notify_admin(f"💀 Session DEAD: `{account_id}`\n{reason[:200]}\n\nNayi session string DB me daalo.")
+
+
+SPAMBOT_LIMITED_RE = re.compile(r"limited until (\d{1,2} \w+ \d{4}), (\d{1,2}:\d{2}) UTC", re.I)
+
+
+async def ask_spambot(client: TelegramClient) -> dict:
+    """
+    @SpamBot se account ka asli status. Returns
+      {"verdict": "ok"|"limited"|"harsh_number"|"unknown", "until": ts|None, "text": str}
+    """
+    try:
+        await client.send_message("SpamBot", "/start")
+        await asyncio.sleep(4)
+        msgs = await client.get_messages("SpamBot", limit=3)
+        text = " ".join((m.message or "") for m in msgs if m and not m.out)
+        low = text.lower()
+        if "no limits" in low or "free as a bird" in low:
+            return {"verdict": "ok", "until": None, "text": text[:300]}
+        if "harsh response" in low or "some phone numbers" in low:
+            return {"verdict": "harsh_number", "until": None, "text": text[:300]}
+        m = SPAMBOT_LIMITED_RE.search(text)
+        if m:
+            dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%d %b %Y %H:%M").replace(tzinfo=pytz.utc)
+            return {"verdict": "limited", "until": dt.timestamp(), "text": text[:300]}
+        if "limited" in low:
+            return {"verdict": "limited", "until": None, "text": text[:300]}
+        return {"verdict": "unknown", "until": None, "text": text[:300]}
+    except Exception as e:
+        return {"verdict": "unknown", "until": None, "text": f"spambot check failed: {type(e).__name__}: {e}"}
+
+
+async def handle_flood(client: TelegramClient, account_id: str, code: str):
+    """
+    PeerFlood/genuine flood aaya -> SpamBot se pucho kitni der ka hai -> exact cooldown.
+    Returns verdict string.
+    """
+    info = await ask_spambot(client)
+    v = info["verdict"]
+    if v == "limited" and info["until"]:
+        hrs = max(1.0, (info["until"] - now_ts()) / 3600 + 1)      # +1h buffer
+        until_ist = datetime.fromtimestamp(info["until"], Config.IST).strftime("%d %b %H:%M IST")
+        await db.accounts_pool.update_one({"account_id": account_id}, {"$set": {
+            "status": "cooling", "cooldown_until": info["until"] + 3600, "limited_until": info["until"],
+            "last_error": f"LIMITED till {until_ist}", "spambot_text": info["text"], "spambot_checked_at": now_ts()},
+            "$inc": {"limit_strikes": 1}})
+        logger.warning(f"⛔ {account_id} LIMITED by Telegram till {until_ist} ({hrs:.0f}h). Cooling exactly till then.")
+        await notify_admin(f"⛔ `{account_id}` Telegram-limited till *{until_ist}*\n(reports se). Us waqt tak cooling. "
+                           f"Strike #{(await db.accounts_pool.find_one({'account_id': account_id}) or {}).get('limit_strikes', 1)}")
+    elif v == "harsh_number":
+        await db.accounts_pool.update_one({"account_id": account_id}, {"$set": {
+            "status": "dead", "last_error": "SpamBot: phone number flagged (harsh response)",
+            "spambot_text": info["text"], "spambot_checked_at": now_ts(), "dead_at": now_ts()}})
+        logger.error(f"💀 {account_id}: number flagged by Telegram anti-spam. Marked dead.")
+        await notify_admin(f"💀 `{account_id}` — SpamBot bola number hi flagged hai. Pool se hata do, ye kabhi add nahi kar payega.")
+    elif v == "ok":
+        # Account clean hai -> flood GROUP-level throttle thi. Account thoda aaram, aur breaker trigger
+        await cooldown_account(account_id, Config.GROUP_THROTTLE_HOURS, f"group throttle ({code}); SpamBot: no limits")
+        await db.accounts_pool.update_one({"account_id": account_id}, {"$set": {"spambot_text": info["text"], "spambot_checked_at": now_ts()}})
+        logger.warning(f"🟡 {account_id} flood but SpamBot says clean => GROUP throttle. {Config.GROUP_THROTTLE_HOURS}h rest.")
+    else:
+        await cooldown_account(account_id, Config.FLOOD_COOLDOWN_HOURS, f"{code}; SpamBot unknown")
+        await db.accounts_pool.update_one({"account_id": account_id}, {"$set": {"spambot_text": info["text"], "spambot_checked_at": now_ts()}})
+    await record_flood_event(account_id, v)
+    return v
+
+
+async def record_flood_event(account_id: str, verdict: str):
+    """Circuit breaker: window me itne floods => poora injector pause."""
+    await db.system_config.update_one({"_id": "config"}, {"$push": {"flood_events": {"t": now_ts(), "acc": account_id, "v": verdict}}})
+    cfg = await db.system_config.find_one({"_id": "config"}) or {}
+    recent = [e for e in cfg.get("flood_events", []) if e["t"] > now_ts() - Config.BREAKER_WINDOW_SECONDS]
+    await db.system_config.update_one({"_id": "config"}, {"$set": {"flood_events": recent[-50:]}})
+    if len(recent) >= Config.BREAKER_FLOOD_COUNT and not cfg.get("breaker_until", 0) > now_ts():
+        until = now_ts() + Config.BREAKER_PAUSE_HOURS * 3600
+        await db.system_config.update_one({"_id": "config"}, {"$set": {"breaker_until": until}})
+        until_ist = datetime.fromtimestamp(until, Config.IST).strftime("%d %b %H:%M IST")
+        logger.error(f"🔌 CIRCUIT BREAKER: {len(recent)} floods in {Config.BREAKER_WINDOW_SECONDS // 60} min. Injector paused till {until_ist}")
+        await notify_admin(f"🔌 *CIRCUIT BREAKER*\n{len(recent)} accounts pe flood {Config.BREAKER_WINDOW_SECONDS // 60} min me. "
+                           f"Injector *{until_ist}* tak paused — baaki accounts bacha liye.\n`resume` se force-on kar sakte ho (recommended nahi).")
+
+
+async def breaker_active() -> bool:
+    cfg = await db.system_config.find_one({"_id": "config"}, {"breaker_until": 1}) or {}
+    return float(cfg.get("breaker_until") or 0) > now_ts()
+
+
+async def global_adds_today() -> int:
+    return await db.master_blacklist.count_documents({"added_at": {"$gt": now_ts() - 86400}})
+
+
+async def spambot_health_sweep():
+    """Har 12h: cooling/ready accounts ka SpamBot status refresh (limited ho to exact time set)."""
+    cutoff = now_ts() - Config.SPAMBOT_CHECK_INTERVAL_HOURS * 3600
+    async for a in db.accounts_pool.find({"status": {"$in": ["ready", "cooling"]},
+                                          "$or": [{"spambot_checked_at": {"$exists": False}}, {"spambot_checked_at": {"$lt": cutoff}}]}):
+        acc_id = a["account_id"]
+        locked = await claim_account({"account_id": acc_id}, "last_add_time")
+        if not locked:
+            continue
+        client = make_client(a["session_string"], acc_id)
+        try:
+            if not await safe_connect(client, acc_id):
+                continue
+            info = await ask_spambot(client)
+            upd = {"spambot_text": info["text"], "spambot_checked_at": now_ts()}
+            if info["verdict"] == "limited" and info["until"]:
+                upd.update({"status": "cooling", "cooldown_until": info["until"] + 3600, "limited_until": info["until"],
+                            "last_error": "LIMITED till " + datetime.fromtimestamp(info["until"], Config.IST).strftime("%d %b %H:%M IST")})
+            elif info["verdict"] == "harsh_number":
+                upd.update({"status": "dead", "last_error": "SpamBot: phone number flagged", "dead_at": now_ts()})
+            elif info["verdict"] == "ok" and a.get("limited_until") and a["limited_until"] < now_ts() and a["status"] == "cooling":
+                upd.update({"status": "ready", "cooldown_until": 0, "daily_adds": 0, "last_error": ""})
+            await db.accounts_pool.update_one({"account_id": acc_id}, {"$set": upd})
+            logger.info(f"🩺 SpamBot {acc_id}: {info['verdict']}")
+        except DEAD_SESSION_ERRORS as e:
+            await mark_dead(acc_id, f"{type(e).__name__}: {e}")
+        except Exception as e:
+            logger.warning(f"health sweep {acc_id}: {type(e).__name__}: {e}")
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            await release_account(acc_id)
+        await asyncio.sleep(random.randint(20, 40))
 
 
 async def cooldown_account(account_id: str, hours: float, reason: str):
@@ -671,7 +818,7 @@ async def harvester_engine():
 
             acc_id = account["account_id"]
             logger.info(f"🕷️ Harvester round using {acc_id} | pending={pending}")
-            client = make_client(account["session_string"])
+            client = make_client(account["session_string"], acc_id)
             hb = asyncio.create_task(lock_heartbeat(acc_id))
             try:
                 if not await safe_connect(client, acc_id):
@@ -712,7 +859,8 @@ async def inject_batch(client: TelegramClient, acc_id: str, account: dict) -> tu
     """
     target_entity = await join_target(client)
     remaining = Config.MAX_ADDS_PER_DAY - account.get("daily_adds", 0)
-    batch_limit = min(Config.MICRO_BATCH_SIZE, remaining)
+    global_left = Config.GLOBAL_MAX_ADDS_PER_DAY - await global_adds_today()
+    batch_limit = max(0, min(Config.MICRO_BATCH_SIZE, remaining, global_left))
     success_count = 0
 
     for _ in range(batch_limit):
@@ -788,7 +936,7 @@ async def inject_batch(client: TelegramClient, acc_id: str, account: dict) -> tu
         logger.warning(f"❌ [{acc_id}] Add failed for {uid}: {code}")
 
         if code.startswith("flood_genuine"):
-            await cooldown_account(acc_id, Config.FLOOD_COOLDOWN_HOURS, code)
+            await handle_flood(client, acc_id, code)
             return success_count, True
         if code.startswith("admin_required"):
             # is account ko target me add permission nahi — baaki batch waste mat karo
@@ -814,6 +962,22 @@ async def injector_engine():
             await wake_cooled_accounts()
             await cleanup_stale_processing()
 
+            if await breaker_active():
+                logger.info("🔌 Circuit breaker active. Injector sleeping 30 min")
+                await asyncio.sleep(1800)
+                continue
+
+            today = await global_adds_today()
+            if today >= Config.GLOBAL_MAX_ADDS_PER_DAY:
+                logger.info(f"🧯 Global cap reached ({today}/{Config.GLOBAL_MAX_ADDS_PER_DAY} in 24h). Sleeping 1h")
+                await asyncio.sleep(3600)
+                continue
+
+            try:
+                await spambot_health_sweep()
+            except Exception as e:
+                logger.warning(f"health sweep error: {e}")
+
             pending = await db.scraped_queue.count_documents({"status": "pending"})
             if pending == 0:
                 logger.info("💉 Nothing pending in queue. Sleeping 10 min")
@@ -832,7 +996,7 @@ async def injector_engine():
 
             acc_id = account["account_id"]
             logger.info(f"🔄 Picked {acc_id} | adds today: {account.get('daily_adds', 0)}")
-            client = make_client(account["session_string"])
+            client = make_client(account["session_string"], acc_id)
             hb = asyncio.create_task(lock_heartbeat(acc_id))
             try:
                 if not await safe_connect(client, acc_id):
@@ -908,9 +1072,14 @@ async def build_status_text() -> str:
     pending = await db.scraped_queue.count_documents({"status": "pending"})
     added = await db.master_blacklist.count_documents({})
     paused = await is_paused()
+    cfg = await db.system_config.find_one({"_id": "config"}) or {}
+    br = float(cfg.get("breaker_until") or 0)
+    br_txt = datetime.fromtimestamp(br, Config.IST).strftime("%d %b %H:%M IST") if br > now_ts() else "off"
+    today = await global_adds_today()
     lines = [
         f"📊 **Engine {VERSION}**",
-        f"⏸ Paused: {'YES' if paused else 'no'}",
+        f"⏸ Paused: {'YES' if paused else 'no'}   🔌 Breaker: {br_txt}",
+        f"📈 Adds last 24h: {today}/{Config.GLOBAL_MAX_ADDS_PER_DAY} (global cap)",
         "",
         f"🟢 Ready: {ready}   ❄️ Cooling: {cooling}   💀 Dead: {dead}   🔒 In use: {locked}",
         f"📥 Pending queue: {pending} (harvest target {Config.QUEUE_TARGET_PENDING})",
@@ -924,7 +1093,10 @@ async def build_status_text() -> str:
             hrs = max(0, (cd - now_ts()) / 3600)
             cd_txt = f" ({hrs:.1f}h left)"
         lock_txt = f" 🔒{a.get('locked_by')}" if a.get("locked_by") else ""
-        lines.append(f"• `{a['account_id']}` {a.get('status')}{cd_txt} adds={a.get('daily_adds', 0)}{lock_txt}")
+        lim = a.get("limited_until")
+        lim_txt = " ⛔" + datetime.fromtimestamp(lim, Config.IST).strftime("till %d %b %H:%M") if lim and lim > now_ts() else ""
+        strikes = f" strikes={a['limit_strikes']}" if a.get("limit_strikes") else ""
+        lines.append(f"• `{a['account_id']}` {a.get('status')}{cd_txt}{lim_txt} adds={a.get('daily_adds', 0)}{strikes}{lock_txt}")
     return "\n".join(lines)
 
 
@@ -965,6 +1137,24 @@ if admin_client:
             )
             await event.reply("✅ Revived" if r.matched_count else "❌ account_id not found")
 
+        elif parts[0] == "spamcheck":
+            await event.reply("🩺 SpamBot sweep started for all accounts (2-5 min)...")
+            await db.accounts_pool.update_many({}, {"$unset": {"spambot_checked_at": ""}})
+            try:
+                await spambot_health_sweep()
+            except Exception as e:
+                await event.reply(f"sweep error: {e}")
+                return
+            lines = ["🩺 **SpamBot results**"]
+            async for a in db.accounts_pool.find({}, {"account_id": 1, "status": 1, "last_error": 1, "spambot_text": 1}).sort("account_id", 1):
+                t = (a.get("spambot_text") or "")[:70].replace("\n", " ")
+                lines.append(f"• `{a['account_id']}` {a.get('status')} — {t}")
+            await event.reply("\n".join(lines))
+
+        elif parts[0] == "breaker" and len(parts) == 2 and parts[1] == "reset":
+            await db.system_config.update_one({"_id": "config"}, {"$set": {"breaker_until": 0, "flood_events": []}})
+            await event.reply("🔌 Breaker reset. Injector resumes on next loop.")
+
         elif parts[0] == "harvest":
             if len(parts) == 2 and parts[1] == "now":
                 await db.system_config.update_one({"_id": "config"}, {"$set": {"harvest_last_round": 0}})
@@ -1003,7 +1193,7 @@ if admin_client:
 
         elif parts[0] in ("help", "/start"):
             await event.reply(
-                "Commands:\n`status`\n`harvest` / `harvest now`\n`channel add|remove|enable|reset <name>`\n"
+                "Commands:\n`status`\n`spamcheck`\n`breaker reset`\n`harvest` / `harvest now`\n`channel add|remove|enable|reset <name>`\n"
                 "`pause` / `resume`\n`dead`\n`revive <account_id>`\n`unlock`"
             )
 

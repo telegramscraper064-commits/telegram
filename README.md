@@ -22,7 +22,7 @@ Do Render accounts, **ek time pe sirf ek chalu** — `render_switcher.py` (GitHu
 `RENDER_API_KEY_1, SERVICE_ID_1, SERVICE_URL_1, RENDER_API_KEY_2, SERVICE_ID_2, SERVICE_URL_2, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID`
 
 ## Admin bot commands
-`status` · `harvest` · `harvest now` · `channel add|remove|enable|reset <name>` · `pause` · `resume` · `dead` · `revive <account_id>` · `unlock` · `help`
+`status` · `spamcheck` · `breaker reset` · `harvest` · `harvest now` · `channel add|remove|enable|reset <name>` · `pause` · `resume` · `dead` · `revive <account_id>` · `unlock` · `help`
 
 ## Harvester (bandwidth-aware, checkpointed)
 - Har channel ka `last_msg_id` `harvest_state` collection me save — agli baar Telegram se **sirf naye messages** (`min_id`) aate hain.
@@ -38,5 +38,13 @@ Do Render accounts, **ek time pe sirf ek chalu** — `render_switcher.py` (GitHu
 3. Session `dead` ho jaye → nayi string generate karo → DB me replace → bot pe `revive <account_id>`.
 4. Baar-baar deploy mat karo — har deploy = ek overlap window.
 
-## Limits (main.py `Config`)
-15 adds/account/day · 3 per micro-batch · 90-150s gap · 30h cooldown after 15 or genuine flood.
+## Limits (main.py `Config`) — v4.3 safe-slow
+8 adds/account/day · **20 adds/day system-wide** (`GLOBAL_MAX_ADDS_PER_DAY`) · 3 per micro-batch · 4-8 min gap · 30h cooldown after cap.
+
+## SpamBot-aware cooldown (v4.3)
+Flood aate hi usi session se `@SpamBot /start` → jawab parse:
+- `limited until <date>` → exact us time (+1h) tak cooling, `limited_until` + `limit_strikes` DB me, alert
+- `no limits` → account clean, GROUP throttle thi → 6h rest + circuit breaker count
+- `harsh response / some phone numbers` → number flagged → `dead`
+- Circuit breaker: 1h me 2 floods → poora injector 12h pause (`breaker reset` se force-on)
+- Har 12h idle accounts ka SpamBot health-check; `spamcheck` command se on-demand
