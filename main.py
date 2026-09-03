@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.0.0-self-regulating"
+VERSION = "5.0.1-self-regulating"
 
 
 class Config:
@@ -305,9 +305,11 @@ async def migrate_legacy_statuses():
     cur = db.accounts_pool.find({"state": {"$exists": False}})
     async for a in cur:
         old = a.get("status", "ready")
+        extra_set = {}
         err = str(a.get("last_error", ""))
         if old == "dead" and "SpamBot" in err:
             st, why = STATE_FLAGGED, "migrated: number flagged by SpamBot"
+            extra_set["flagged_recheck_at"] = now_ts() + random.randint(1800, 7200)
         elif old == "dead":
             st, why = STATE_DEAD, "migrated: " + err
         elif a.get("limited_until") and a["limited_until"] > now_ts():
@@ -316,7 +318,7 @@ async def migrate_legacy_statuses():
             st, why = STATE_RESTING, "migrated: " + err
         else:
             st, why = STATE_ACTIVE, "migrated"
-        await db.accounts_pool.update_one({"account_id": a["account_id"]}, {"$set": {
+        await db.accounts_pool.update_one({"account_id": a["account_id"]}, {"$set": {**extra_set, 
             "state": st, "state_reason": why, "state_since": now_ts(),
             "tier": a.get("tier", 2), "rest_until": a.get("cooldown_until", 0) if st == STATE_RESTING else 0,
             "strikes": a.get("limit_strikes", 0), "clean_since": now_ts(), "last_used": a.get("last_add_time") or 0,
