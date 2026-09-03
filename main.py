@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.2.0-self-regulating"
+VERSION = "5.2.1-self-regulating"
 
 
 class Config:
@@ -225,6 +225,7 @@ class Database:
         self.harvest_state = self.db["harvest_state"]
         self.events = self.db["events"]              # audit log (adds, floods, state changes)
         self.errors = self.db["errors"]
+        self.agent_state = self.db["agent_state"]
         await self.client.admin.command("ping")
         logger.info("✅ Connected to MongoDB")
         _h = MongoErrorHandler(); _h.setLevel(logging.WARNING); _h.setFormatter(logging.Formatter("%(message)s")); logging.getLogger().addHandler(_h)
@@ -338,9 +339,12 @@ async def lock_heartbeat(account_id: str):
 
 async def set_state(account_id: str, state: str, reason: str = "", **extra):
     upd = {"state": state, "state_reason": reason[:200], "state_since": now_ts(), **extra}
-    await db.accounts_pool.update_one({"account_id": account_id}, {"$set": upd})
-    logger.info(f"🔁 {account_id} → {state.upper()} {('(' + reason[:80] + ')') if reason else ''}")
-    await log_event("state", account_id, state=state, reason=reason[:200])
+    prev = await db.accounts_pool.find_one_and_update({"account_id": account_id}, {"$set": upd}, projection={"state": 1})
+    frm = (prev or {}).get("state", "?")
+    if frm == state:
+        return  # no-op (recheck confirmed same state) — no event, state_since already refreshed
+    logger.info(f"🔁 {account_id} {frm} → {state.upper()} {('(' + reason[:80] + ')') if reason else ''}")
+    await log_event("state", account_id, frm=frm, to=state, state=state, reason=reason[:200])
 
 
 async def mark_session_dead(account_id: str, reason: str):
@@ -1096,7 +1100,8 @@ if admin_client:
             await db.system_config.update_one({"_id": "config"}, {"$set": {"cap_override": int(parts[1])}}, upsert=True)
             await event.reply(f"✅ global cap = {Config.GLOBAL_MAX_ADDS_PER_DAY}/day (DB me saved, dono instances follow karenge)")
         elif c == "pace" and len(parts) == 2 and parts[1] in Config.PACE_PROFILES:
-            await db.system_config.update_one({"_id": "config"}, {"$set": {"pace": parts[1]}, "$unset": {"cap_override": ""}}, upsert=True)
+            await db.system_config.update_one({"_id": "config"}, {"$set": {"pace": parts[1], "pace_set_by": "admin"}, "$unset": {"cap_override": ""}}, upsert=True)
+            await db.agent_state.update_one({"_id": "pace_governor"}, {"$set": {"manual_safe": parts[1] == "safe", "downgraded_at": 0}}, upsert=True)
             Config.apply_pace(parts[1])
             await event.reply(f"⚙️ pace = *{Config.PACE}*\n{Config.ADDS_PER_SESSION} adds/session, gap {Config.IN_SESSION_GAP[0]}-{Config.IN_SESSION_GAP[1]}s, same account gap {Config.SAME_ACCOUNT_MIN_GAP//60} min\n"
                               f"tier daily: {Config.TIER_DAILY}\nglobal cap: {Config.GLOBAL_MAX_ADDS_PER_DAY}/day\n"

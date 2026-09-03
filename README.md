@@ -60,3 +60,5 @@ Bot: `status` `spamcheck` `events` `pause` `resume` `breaker reset` `revive <id>
 MASTER → WATCHER (DB/Render/heartbeats/errors padhta hai) → ANALYST (problem + severity + fix) → CODER (safe auto-fix: stale lock, stuck resting, stuck queue, pace→safe on floods, redeploy on hang/failed deploy; code bugs → GitHub issue with traceback) → MANAGER (problem lifecycle, dedup, escalation, resolve) → UPDATER (version drift, self-version) → REPORTER (Telegram: Krishna Saved Messages + engine bot `status` forward).
 Report policy: CRIT har run · WARN nayi problem pe / 3h · OK digest 6h + 09:00/21:00. Secrets: MONGO_URI, API_ID, API_HASH, WATCHER_SESSION.
 Engine v5.2: WARNING+ logs → `db.errors` (TTL 7d), loop heartbeats → `system_config.heartbeat`.
+
+**Pace governor (agents):** FAST me trouble (2+ accounts naye limited/flagged 24h, 2+ floods, breaker, 20+ errors) → auto SAFE. 48h clean → auto FAST wapas. Bot pe `pace safe` = manual (governor upgrade nahi karega); `pace fast` = manual override.

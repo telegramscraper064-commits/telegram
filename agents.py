@@ -30,7 +30,7 @@ import traceback
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-AGENTS_VERSION = "1.0.0"
+AGENTS_VERSION = "1.1.0"
 IST = timezone(timedelta(hours=5, minutes=30))
 NOW = time.time()
 
@@ -104,6 +104,7 @@ class Watcher:
         o["errors_24h"] = self.db.errors.count_documents({"t": {"$gt": NOW - 86400}})
         o["events"] = list(self.db.events.find({"t": {"$gt": NOW - 1800}}).sort("t", -1).limit(100))
         o["floods_24h"] = self.db.events.count_documents({"t": {"$gt": NOW - 86400}, "kind": {"$in": ["flood", "limit"]}})
+        o["state_events_24h"] = list(self.db.events.find({"t": {"$gt": NOW - 86400}, "kind": "state"}, {"acc": 1, "frm": 1, "to": 1, "t": 1}))
         # Render services
         svc = []
         for u in SERVICE_URLS:
@@ -142,9 +143,13 @@ class Analyst:
     """Turns observations into problems (severity: CRIT / WARN / INFO)."""
     name = "ANALYST"
 
+    def __init__(self, db=None):
+        self.db_state = db.agent_state if db is not None else None
+
     def run(self, b: Board):
         o = b.obs
         P = b.problems
+        self.recent_state_events = o.get("state_events_24h", [])
 
         def add(key, sev, title, detail="", fix="", auto=None):
             P.append({"key": key, "sev": sev, "title": title, "detail": detail, "fix": fix, "auto": auto})
@@ -217,7 +222,32 @@ class Analyst:
                 # injector alive, capacity available, active hours, but no adds in 30 min — allowed (idle turns/gaps) unless persists
                 add("no_adds_30m", "INFO", "30 min me koi add nahi (cap/accounts available)", f"adds24h={o['adds_24h']} addable={len(addable)}", "agar 3 run tak rahe → CRIT", auto=None)
         if o["floods_24h"] >= 3:
-            add("floods", "WARN", f"{o['floods_24h']} flood/limit events 24h me", "", "pace safe rakho", auto="pace_safe")
+            add("floods", "WARN", f"{o['floods_24h']} flood/limit events 24h me", "", "pace safe", auto="pace_safe")
+        # ---- PACE GOVERNOR: fast → safe on trouble; safe → fast after quiet period ----
+        pace = cfg["pace"]
+        # "newly limited" = state-change EVENT in last 24h where an account went active/probation → limited/flagged
+        # (state_since alone is misleading: rechecks/migration refresh it for OLD limits)
+        newly_limited = sorted({e.get("acc") for e in self.recent_state_events if e.get("to") in ("limited", "flagged")
+                                and e.get("frm") in ("active", "probation", "resting")})
+        o["newly_limited_24h"] = newly_limited
+        trouble = []
+        if len(newly_limited) >= 2:
+            trouble.append(f"{len(newly_limited)} accounts limited/flagged in 24h: {newly_limited}")
+        if o["floods_24h"] >= 2:
+            trouble.append(f"{o['floods_24h']} floods 24h")
+        if cfg["breaker_until"] > NOW:
+            trouble.append("breaker open")
+        if o["errors_24h"] >= 20:
+            trouble.append(f"{o['errors_24h']} errors 24h")
+        if pace == "fast" and trouble:
+            add("pace_downgrade", "WARN", "Pace governor: FAST → SAFE (trouble detected)", "; ".join(trouble),
+                "auto; 48h clean ke baad wapas fast", auto="pace_safe")
+        elif pace == "safe":
+            gov = self.db_state.find_one({"_id": "pace_governor"}) if hasattr(self, "db_state") else None
+            downgraded_at = (gov or {}).get("downgraded_at", 0)
+            manual_safe = (gov or {}).get("manual_safe", False)
+            if not trouble and not manual_safe and downgraded_at and NOW - downgraded_at > 48 * 3600 and o["floods_24h"] == 0 and not newly_limited:
+                add("pace_upgrade", "INFO", "Pace governor: 48h clean → SAFE → FAST", "", "auto", auto="pace_fast")
 
         # --- queue ---
         if o["pending"] < 200:
@@ -287,8 +317,19 @@ class Coder:
     def fix_pace_safe(self, p, b):
         cfg = self.db.system_config.find_one({"_id": "config"}) or {}
         if cfg.get("pace", "safe") != "safe":
-            self.db.system_config.update_one({"_id": "config"}, {"$set": {"pace": "safe"}, "$unset": {"cap_override": ""}})
-            return "pace fast → safe (floods)"
+            self.db.system_config.update_one({"_id": "config"}, {"$set": {"pace": "safe", "pace_set_by": "agents"}, "$unset": {"cap_override": ""}})
+            self.db.agent_state.update_one({"_id": "pace_governor"}, {"$set": {"downgraded_at": NOW, "reason": p.get("detail", "")[:200], "manual_safe": False}}, upsert=True)
+            b.notes.append("⚙️ PACE → SAFE (auto). 48h clean → wapas FAST. Manual override: bot pe `pace fast`")
+            return "pace fast → safe"
+        return None
+
+    def fix_pace_fast(self, p, b):
+        cfg = self.db.system_config.find_one({"_id": "config"}) or {}
+        if cfg.get("pace", "safe") != "fast":
+            self.db.system_config.update_one({"_id": "config"}, {"$set": {"pace": "fast", "pace_set_by": "agents"}, "$unset": {"cap_override": ""}})
+            self.db.agent_state.update_one({"_id": "pace_governor"}, {"$set": {"upgraded_at": NOW, "downgraded_at": 0}}, upsert=True)
+            b.notes.append("⚙️ PACE → FAST (auto, 48h clean)")
+            return "pace safe → fast"
         return None
 
     def fix_wake_service(self, p, b):
@@ -493,7 +534,7 @@ class Master:
         from pymongo import MongoClient
         self.db = MongoClient(MONGO_URI, serverSelectionTimeoutMS=20000)["telegram_automation"]
         self.b = Board()
-        self.agents = [Watcher(self.db), Analyst(), Coder(self.db), Manager(self.db), Updater(self.db)]
+        self.agents = [Watcher(self.db), Analyst(self.db), Coder(self.db), Manager(self.db), Updater(self.db)]
         self.reporter = Reporter(self.db)
 
     def should_report(self) -> tuple[bool, bool]:
