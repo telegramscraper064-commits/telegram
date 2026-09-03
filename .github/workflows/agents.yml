@@ -1,0 +1,43 @@
+name: AI Agents Supervisor
+
+# Har 30 min: WATCHER → ANALYST → CODER → MANAGER → UPDATER → REPORTER (MASTER coordinates)
+# Report Telegram pe (Krishna ke Saved Messages) + engine bot se `status` forward.
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: agents
+  cancel-in-progress: false
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  supervise:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q "pymongo[srv]" telethon
+      - name: Run agents
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          WATCHER_SESSION: ${{ secrets.WATCHER_SESSION }}
+          SERVICE_URL_1: ${{ secrets.SERVICE_URL_1 }}
+          SERVICE_URL_2: ${{ secrets.SERVICE_URL_2 }}
+          RENDER_API_KEY_1: ${{ secrets.RENDER_API_KEY_1 }}
+          RENDER_API_KEY_2: ${{ secrets.RENDER_API_KEY_2 }}
+          SERVICE_ID_1: ${{ secrets.SERVICE_ID_1 }}
+          SERVICE_ID_2: ${{ secrets.SERVICE_ID_2 }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPORT_TO: me
+          ENGINE_BOT: krishnascrapper_bot
+        run: python agents.py

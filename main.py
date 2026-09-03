@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.1.1-self-regulating"
+VERSION = "5.2.0-self-regulating"
 
 
 class Config:
@@ -224,8 +224,10 @@ class Database:
         self.system_config = self.db["system_config"]
         self.harvest_state = self.db["harvest_state"]
         self.events = self.db["events"]              # audit log (adds, floods, state changes)
+        self.errors = self.db["errors"]
         await self.client.admin.command("ping")
         logger.info("✅ Connected to MongoDB")
+        _h = MongoErrorHandler(); _h.setLevel(logging.WARNING); _h.setFormatter(logging.Formatter("%(message)s")); logging.getLogger().addHandler(_h)
         await self._ensure_indexes()
         await self.system_config.update_one({"_id": "config"},
                                             {"$setOnInsert": {"source_channels": [], "is_paused": False}}, upsert=True)
@@ -252,6 +254,7 @@ class Database:
         await idx(self.master_blacklist, [("added_at", ASCENDING)])
         await idx(self.harvest_state, [("channel", ASCENDING)], unique=True)
         await idx(self.events, [("t", ASCENDING)], expireAfterSeconds=30 * 86400)
+        await idx(self.errors, [("t", ASCENDING)], expireAfterSeconds=7 * 86400)
 
     async def disconnect(self):
         if self.client:
@@ -264,6 +267,31 @@ db = Database(Config.MONGO_URI)
 async def log_event(kind: str, account_id: str = "", **data):
     try:
         await db.events.insert_one({"t": now_ts(), "kind": kind, "acc": account_id, "inst": Config.INSTANCE_ID, **data})
+    except Exception:
+        pass
+
+
+class MongoErrorHandler(logging.Handler):
+    """WARNING+ logs → db.errors (TTL 7d) taaki agents Render ke bahar se errors padh sakein."""
+    def emit(self, record):
+        try:
+            if not db.client:
+                return
+            msg = self.format(record)
+            if "engine" not in record.name and record.levelno < logging.ERROR:
+                return
+            asyncio.get_event_loop().create_task(db.errors.insert_one({
+                "t": now_ts(), "level": record.levelname, "logger": record.name, "msg": msg[:1500],
+                "inst": Config.INSTANCE_ID, "version": VERSION,
+                "exc": (record.exc_text or "")[:3000] if record.exc_info else ""}))
+        except Exception:
+            pass
+
+
+async def heartbeat(loop_name: str, **extra):
+    try:
+        await db.system_config.update_one({"_id": "heartbeat"}, {"$set": {
+            f"{loop_name}_at": now_ts(), f"{loop_name}_inst": Config.INSTANCE_ID, "version": VERSION, **extra}}, upsert=True)
     except Exception:
         pass
 
@@ -562,6 +590,7 @@ async def health_loop():
     await asyncio.sleep(60)
     while is_engine_running:
         try:
+            await heartbeat("health")
             await lifecycle_tick()   # state flips (resting→active etc.) injector ke cap-sleep pe depend na karein
             await health_sweep()
         except asyncio.CancelledError:
@@ -757,6 +786,7 @@ async def harvester_engine():
     logger.info("🕷️ Harvester started")
     while is_engine_running:
         try:
+            await heartbeat("harvester")
             if await is_paused():
                 await asyncio.sleep(60)
                 continue
@@ -899,6 +929,7 @@ async def injector_engine():
     logger.info("💉 Injector started (human-paced)")
     while is_engine_running:
         try:
+            await heartbeat("injector", pace=Config.PACE, cap=Config.GLOBAL_MAX_ADDS_PER_DAY)
             await lifecycle_tick()
             if await is_paused() or not in_active_hours():
                 await asyncio.sleep(600)

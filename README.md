@@ -55,3 +55,8 @@ Pace profiles (bot `pace safe|fast`, DB-synced): safe = 2/session, T1-4 2/4/6/8,
 Global cap default 20/din. Startup pe identity dedupe (ek Telegram user ki 2 entries → doosri disable).
 
 Bot: `status` `spamcheck` `events` `pause` `resume` `breaker reset` `revive <id>` `tier <id> <1-4>` `cap <n>` `pace safe|fast` `delete <id>` `harvest` `channel …`
+
+## AI Agents Supervisor (`agents.py`, har 30 min GitHub Actions)
+MASTER → WATCHER (DB/Render/heartbeats/errors padhta hai) → ANALYST (problem + severity + fix) → CODER (safe auto-fix: stale lock, stuck resting, stuck queue, pace→safe on floods, redeploy on hang/failed deploy; code bugs → GitHub issue with traceback) → MANAGER (problem lifecycle, dedup, escalation, resolve) → UPDATER (version drift, self-version) → REPORTER (Telegram: Krishna Saved Messages + engine bot `status` forward).
+Report policy: CRIT har run · WARN nayi problem pe / 3h · OK digest 6h + 09:00/21:00. Secrets: MONGO_URI, API_ID, API_HASH, WATCHER_SESSION.
+Engine v5.2: WARNING+ logs → `db.errors` (TTL 7d), loop heartbeats → `system_config.heartbeat`.
