@@ -8,7 +8,8 @@ Do Render accounts, **ek time pe sirf ek chalu** — `render_switcher.py` (GitHu
 |---|---|
 | `main.py` | FastAPI app + Telethon engines (multi-instance safe: atomic account lock, dead-session detection) |
 | `render_switcher.py` | Symmetric: jo bhi service gire, dusri (resumable) auto-resume. Dono running → non-preferred suspend. Manual resume kabhi nahi |
-| `.github/workflows/render_switcher.yml` | Switcher ka cron |
+| `.github/workflows/render_switcher.yml` | Switcher ka cron (har 10 min) |
+| `keep_alive.py` + `.github/workflows/keep_alive.yml` | Har 5 min **sirf running** service ko ping (Render API se pehle status dekhta hai; suspended ko kabhi ping nahi). Read-only — kabhi suspend/resume nahi karta |
 | `requirements.txt` | Render build deps |
 | `.env.example` | Saare env vars ka template |
 

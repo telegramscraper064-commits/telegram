@@ -1,0 +1,30 @@
+name: Keep-Alive (active Render only)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'     # har 5 min (GitHub cron 5-15 min late chal sakta hai; Render 15 min pe sota hai)
+  workflow_dispatch:
+
+concurrency:
+  group: keep-alive
+  cancel-in-progress: true    # purana run atka ho to naya use replace kare
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -q requests
+      - name: Ping running service
+        env:
+          RENDER_API_KEY_1: ${{ secrets.RENDER_API_KEY_1 }}
+          SERVICE_ID_1:     ${{ secrets.SERVICE_ID_1 }}
+          SERVICE_URL_1:    ${{ secrets.SERVICE_URL_1 }}
+          RENDER_API_KEY_2: ${{ secrets.RENDER_API_KEY_2 }}
+          SERVICE_ID_2:     ${{ secrets.SERVICE_ID_2 }}
+          SERVICE_URL_2:    ${{ secrets.SERVICE_URL_2 }}
+        run: python keep_alive.py
