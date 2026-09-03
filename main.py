@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.0.1-self-regulating"
+VERSION = "5.1.0-self-regulating"
 
 
 class Config:
@@ -98,11 +98,20 @@ class Config:
     SELF_PING_URL = os.getenv("SELF_PING_URL", "").strip()
     ACTIVE_HOURS_IST = os.getenv("ACTIVE_HOURS_IST", "8-23").strip()
 
-    # ---- human pacing (aapki spec) ----
-    ADDS_PER_SESSION = 2                    # ek baar connect me max 2 adds
+    # ---- pacing profiles (bot: `pace safe|fast`, DB system_config.pace) ----
+    # safe : 2 adds/session, 150-200s gap, 45 min same-account gap, T1-4 = 2/4/6/8 per day
+    # fast : 3 adds/session, 3 sessions/day (=9/ID), 120-180s gap, 3h same-account gap, T1-4 = 3/6/9/9
+    PACE_PROFILES = {
+        "safe": dict(ADDS_PER_SESSION=2, IN_SESSION_GAP=(150, 200), SAME_ACCOUNT_MIN_GAP=45 * 60,
+                     TIER_DAILY={1: 2, 2: 4, 3: 6, 4: 8}, TIER_BATCH={1: 1, 2: 2, 3: 2, 4: 2}, GLOBAL_CAP=20),
+        "fast": dict(ADDS_PER_SESSION=3, IN_SESSION_GAP=(120, 180), SAME_ACCOUNT_MIN_GAP=3 * 3600,
+                     TIER_DAILY={1: 3, 2: 6, 3: 9, 4: 9}, TIER_BATCH={1: 1, 2: 3, 3: 3, 4: 3}, GLOBAL_CAP=60),
+    }
+    PACE = os.getenv("PACE", "safe").strip().lower()
+    ADDS_PER_SESSION = 2                    # ek baar connect me max N adds (profile se overwrite)
     IN_SESSION_GAP = (150, 200)             # do adds ke beech
     BETWEEN_ACCOUNTS_GAP = (180, 240)       # account switch gap 3-4 min
-    SAME_ACCOUNT_MIN_GAP = 45 * 60          # ek account 45 min se pehle dobara nahi
+    SAME_ACCOUNT_MIN_GAP = 45 * 60          # ek account itne time se pehle dobara nahi
     IDLE_TURN_PROB = 0.15                   # 15% turns "kuch nahi" (irregularity)
     IDLE_TURN_SLEEP = (300, 600)
     GLOBAL_MAX_ADDS_PER_DAY = int(os.getenv("GLOBAL_MAX_ADDS_PER_DAY", "20"))
@@ -110,6 +119,17 @@ class Config:
     # ---- tiers ----
     TIER_DAILY = {1: 2, 2: 4, 3: 6, 4: 8}
     TIER_BATCH = {1: 1, 2: 2, 3: 2, 4: 2}
+
+    @classmethod
+    def apply_pace(cls, name: str, cap_override: int | None = None):
+        prof = cls.PACE_PROFILES.get(name) or cls.PACE_PROFILES["safe"]
+        cls.PACE = name if name in cls.PACE_PROFILES else "safe"
+        cls.ADDS_PER_SESSION = prof["ADDS_PER_SESSION"]
+        cls.IN_SESSION_GAP = prof["IN_SESSION_GAP"]
+        cls.SAME_ACCOUNT_MIN_GAP = prof["SAME_ACCOUNT_MIN_GAP"]
+        cls.TIER_DAILY = dict(prof["TIER_DAILY"])
+        cls.TIER_BATCH = dict(prof["TIER_BATCH"])
+        cls.GLOBAL_MAX_ADDS_PER_DAY = cap_override if cap_override else prof["GLOBAL_CAP"]
     TIER_UP_DAYS = 7
     PROBATION_DAYS = 3
 
@@ -495,6 +515,12 @@ async def lifecycle_tick():
 
 async def health_sweep():
     """SpamBot re-check: limited jinka time nikal gaya, flagged jinka recheck due, aur 12h purane sab."""
+    cfg = await db.system_config.find_one({"_id": "config"}) or {}
+    want = cfg.get("pace") or Config.PACE
+    want_cap = cfg.get("cap_override")
+    if want != Config.PACE or (want_cap and want_cap != Config.GLOBAL_MAX_ADDS_PER_DAY):
+        Config.apply_pace(want, want_cap)
+        logger.info(f"⚙️ pace={Config.PACE} | {Config.ADDS_PER_SESSION}/session | daily {Config.TIER_DAILY} | cap {Config.GLOBAL_MAX_ADDS_PER_DAY}")
     now = now_ts()
     q = {"state": {"$nin": [STATE_DEAD]}, "duplicate": {"$ne": True}, "$or": [
         {"state": STATE_LIMITED, "limited_until": {"$lte": now}},
@@ -977,7 +1003,7 @@ async def build_status() -> str:
     pending = await db.scraped_queue.count_documents({"status": "pending"})
     lines = [f"📊 **Engine {VERSION}**",
              f"⏸ {'PAUSED' if await is_paused() else 'running'} | 🔌 breaker {ist(br) if br > now_ts() else 'off'} | 🕐 {'active hrs' if in_active_hours() else 'night'}",
-             f"📈 adds 24h: {today}/{Config.GLOBAL_MAX_ADDS_PER_DAY} | 📥 pending {pending} | ✅ total {await db.master_blacklist.count_documents({})}",
+             f"⚙️ pace {Config.PACE} | 📈 adds 24h: {today}/{Config.GLOBAL_MAX_ADDS_PER_DAY} | 📥 pending {pending} | ✅ total {await db.master_blacklist.count_documents({})}",
              " ".join(f"{STATE_ICON.get(k, '•')}{k}:{v}" for k, v in sorted(counts.items())), ""]
     async for a in db.accounts_pool.find({}, {"session_string": 0}).sort("account_id", 1):
         st = a.get("state", "?")
@@ -1035,7 +1061,16 @@ if admin_client:
             await event.reply("✅ tier set" if r.matched_count else "❌ not found")
         elif c == "cap" and len(parts) == 2 and parts[1].isdigit():
             Config.GLOBAL_MAX_ADDS_PER_DAY = int(parts[1])
-            await event.reply(f"✅ global cap = {Config.GLOBAL_MAX_ADDS_PER_DAY}/day (is process ke liye; permanent ke liye env)")
+            await db.system_config.update_one({"_id": "config"}, {"$set": {"cap_override": int(parts[1])}}, upsert=True)
+            await event.reply(f"✅ global cap = {Config.GLOBAL_MAX_ADDS_PER_DAY}/day (DB me saved, dono instances follow karenge)")
+        elif c == "pace" and len(parts) == 2 and parts[1] in Config.PACE_PROFILES:
+            await db.system_config.update_one({"_id": "config"}, {"$set": {"pace": parts[1]}, "$unset": {"cap_override": ""}}, upsert=True)
+            Config.apply_pace(parts[1])
+            await event.reply(f"⚙️ pace = *{Config.PACE}*\n{Config.ADDS_PER_SESSION} adds/session, gap {Config.IN_SESSION_GAP[0]}-{Config.IN_SESSION_GAP[1]}s, same account gap {Config.SAME_ACCOUNT_MIN_GAP//60} min\n"
+                              f"tier daily: {Config.TIER_DAILY}\nglobal cap: {Config.GLOBAL_MAX_ADDS_PER_DAY}/day\n"
+                              + ("⚠️ fast: limit aayi to wo account khud tier neeche + safe pace pe girega" if Config.PACE == "fast" else ""))
+        elif c == "pace":
+            await event.reply(f"⚙️ current pace = *{Config.PACE}* | `pace safe` ya `pace fast`")
         elif c == "delete" and len(parts) == 2:
             r = await db.accounts_pool.delete_one({"account_id": parts[1]})
             await event.reply("🗑 deleted" if r.deleted_count else "❌ not found")
@@ -1074,7 +1109,7 @@ if admin_client:
             await event.reply(f"✅ channel {act} {key}")
         elif c in ("help", "/start"):
             await event.reply("`status` `spamcheck` `events [n]` `pause` `resume` `breaker reset`\n"
-                              "`revive <id>` `tier <id> <1-4>` `cap <n>` `delete <id>` `unlock`\n"
+                              "`revive <id>` `tier <id> <1-4>` `cap <n>` `pace safe|fast` `delete <id>` `unlock`\n"
                               "`harvest` `harvest now` `channel add|remove|enable|reset <name>`")
 
 
@@ -1106,6 +1141,9 @@ async def delayed_engine_start():
                 logger.info("🤖 Admin bot online")
             except Exception as e:
                 logger.error(f"Admin bot: {e}")
+        cfg0 = await db.system_config.find_one({"_id": "config"}) or {}
+        Config.apply_pace(cfg0.get("pace") or Config.PACE, cfg0.get("cap_override"))
+        logger.info(f"⚙️ pace={Config.PACE} | {Config.ADDS_PER_SESSION}/session | daily {Config.TIER_DAILY} | cap {Config.GLOBAL_MAX_ADDS_PER_DAY}")
         await migrate_legacy_statuses()
         try:
             await dedupe_identities()

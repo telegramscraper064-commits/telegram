@@ -51,6 +51,7 @@ Do Render accounts, **ek time pe sirf ek chalu** — `render_switcher.py` (GitHu
 
 Tiers: T1=2/din, T2=4, T3=6, T4=8. Strike → tier−1. 7 din clean → tier+1.
 Pacing: 2 adds/session, 150–200s gap, account switch 3–4 min, same account ≥45 min gap, 15% idle turns, 8–23 IST.
-Global cap 20/din. Startup pe identity dedupe (ek Telegram user ki 2 entries → doosri disable).
+Pace profiles (bot `pace safe|fast`, DB-synced): safe = 2/session, T1-4 2/4/6/8, cap 20 · fast = 3/session, 3 sessions/din (9/ID), T1-4 3/6/9/9, cap 60. Limit lagi to account khud tier neeche.
+Global cap default 20/din. Startup pe identity dedupe (ek Telegram user ki 2 entries → doosri disable).
 
-Bot: `status` `spamcheck` `events` `pause` `resume` `breaker reset` `revive <id>` `tier <id> <1-4>` `cap <n>` `delete <id>` `harvest` `channel …`
+Bot: `status` `spamcheck` `events` `pause` `resume` `breaker reset` `revive <id>` `tier <id> <1-4>` `cap <n>` `pace safe|fast` `delete <id>` `harvest` `channel …`
