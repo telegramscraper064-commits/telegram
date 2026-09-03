@@ -80,7 +80,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("engine")
-VERSION = "4.3.0-spambot-aware"   # har release pe badlo -> GET / aur status se verify hota hai kaunsa code live hai
+VERSION = "4.3.1-spambot-aware"   # har release pe badlo -> GET / aur status se verify hota hai kaunsa code live hai
 
 
 class Config:
@@ -447,8 +447,10 @@ async def spambot_health_sweep():
                             "last_error": "LIMITED till " + datetime.fromtimestamp(info["until"], Config.IST).strftime("%d %b %H:%M IST")})
             elif info["verdict"] == "harsh_number":
                 upd.update({"status": "dead", "last_error": "SpamBot: phone number flagged", "dead_at": now_ts()})
-            elif info["verdict"] == "ok" and a.get("limited_until") and a["limited_until"] < now_ts() and a["status"] == "cooling":
-                upd.update({"status": "ready", "cooldown_until": 0, "daily_adds": 0, "last_error": ""})
+            elif info["verdict"] == "ok" and a["status"] == "cooling" and "flood" in str(a.get("last_error", "")):
+                # Flood-cooling tha par Telegram bolta hai clean => group throttle thi; 6h se zyada mat rok
+                new_cd = min(float(a.get("cooldown_until") or 0), now_ts() + Config.GROUP_THROTTLE_HOURS * 3600)
+                upd.update({"cooldown_until": new_cd, "last_error": "group throttle; SpamBot: no limits"})
             await db.accounts_pool.update_one({"account_id": acc_id}, {"$set": upd})
             logger.info(f"🩺 SpamBot {acc_id}: {info['verdict']}")
         except DEAD_SESSION_ERRORS as e:
@@ -462,6 +464,19 @@ async def spambot_health_sweep():
                 pass
             await release_account(acc_id)
         await asyncio.sleep(random.randint(20, 40))
+
+
+async def health_sweep_loop():
+    """Independent task: cap/breaker/pause se affected nahi. Start pe ek baar, phir har 12h."""
+    await asyncio.sleep(90)   # engines settle ho jayein
+    while is_engine_running:
+        try:
+            await spambot_health_sweep()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"health sweep loop error: {type(e).__name__}: {e}")
+        await asyncio.sleep(1800)   # har 30 min dekho kis account ka 12h check due hai
 
 
 async def cooldown_account(account_id: str, hours: float, reason: str):
@@ -973,11 +988,6 @@ async def injector_engine():
                 await asyncio.sleep(3600)
                 continue
 
-            try:
-                await spambot_health_sweep()
-            except Exception as e:
-                logger.warning(f"health sweep error: {e}")
-
             pending = await db.scraped_queue.count_documents({"status": "pending"})
             if pending == 0:
                 logger.info("💉 Nothing pending in queue. Sleeping 10 min")
@@ -1237,6 +1247,7 @@ async def delayed_engine_start():
             background_tasks.append(asyncio.create_task(harvester_engine()))
         if Config.INSTANCE_ROLE in ("both", "injector"):
             background_tasks.append(asyncio.create_task(injector_engine()))
+            background_tasks.append(asyncio.create_task(health_sweep_loop()))
         background_tasks.append(asyncio.create_task(self_ping_loop()))
 
         await notify_admin(f"🚀 Instance `{Config.INSTANCE_ID}` started (role={Config.INSTANCE_ROLE})")
