@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.2.1-self-regulating"
+VERSION = "5.3.0-self-regulating"
 
 
 class Config:
@@ -137,6 +137,12 @@ class Config:
     GROUP_THROTTLE_REST_HOURS = 6
     UNKNOWN_FLOOD_REST_HOURS = 24
     FLAGGED_RECHECK_HOURS = 24
+    # ---- ADVOCATE agent (auto SpamBot complaint, human-like) ----
+    ADVOCATE_ENABLED = os.getenv("ADVOCATE_ENABLED", "true").lower() == "true"
+    ADVOCATE_MIN_DELAY_H = (3, 20)          # flag/limit ke baad itne ghante ruk ke complaint (insaan turant nahi karta)
+    ADVOCATE_RETRY_DAYS = 5                 # pehli complaint ke 5 din baad bhi flagged → doosri (alag wording)
+    ADVOCATE_MAX_ATTEMPTS = 3               # ek account pe max 3 complaints (usse zyada spam lagta hai)
+    ADVOCATE_HOURS_IST = (9, 22)            # sirf din me (raat 4 baje complaint = bot)
     LIMITED_BUFFER_HOURS = 2
     BREAKER_WINDOW_SECONDS = 3600
     BREAKER_FLOOD_COUNT = 2
@@ -446,6 +452,170 @@ async def ask_spambot(client: TelegramClient) -> dict:
         return {"verdict": "unknown", "until": None, "text": f"spambot failed: {type(e).__name__}: {e}"}
 
 
+# ============================================================================
+# ADVOCATE AGENT — SpamBot complaint, human-like
+# Flow (observed live): /start → [Submit a complaint] → [No, I'll never do any of this!] → free text → "successfully submitted"
+# Human traits: waits hours (not instant), only daytime IST, typing indicator + reading pauses,
+#               personal wording per account (name, profile), never same text twice, max 3 attempts, 5-day gaps.
+# ============================================================================
+_ADV_OPENERS = [
+    "Hi, I think my account got limited by mistake.",
+    "Hello, my account has been restricted and I don't understand why.",
+    "Namaste, I'm writing because my account is showing limits.",
+    "Hi team, I noticed my account is limited since a few days.",
+    "Hello. I'm a regular user and my account suddenly got restricted.",
+]
+_ADV_CONTEXT = [
+    "I'm from an agriculture background and I mostly use Telegram for our farming and agri quiz study group with friends and classmates.",
+    "I use Telegram mainly to stay in touch with my agriculture college friends and share quiz questions in our study group.",
+    "I'm a student of agriculture, I use this account for our small quiz group where we share farming MCQs and notes.",
+    "I mostly talk to family and my agri study group here. We share daily quiz and exam preparation material.",
+    "This is my personal number. I use it for our farming community group and for chatting with friends.",
+]
+_ADV_ADMIT = [
+    "I did add a few friends and classmates to our group recently, maybe that looked suspicious. I didn't intend to spam anyone.",
+    "Recently I added some people I know to our study group, maybe that triggered it. I'm sorry if it bothered anyone.",
+    "I added a few known people to the group who are interested in agri exams. If that was too many at once, I apologise.",
+    "I invited some friends to our quiz group in the last few days. I didn't know that could cause a problem.",
+    "Maybe adding a few members to our agri group caused this. It was not advertising or promotion, just study material.",
+]
+_ADV_CLOSE = [
+    "Please review my account, I'll be careful from now on. Thank you.",
+    "Kindly check and remove the limit if possible. I will not repeat this. Thanks a lot.",
+    "Please have a look. I really need this account for my studies. Thank you for your time.",
+    "Request you to please lift the restriction. I'll follow the rules. Thanks.",
+    "Please help me with this, I'm not a spammer. Thank you.",
+]
+
+
+def _advocate_text(account: dict, attempt: int) -> str:
+    rnd_ = random.Random(f"{account.get('account_id')}-{attempt}-{int(now_ts() // 86400)}")
+    name = (account.get("first_name") or "").strip()
+    parts = [rnd_.choice(_ADV_OPENERS)]
+    if name and rnd_.random() < 0.6:
+        parts[0] = parts[0].rstrip(".") + f". My name is {name}."
+    parts.append(rnd_.choice(_ADV_CONTEXT))
+    parts.append(rnd_.choice(_ADV_ADMIT))
+    if attempt >= 2:
+        parts.append(rnd_.choice([
+            "I had submitted a complaint a few days ago but the limit is still there, so writing again.",
+            "This is my second request, the restriction is still active. Please check once more.",
+        ]))
+    parts.append(rnd_.choice(_ADV_CLOSE))
+    text = " ".join(parts)
+    # light human imperfections: occasional lowercase start of a sentence / double space
+    if rnd_.random() < 0.3:
+        text = text.replace(". I ", ".  I ", 1)
+    if rnd_.random() < 0.25:
+        text = text.replace("Thank you", "Thankyou", 1)
+    return text
+
+
+async def _adv_type(client: TelegramClient, text: str):
+    """typing indicator proportional to length, like a person on a phone (~25-40 chars/sec burst, with pauses)."""
+    try:
+        async with client.action("SpamBot", "typing"):
+            await asyncio.sleep(min(45, max(6, len(text) / random.uniform(4.5, 7.0))))
+    except Exception:
+        await asyncio.sleep(random.uniform(6, 12))
+
+
+async def _adv_click(client: TelegramClient, msg, label_part: str) -> bool:
+    if not msg or not msg.buttons:
+        return False
+    for row in msg.buttons:
+        for b in row:
+            if label_part.lower() in (b.text or "").lower():
+                await asyncio.sleep(random.uniform(2.5, 6.0))   # reading the options
+                await b.click()
+                return True
+    return False
+
+
+async def advocate_complain(client: TelegramClient, account: dict, attempt: int) -> tuple[bool, str]:
+    """Run the SpamBot complaint conversation. Returns (submitted, note)."""
+    acc = account["account_id"]
+    try:
+        await client.send_message("SpamBot", "/start")
+        await asyncio.sleep(random.uniform(5, 9))
+        m = (await client.get_messages("SpamBot", limit=1))[0]
+        low = (m.message or "").lower()
+        if "no limits" in low or "free as a bird" in low:
+            return False, "already clean"
+        if not await _adv_click(client, m, "complaint"):
+            # limited-until variant: button text is "This is a mistake"
+            if not await _adv_click(client, m, "mistake"):
+                return False, f"no complaint button: {(m.message or '')[:80]}"
+            await asyncio.sleep(random.uniform(4, 7))
+            m = (await client.get_messages("SpamBot", limit=1))[0]
+            if not await _adv_click(client, m, "yes"):
+                return False, "no 'yes' button after mistake"
+        await asyncio.sleep(random.uniform(4, 8))
+        m = (await client.get_messages("SpamBot", limit=1))[0]
+        if not await _adv_click(client, m, "never"):
+            return False, f"no 'never' button: {(m.message or '')[:80]}"
+        await asyncio.sleep(random.uniform(5, 10))   # reading "write me some details"
+        m = (await client.get_messages("SpamBot", limit=1))[0]
+        if "details" not in (m.message or "").lower() and "write" not in (m.message or "").lower():
+            return False, f"unexpected prompt: {(m.message or '')[:80]}"
+        text = _advocate_text(account, attempt)
+        await _adv_type(client, text)
+        await client.send_message("SpamBot", text)
+        await asyncio.sleep(random.uniform(5, 9))
+        m = (await client.get_messages("SpamBot", limit=1))[0]
+        ok = "submitted" in (m.message or "").lower() or "thank" in (m.message or "").lower()
+        return ok, (m.message or "")[:120]
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:100]}"
+
+
+async def advocate_tick(client: TelegramClient, account: dict, verdict: str) -> None:
+    """Called from health sweep when an account is still flagged/limited. Decides if a complaint is due, then files it."""
+    if not Config.ADVOCATE_ENABLED or verdict not in ("flagged", "limited"):
+        return
+    acc = account["account_id"]
+    h = datetime.now(Config.IST).hour
+    if not (Config.ADVOCATE_HOURS_IST[0] <= h < Config.ADVOCATE_HOURS_IST[1]):
+        return
+    adv = account.get("advocate") or {}
+    attempts = int(adv.get("attempts", 0))
+    if attempts >= Config.ADVOCATE_MAX_ATTEMPTS:
+        return
+    last = float(adv.get("last_at") or 0)
+    since = float(account.get("state_since") or now_ts())
+    if attempts == 0:
+        # first complaint: wait a random 3-20h after the flag (persisted so it's stable across sweeps)
+        due = adv.get("first_due")
+        if not due:
+            due = since + random.uniform(*Config.ADVOCATE_MIN_DELAY_H) * 3600
+            await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"advocate.first_due": due}})
+            return
+        if now_ts() < float(due):
+            return
+    else:
+        if now_ts() - last < Config.ADVOCATE_RETRY_DAYS * 86400:
+            return
+    # also skip if user manually complained recently (a "submitted" reply in last 3 days from any client)
+    try:
+        for m in await client.get_messages("SpamBot", limit=15):
+            if (not m.out) and "successfully submitted" in (m.message or "").lower() and m.date.timestamp() > now_ts() - 3 * 86400:
+                await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"advocate.last_at": m.date.timestamp(), "advocate.attempts": max(1, attempts)}})
+                logger.info(f"🧑‍⚖️ {acc}: complaint already submitted {ist(m.date.timestamp())} (manual) — skip")
+                return
+    except Exception:
+        pass
+    ok, note = await advocate_complain(client, account, attempts + 1)
+    await db.accounts_pool.update_one({"account_id": acc}, {"$set": {
+        "advocate.last_at": now_ts(), "advocate.attempts": attempts + (1 if ok else 0),
+        "advocate.last_result": note[:120], "advocate.last_ok": ok}})
+    await log_event("advocate", acc, ok=ok, attempt=attempts + 1, note=note[:120])
+    if ok:
+        logger.info(f"🧑‍⚖️ {acc}: complaint #{attempts + 1} submitted")
+        await notify_admin(f"🧑‍⚖️ ADVOCATE: `{acc}` ({account.get('first_name', '')}) ke liye SpamBot complaint #{attempts + 1} submit ki.\n_{note[:100]}_")
+    else:
+        logger.warning(f"🧑‍⚖️ {acc}: complaint failed: {note}")
+
+
 async def apply_verdict(account_id: str, info: dict, context: str) -> str:
     """SpamBot verdict -> state transition. Returns new state."""
     a = await db.accounts_pool.find_one({"account_id": account_id}) or {}
@@ -574,6 +744,12 @@ async def health_sweep():
             await apply_verdict(acc, info, "health")
             if a["state"] == STATE_FLAGGED and info["verdict"] == "flagged":
                 await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"flagged_recheck_at": now_ts() + Config.FLAGGED_RECHECK_HOURS * 3600}})
+            if info["verdict"] in ("flagged", "limited"):
+                try:
+                    fresh = await db.accounts_pool.find_one({"account_id": acc}) or a
+                    await advocate_tick(client, fresh, info["verdict"])
+                except Exception as e:
+                    logger.warning(f"advocate {acc}: {type(e).__name__}: {e}")
             if a["state"] == STATE_LIMITED and info["verdict"] == "limited" and not info["until"]:
                 await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"limited_until": now_ts() + 12 * 3600}})
             logger.info(f"🩺 {acc}: {info['verdict']}")
@@ -1057,7 +1233,9 @@ async def build_status() -> str:
             extra = f" till {ist(a.get('probation_until'))}"
         t = a.get("tier", 2)
         lock = f" 🔒" if a.get("locked_by") else ""
-        lines.append(f"{STATE_ICON.get(st, '•')} `{a['account_id']}` {st}{extra} | T{t} {a.get('daily_adds', 0)}/{Config.TIER_DAILY.get(t, 2)} | strikes {a.get('strikes', 0)}{lock}")
+        adv = a.get("advocate") or {}
+        advs = f" | 🧑‍⚖️{adv.get('attempts', 0)}" if adv.get("attempts") else ""
+        lines.append(f"{STATE_ICON.get(st, '•')} `{a['account_id']}` {st}{extra} | T{t} {a.get('daily_adds', 0)}/{Config.TIER_DAILY.get(t, 2)} | strikes {a.get('strikes', 0)}{advs}{lock}")
     return "\n".join(lines)
 
 
@@ -1108,6 +1286,13 @@ if admin_client:
                               + ("⚠️ fast: limit aayi to wo account khud tier neeche + safe pace pe girega" if Config.PACE == "fast" else ""))
         elif c == "pace":
             await event.reply(f"⚙️ current pace = *{Config.PACE}* | `pace safe` ya `pace fast`")
+        elif c == "complain" and len(parts) == 2:
+            a = await db.accounts_pool.find_one({"account_id": parts[1]})
+            if not a:
+                await event.reply("❌ not found")
+            else:
+                await db.accounts_pool.update_one({"account_id": parts[1]}, {"$set": {"advocate.first_due": now_ts(), "advocate.last_at": 0}})
+                await event.reply("🧑‍⚖️ ok — agle health sweep (≤30 min, 9-22 IST) me complaint file hogi")
         elif c == "delete" and len(parts) == 2:
             r = await db.accounts_pool.delete_one({"account_id": parts[1]})
             await event.reply("🗑 deleted" if r.deleted_count else "❌ not found")
@@ -1146,7 +1331,7 @@ if admin_client:
             await event.reply(f"✅ channel {act} {key}")
         elif c in ("help", "/start"):
             await event.reply("`status` `spamcheck` `events [n]` `pause` `resume` `breaker reset`\n"
-                              "`revive <id>` `tier <id> <1-4>` `cap <n>` `pace safe|fast` `delete <id>` `unlock`\n"
+                              "`revive <id>` `tier <id> <1-4>` `cap <n>` `pace safe|fast` `complain <id>` `delete <id>` `unlock`\n"
                               "`harvest` `harvest now` `channel add|remove|enable|reset <name>`")
 
 

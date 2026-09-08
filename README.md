@@ -62,3 +62,6 @@ Report policy: CRIT har run · WARN nayi problem pe / 3h · OK digest 6h + 09:00
 Engine v5.2: WARNING+ logs → `db.errors` (TTL 7d), loop heartbeats → `system_config.heartbeat`.
 
 **Pace governor (agents):** FAST me trouble (2+ accounts naye limited/flagged 24h, 2+ floods, breaker, 20+ errors) → auto SAFE. 48h clean → auto FAST wapas. Bot pe `pace safe` = manual (governor upgrade nahi karega); `pace fast` = manual override.
+
+## ADVOCATE agent (engine v5.3, `main.py`)
+Flagged/limited account → SpamBot complaint khud file karta hai, insaan jaisa: flag ke 3–20h baad (turant nahi), sirf 9–22 IST, buttons click karke (`Submit a complaint` → `No, I'll never…`), typing indicator, har account/attempt ke liye alag personal wording (naam, agri-student context, halki galti-maafi), max 3 attempts, 5 din gap. Manual complaint detect karke skip karta hai. Bot: `complain <id>` (turant queue), status me 🧑‍⚖️N = attempts. Env `ADVOCATE_ENABLED=false` band karne ke liye.
