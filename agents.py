@@ -30,7 +30,7 @@ import traceback
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-AGENTS_VERSION = "1.1.0"
+AGENTS_VERSION = "1.2.0"
 IST = timezone(timedelta(hours=5, minutes=30))
 NOW = time.time()
 
@@ -263,7 +263,21 @@ class Analyst:
                 k = (e.get("msg") or "")[:60]
                 sigs[k] = sigs.get(k, 0) + 1
             top = sorted(sigs.items(), key=lambda x: -x[1])[:5]
-            crit = any("Traceback" in (e.get("exc") or "") or e.get("level") == "ERROR" for e in errs)
+            # Telegram/network transient errors are NOT code bugs → never CRIT, never GitHub issue
+            TRANSIENT = ("ServerError", "RPCError -500", "No workers running", "Request was unsuccessful", "ConnectionError",
+                         "TimeoutError", "ServerDisconnected", "Connection reset", "Temporary failure", "ServerSelectionTimeout")
+            def is_transient(e):
+                m = (e.get("msg") or "") + (e.get("exc") or "")
+                return any(t in m for t in TRANSIENT)
+            real = [e for e in errs if not is_transient(e)]
+            crit = any("Traceback" in (e.get("exc") or "") or e.get("level") == "ERROR" for e in real)
+            if not real:
+                add("transient_errors", "INFO", f"{len(errs)} Telegram/network transient errors 30 min me (engine ne retry kiya)",
+                    "\n".join(f"  ×{n} {m}" for m, n in top), "koi action nahi; agar 3 run tak rahe → WARN", auto=None)
+                errs = []
+            else:
+                errs = real
+        if errs:
             add("errors", "CRIT" if crit else "WARN", f"{len(errs)} warning/error logs 30 min me",
                 "\n".join(f"  ×{n} {m}" for m, n in top), "coder agent → issue", auto="file_issue" if crit else None)
 
