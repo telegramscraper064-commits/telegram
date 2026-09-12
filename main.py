@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.3.1-self-regulating"
+VERSION = "5.4.0-self-regulating"
 
 
 class Config:
@@ -104,7 +104,7 @@ class Config:
     PACE_PROFILES = {
         "safe": dict(ADDS_PER_SESSION=2, IN_SESSION_GAP=(150, 200), SAME_ACCOUNT_MIN_GAP=45 * 60,
                      TIER_DAILY={1: 2, 2: 4, 3: 6, 4: 8}, TIER_BATCH={1: 1, 2: 2, 3: 2, 4: 2}, GLOBAL_CAP=40),
-        "fast": dict(ADDS_PER_SESSION=3, IN_SESSION_GAP=(120, 180), SAME_ACCOUNT_MIN_GAP=3 * 3600,
+        "fast": dict(ADDS_PER_SESSION=3, IN_SESSION_GAP=(120, 180), SAME_ACCOUNT_MIN_GAP=2 * 3600,
                      TIER_DAILY={1: 3, 2: 6, 3: 9, 4: 9}, TIER_BATCH={1: 1, 2: 3, 3: 3, 4: 3}, GLOBAL_CAP=60),
     }
     PACE = os.getenv("PACE", "safe").strip().lower()
@@ -1067,10 +1067,18 @@ async def inject_session(client: TelegramClient, acc: str, account: dict) -> tup
     global_left = Config.GLOBAL_MAX_ADDS_PER_DAY - await global_adds_today()
     todo = max(0, min(per_session, daily_left, global_left))
     done = 0
-    for i in range(todo):
+    attempts = 0
+    max_attempts = todo * 3 + 2          # skips/unresolvable session ko nahi todte; sirf successful adds ginte hain
+    while done < todo and attempts < max_attempts:
+        attempts += 1
+        # FIX 4: username wale users pehle (resolve reliable), phir baaki
         doc = await db.scraped_queue.find_one_and_update(
-            {"status": "pending"}, {"$set": {"status": "processing", "processing_at": now_ts(), "processing_by": acc}},
-            sort=[("_id", ASCENDING)])
+            {"status": "pending", "username": {"$nin": [None, ""]}},
+            {"$set": {"status": "processing", "processing_at": now_ts(), "processing_by": acc}}, sort=[("_id", ASCENDING)])
+        if not doc:
+            doc = await db.scraped_queue.find_one_and_update(
+                {"status": "pending"}, {"$set": {"status": "processing", "processing_at": now_ts(), "processing_by": acc}},
+                sort=[("_id", ASCENDING)])
         if not doc:
             return done, "queue_empty"
         uid = doc["user_id"]
@@ -1094,7 +1102,7 @@ async def inject_session(client: TelegramClient, acc: str, account: dict) -> tup
             await db.accounts_pool.update_one({"account_id": acc}, {"$inc": {"daily_adds": 1, "total_added": 1}, "$set": {"last_used": now_ts()}})
             await log_event("add", acc, user_id=uid)
             logger.info(f"✅ [{acc} T{tier}] added {uid} ({done}/{todo})")
-            if i < todo - 1:
+            if done < todo:
                 gap = rnd(Config.IN_SESSION_GAP)
                 logger.info(f"   ⏸ in-session gap {gap}s")
                 await asyncio.sleep(gap)
@@ -1103,16 +1111,19 @@ async def inject_session(client: TelegramClient, acc: str, account: dict) -> tup
             await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "invalid", "reason": code}})
             await asyncio.sleep(random.uniform(5, 15))
             continue
-        await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "pending"}, "$unset": {"processing_at": "", "processing_by": ""}})
         logger.warning(f"❌ [{acc}] {uid}: {code}")
         if code.startswith("flood"):
+            await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "pending"}, "$unset": {"processing_at": "", "processing_by": ""}})
             await handle_flood(client, acc, code)
             return done, "flood"
         if code.startswith("admin_required"):
+            await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "pending"}, "$unset": {"processing_at": "", "processing_by": ""}})
             await set_state(acc, STATE_RESTING, code, rest_until=now_ts() + 6 * 3600)
             return done, "admin_required"
-        return done, "error"
-    return done, "ok"
+        # generic error (bad hash, deleted user, etc.) → user invalid, session CONTINUES
+        await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "invalid", "reason": code[:80]}})
+        await asyncio.sleep(random.uniform(5, 15))
+    return done, "ok" if done else "no_adds"
 
 
 async def injector_engine():
