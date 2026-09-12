@@ -30,7 +30,7 @@ import traceback
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-AGENTS_VERSION = "1.2.0"
+AGENTS_VERSION = "1.3.0"
 IST = timezone(timedelta(hours=5, minutes=30))
 NOW = time.time()
 
@@ -103,7 +103,8 @@ class Watcher:
         o["errors"] = list(self.db.errors.find({"t": {"$gt": NOW - 1800}}).sort("t", -1).limit(50))
         o["errors_24h"] = self.db.errors.count_documents({"t": {"$gt": NOW - 86400}})
         o["events"] = list(self.db.events.find({"t": {"$gt": NOW - 1800}}).sort("t", -1).limit(100))
-        o["floods_24h"] = self.db.events.count_documents({"t": {"$gt": NOW - 86400}, "kind": {"$in": ["flood", "limit"]}})
+        o["floods_24h"] = self.db.events.count_documents({"t": {"$gt": NOW - 86400}, "kind": {"$in": ["flood", "limit"]}, "verdict": {"$ne": "ok"}})
+        o["throttle_floods_24h"] = self.db.events.count_documents({"t": {"$gt": NOW - 86400}, "kind": "flood", "verdict": "ok"})
         o["state_events_24h"] = list(self.db.events.find({"t": {"$gt": NOW - 86400}, "kind": "state"}, {"acc": 1, "frm": 1, "to": 1, "t": 1}))
         # Render services
         svc = []
@@ -241,13 +242,13 @@ class Analyst:
             trouble.append(f"{o['errors_24h']} errors 24h")
         if pace == "fast" and trouble:
             add("pace_downgrade", "WARN", "Pace governor: FAST → SAFE (trouble detected)", "; ".join(trouble),
-                "auto; 48h clean ke baad wapas fast", auto="pace_safe")
+                "auto; 24h clean ke baad wapas fast", auto="pace_safe")
         elif pace == "safe":
             gov = self.db_state.find_one({"_id": "pace_governor"}) if hasattr(self, "db_state") else None
             downgraded_at = (gov or {}).get("downgraded_at", 0)
             manual_safe = (gov or {}).get("manual_safe", False)
-            if not trouble and not manual_safe and downgraded_at and NOW - downgraded_at > 48 * 3600 and o["floods_24h"] == 0 and not newly_limited:
-                add("pace_upgrade", "INFO", "Pace governor: 48h clean → SAFE → FAST", "", "auto", auto="pace_fast")
+            if not trouble and not manual_safe and downgraded_at and NOW - downgraded_at > 24 * 3600 and o["floods_24h"] == 0 and not newly_limited:
+                add("pace_upgrade", "INFO", "Pace governor: 24h clean → SAFE → FAST", "", "auto", auto="pace_fast")
 
         # --- queue ---
         if o["pending"] < 200:
@@ -265,7 +266,8 @@ class Analyst:
             top = sorted(sigs.items(), key=lambda x: -x[1])[:5]
             # Telegram/network transient errors are NOT code bugs → never CRIT, never GitHub issue
             TRANSIENT = ("ServerError", "RPCError -500", "No workers running", "Request was unsuccessful", "ConnectionError",
-                         "TimeoutError", "ServerDisconnected", "Connection reset", "Temporary failure", "ServerSelectionTimeout")
+                         "TimeoutError", "ServerDisconnected", "Connection reset", "Temporary failure", "ServerSelectionTimeout",
+                         "FloodWaitError", "BREAKER:", "flood_peer")
             def is_transient(e):
                 m = (e.get("msg") or "") + (e.get("exc") or "")
                 return any(t in m for t in TRANSIENT)
@@ -333,7 +335,7 @@ class Coder:
         if cfg.get("pace", "safe") != "safe":
             self.db.system_config.update_one({"_id": "config"}, {"$set": {"pace": "safe", "pace_set_by": "agents"}, "$unset": {"cap_override": ""}})
             self.db.agent_state.update_one({"_id": "pace_governor"}, {"$set": {"downgraded_at": NOW, "reason": p.get("detail", "")[:200], "manual_safe": False}}, upsert=True)
-            b.notes.append("⚙️ PACE → SAFE (auto). 48h clean → wapas FAST. Manual override: bot pe `pace fast`")
+            b.notes.append("⚙️ PACE → SAFE (auto). 24h clean → wapas FAST. Manual override: bot pe `pace fast`")
             return "pace fast → safe"
         return None
 

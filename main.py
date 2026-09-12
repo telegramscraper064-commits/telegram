@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.3.0-self-regulating"
+VERSION = "5.3.1-self-regulating"
 
 
 class Config:
@@ -103,7 +103,7 @@ class Config:
     # fast : 3 adds/session, 3 sessions/day (=9/ID), 120-180s gap, 3h same-account gap, T1-4 = 3/6/9/9
     PACE_PROFILES = {
         "safe": dict(ADDS_PER_SESSION=2, IN_SESSION_GAP=(150, 200), SAME_ACCOUNT_MIN_GAP=45 * 60,
-                     TIER_DAILY={1: 2, 2: 4, 3: 6, 4: 8}, TIER_BATCH={1: 1, 2: 2, 3: 2, 4: 2}, GLOBAL_CAP=20),
+                     TIER_DAILY={1: 2, 2: 4, 3: 6, 4: 8}, TIER_BATCH={1: 1, 2: 2, 3: 2, 4: 2}, GLOBAL_CAP=40),
         "fast": dict(ADDS_PER_SESSION=3, IN_SESSION_GAP=(120, 180), SAME_ACCOUNT_MIN_GAP=3 * 3600,
                      TIER_DAILY={1: 3, 2: 6, 3: 9, 4: 9}, TIER_BATCH={1: 1, 2: 3, 3: 3, 4: 3}, GLOBAL_CAP=60),
     }
@@ -114,7 +114,7 @@ class Config:
     SAME_ACCOUNT_MIN_GAP = 45 * 60          # ek account itne time se pehle dobara nahi
     IDLE_TURN_PROB = 0.15                   # 15% turns "kuch nahi" (irregularity)
     IDLE_TURN_SLEEP = (300, 600)
-    GLOBAL_MAX_ADDS_PER_DAY = int(os.getenv("GLOBAL_MAX_ADDS_PER_DAY", "20"))
+    GLOBAL_MAX_ADDS_PER_DAY = int(os.getenv("GLOBAL_MAX_ADDS_PER_DAY", "40"))
 
     # ---- tiers ----
     TIER_DAILY = {1: 2, 2: 4, 3: 6, 4: 8}
@@ -134,7 +134,7 @@ class Config:
     PROBATION_DAYS = 3
 
     # ---- flood / limit handling ----
-    GROUP_THROTTLE_REST_HOURS = 6
+    GROUP_THROTTLE_REST_HOURS = 3
     UNKNOWN_FLOOD_REST_HOURS = 24
     FLAGGED_RECHECK_HOURS = 24
     # ---- ADVOCATE agent (auto SpamBot complaint, human-like) ----
@@ -677,11 +677,15 @@ async def record_flood_for_breaker(account_id: str, verdict: str):
     cfg = await db.system_config.find_one({"_id": "config"}) or {}
     recent = [e for e in cfg.get("flood_events", []) if e["t"] > now_ts() - Config.BREAKER_WINDOW_SECONDS]
     await db.system_config.update_one({"_id": "config"}, {"$set": {"flood_events": recent[-50:]}})
-    if len(recent) >= Config.BREAKER_FLOOD_COUNT and float(cfg.get("breaker_until") or 0) < now_ts():
+    # breaker sirf REAL account trouble pe (SpamBot != ok). Clean-verdict flood = group throttle → account 6h rest, baaki chalte rahen.
+    real = [e for e in recent if e.get("v") != "ok"]
+    if len(real) < Config.BREAKER_FLOOD_COUNT and len(recent) >= 3:
+        real = recent  # 3+ floods in 1h even if all "clean" → group is throttling hard → pause anyway
+    if len(real) >= Config.BREAKER_FLOOD_COUNT and float(cfg.get("breaker_until") or 0) < now_ts():
         until = now_ts() + Config.BREAKER_PAUSE_HOURS * 3600
         await db.system_config.update_one({"_id": "config"}, {"$set": {"breaker_until": until}})
-        logger.error(f"🔌 BREAKER: {len(recent)} floods/{Config.BREAKER_WINDOW_SECONDS // 60}min → injector paused till {ist(until)}")
-        await notify_admin(f"🔌 *CIRCUIT BREAKER* — {len(recent)} accounts pe flood 1h me. Injector *{ist(until)} IST* tak paused.\n`breaker reset` se force-on.")
+        logger.error(f"🔌 BREAKER: {len(real)} floods/{Config.BREAKER_WINDOW_SECONDS // 60}min → injector paused till {ist(until)}")
+        await notify_admin(f"🔌 *CIRCUIT BREAKER* — {len(real)} accounts pe flood 1h me. Injector *{ist(until)} IST* tak paused.\n`breaker reset` se force-on.")
 
 
 async def breaker_active() -> bool:
@@ -799,8 +803,14 @@ async def is_paused() -> bool:
     return bool(cfg and cfg.get("is_paused"))
 
 
+def ist_day_start_ts() -> float:
+    d = datetime.now(Config.IST).replace(hour=0, minute=0, second=0, microsecond=0)
+    return d.timestamp()
+
+
 async def global_adds_today() -> int:
-    return await db.master_blacklist.count_documents({"added_at": {"$gt": now_ts() - 86400}})
+    """Adds since IST midnight (calendar day), NOT rolling 24h — rolling window blocked every morning."""
+    return await db.master_blacklist.count_documents({"added_at": {"$gt": ist_day_start_ts()}})
 
 
 async def join_target(client: TelegramClient):
