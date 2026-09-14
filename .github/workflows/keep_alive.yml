@@ -2,7 +2,7 @@ name: Keep-Alive (active Render only)
 
 on:
   schedule:
-    - cron: '*/5 * * * *'     # har 5 min (GitHub cron 5-15 min late chal sakta hai; Render 15 min pe sota hai)
+    - cron: '*/3 * * * *'     # har 3 min (GitHub cron late chalta hai; Render 15 min pe sota hai)
   workflow_dispatch:
 
 concurrency:

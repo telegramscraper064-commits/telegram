@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.4.0-self-regulating"
+VERSION = "5.4.1-self-regulating"
 
 
 class Config:
@@ -682,9 +682,11 @@ async def record_flood_for_breaker(account_id: str, verdict: str):
     if len(real) < Config.BREAKER_FLOOD_COUNT and len(recent) >= 3:
         real = recent  # 3+ floods in 1h even if all "clean" → group is throttling hard → pause anyway
     if len(real) >= Config.BREAKER_FLOOD_COUNT and float(cfg.get("breaker_until") or 0) < now_ts():
-        until = now_ts() + Config.BREAKER_PAUSE_HOURS * 3600
+        all_clean = all(e.get("v") == "ok" for e in real)
+        hours = 2 if all_clean else Config.BREAKER_PAUSE_HOURS   # group throttle → 2h; account trouble → 12h
+        until = now_ts() + hours * 3600
         await db.system_config.update_one({"_id": "config"}, {"$set": {"breaker_until": until}})
-        logger.error(f"🔌 BREAKER: {len(real)} floods/{Config.BREAKER_WINDOW_SECONDS // 60}min → injector paused till {ist(until)}")
+        logger.error(f"🔌 BREAKER: {len(real)} floods/{Config.BREAKER_WINDOW_SECONDS // 60}min ({'group throttle' if all_clean else 'account trouble'}) → injector paused till {ist(until)}")
         await notify_admin(f"🔌 *CIRCUIT BREAKER* — {len(real)} accounts pe flood 1h me. Injector *{ist(until)} IST* tak paused.\n`breaker reset` se force-on.")
 
 
@@ -1360,14 +1362,25 @@ if admin_client:
 # LIFESPAN
 # ==========================================================
 async def self_ping_loop():
-    if not Config.SELF_PING_URL:
+    """Render free tier 15 min idle pe sota hai. GitHub cron (keep_alive) 5-15 min late chalta hai aur weekend pe
+    ghante bhar gayab ho sakta hai (13 Sep: 6h gaps) → service soyi → engine band. Isliye engine khud ko har 4 min ping karta hai.
+    URL: SELF_PING_URL env, warna Render ka RENDER_EXTERNAL_URL (Render khud set karta hai)."""
+    url = Config.SELF_PING_URL or os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    if not url:
+        logger.warning("self-ping: no URL (set SELF_PING_URL) — Render sleep risk")
         return
+    url = url.rstrip("/") + "/"
+    logger.info(f"🏓 self-ping every 4 min → {url}")
+    fails = 0
     while is_engine_running:
+        await asyncio.sleep(240 + random.randint(0, 30))
         try:
-            await asyncio.to_thread(lambda: urllib.request.urlopen(Config.SELF_PING_URL, timeout=20).read())
-        except Exception:
-            pass
-        await asyncio.sleep(600)
+            await asyncio.to_thread(lambda: urllib.request.urlopen(url, timeout=25).read())
+            fails = 0
+        except Exception as e:
+            fails += 1
+            if fails in (3, 10):
+                logger.warning(f"self-ping failing x{fails}: {type(e).__name__}")
 
 
 async def delayed_engine_start():

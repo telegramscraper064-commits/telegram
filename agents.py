@@ -30,7 +30,7 @@ import traceback
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-AGENTS_VERSION = "1.3.0"
+AGENTS_VERSION = "1.4.0"
 IST = timezone(timedelta(hours=5, minutes=30))
 NOW = time.time()
 
@@ -111,9 +111,10 @@ class Watcher:
         for u in SERVICE_URLS:
             st = {"url": u, "http": None, "version": None, "ok": False}
             try:
-                code, body = http_json(u.rstrip("/") + "/health", timeout=60)
+                t0 = time.time()
+                code, body = http_json(u.rstrip("/") + "/health", timeout=75)
                 st.update(http=code, ok=bool(body.get("ok")), version=body.get("version"), instance=body.get("instance"),
-                          breaker=body.get("breaker"), paused=body.get("paused"))
+                          breaker=body.get("breaker"), paused=body.get("paused"), latency=round(time.time() - t0, 1))
             except Exception as e:
                 st["error"] = f"{type(e).__name__}: {str(e)[:80]}"
             svc.append(st)
@@ -165,6 +166,11 @@ class Analyst:
             add("svc_two", "CRIT", "DONO Render services live hain (session clash risk)",
                 ", ".join(s["url"] for s in live), "Ek ko suspend karo (switcher)", auto=None)
 
+        # --- cold start = service was asleep = engine was NOT running ---
+        for s_ in live:
+            if (s_.get("latency") or 0) > 20:
+                add("svc_was_asleep", "WARN", f"Service cold-start ({s_['latency']}s) — Render so gaya tha, engine tab tak band tha",
+                    "keep-alive ping miss hua (GitHub cron delay)", "engine v5.4.1+ self-ping (4 min) — deploy check", auto=None)
         # --- heartbeats (only meaningful if a service is live) ---
         hb = o["heartbeat"]
         if live:
