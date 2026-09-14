@@ -1,0 +1,43 @@
+name: Render Env Setup (one-time)
+on:
+  workflow_dispatch:
+jobs:
+  setenv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Set SELF_PING_URL on both Render services
+        env:
+          K1: ${{ secrets.RENDER_API_KEY_1 }}
+          K2: ${{ secrets.RENDER_API_KEY_2 }}
+          S1: ${{ secrets.SERVICE_ID_1 }}
+          S2: ${{ secrets.SERVICE_ID_2 }}
+          U1: ${{ secrets.SERVICE_URL_1 }}
+          U2: ${{ secrets.SERVICE_URL_2 }}
+        run: |
+          python3 - <<'PY'
+          import os, json, urllib.request
+          def api(key, path, method="GET", data=None):
+              req = urllib.request.Request("https://api.render.com/v1"+path, method=method,
+                    data=json.dumps(data).encode() if data is not None else None,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "application/json"})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r: return r.status, json.loads(r.read() or b"null")
+              except urllib.error.HTTPError as e: return e.code, e.read().decode()[:200]
+          for key, sid, url in ((os.environ["K1"], os.environ["S1"], os.environ["U1"]), (os.environ["K2"], os.environ["S2"], os.environ["U2"])):
+              url = url.strip().rstrip("/")
+              st, svc = api(key, f"/services/{sid}")
+              name = svc.get("name") if isinstance(svc, dict) else "?"
+              print(f"\n== {name} ({sid}) suspended={svc.get('suspended') if isinstance(svc, dict) else '?'} ==")
+              st, cur = api(key, f"/services/{sid}/env-vars?limit=100")
+              keys = {e["envVar"]["key"]: e["envVar"].get("value") for e in cur} if isinstance(cur, list) else {}
+              print("  existing SELF_PING_URL:", keys.get("SELF_PING_URL"))
+              st, r = api(key, f"/services/{sid}/env-vars/SELF_PING_URL", "PUT", {"value": url})
+              print(f"  PUT SELF_PING_URL={url} -> {st}")
+              # only the ACTIVE (non-suspended) service needs a redeploy to pick it up; suspended one gets it on next resume
+              if isinstance(svc, dict) and svc.get("suspended") != "suspended":
+                  st, r = api(key, f"/services/{sid}/deploys", "POST", {"clearCache": "do_not_clear"})
+                  print(f"  redeploy -> {st}")
+              else:
+                  print("  suspended: env saved, applies on next resume")
+          PY
