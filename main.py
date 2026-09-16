@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.4.1-self-regulating"
+VERSION = "5.5.0-self-regulating"
 
 
 class Config:
@@ -870,22 +870,34 @@ async def resolve_entity(client: TelegramClient, doc: dict):
     return None
 
 
+def _invite_result(res, user) -> tuple[bool, str]:
+    """Telegram (Layer 176+) InviteToChannel par exception NAHI deta jab user privacy ki wajah se add na ho —
+    `messages.InvitedUsers.missing_invitees` me batata hai. Purana code isko success gin raha tha (16 Sep: 42 me se 12 fake).
+    Sirf tab success jab user missing_invitees me NAHI hai."""
+    missing = getattr(res, "missing_invitees", None) or []
+    for m in missing:
+        if getattr(m, "user_id", None) == getattr(user, "id", None):
+            why = "premium_required" if getattr(m, "premium_would_allow_invite", False) or getattr(m, "premium_required_for_pm", False) else "privacy"
+            return False, f"skip_user:NotInvited_{why}"
+    return True, "ok"
+
+
 async def attempt_add(client: TelegramClient, target, user):
     if Config.TEST_MODE:
         logger.info(f"🧪 [DRY] would add {getattr(user, 'id', '?')}")
         await asyncio.sleep(2)
         return True, "ok"
     try:
-        await client(InviteToChannelRequest(target, [user]))
-        return True, "ok"
+        res = await client(InviteToChannelRequest(target, [user]))
+        return _invite_result(res, user)
     except FloodWaitError as e:
         if e.seconds > 1800:
             return False, f"flood_wait_{e.seconds}"
         logger.info(f"⏳ FloodWait {e.seconds}s, waiting")
         await asyncio.sleep(e.seconds + random.randint(10, 30))
         try:
-            await client(InviteToChannelRequest(target, [user]))
-            return True, "ok"
+            res = await client(InviteToChannelRequest(target, [user]))
+            return _invite_result(res, user)
         except SKIP_USER_ERRORS as ex:
             return False, f"skip_user:{type(ex).__name__}"
         except Exception:

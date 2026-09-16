@@ -30,7 +30,7 @@ import traceback
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-AGENTS_VERSION = "1.4.0"
+AGENTS_VERSION = "1.5.0"
 IST = timezone(timedelta(hours=5, minutes=30))
 NOW = time.time()
 
@@ -86,6 +86,40 @@ class Watcher:
     def __init__(self, db):
         self.db = db
 
+    async def _verify_today(self):
+        """Ground truth: group admin log 'ParticipantInvite' events today (by our accounts) vs master_blacklist today."""
+        if not (WATCHER_SESSION and API_ID and API_HASH):
+            return None
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        from telethon.tl.functions.channels import GetAdminLogRequest
+        from telethon.tl.types import ChannelAdminLogEventsFilter
+        group = os.environ.get("TARGET_GROUP", "agriquizworld")
+        day0 = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
+        c = TelegramClient(StringSession(WATCHER_SESSION), API_ID, API_HASH, connection_retries=2, auto_reconnect=False,
+                           device_model="Agents Supervisor", system_version="GitHub Actions", app_version=AGENTS_VERSION)
+        try:
+            await c.connect()
+            ent = await c.get_entity(group)
+            F = ChannelAdminLogEventsFilter(invite=True, join=False, leave=False, ban=False, unban=False, kick=False, unkick=False, promote=False,
+                                            demote=False, info=False, settings=False, pinned=False, edit=False, delete=False, group_call=False,
+                                            invites=False, send=False, forums=False, sub_extend=False)
+            targets, max_id = set(), 0
+            for _ in range(6):
+                r = await c(GetAdminLogRequest(ent, q="", events_filter=F, max_id=max_id, min_id=0, limit=100))
+                if not r.events:
+                    break
+                for e in r.events:
+                    if e.date.astimezone(IST) >= day0 and type(e.action).__name__.endswith("ParticipantInvite"):
+                        targets.add(e.action.participant.user_id)
+                max_id = r.events[-1].id
+                if r.events[-1].date.astimezone(IST) < day0:
+                    break
+        finally:
+            await c.disconnect()
+        dbu = {x["user_id"] for x in self.db.master_blacklist.find({"added_at": {"$gt": day0.timestamp()}}, {"user_id": 1})}
+        return {"tg": len(targets), "db": len(dbu), "verified": len(dbu & targets), "db_only": len(dbu - targets), "tg_only": len(targets - dbu)}
+
     def run(self, b: Board):
         o = b.obs
         hb = self.db.system_config.find_one({"_id": "heartbeat"}) or {}
@@ -133,6 +167,12 @@ class Watcher:
             except Exception as e:
                 deploys.append({"sid": sid, "error": f"{type(e).__name__}"})
         o["deploys"] = deploys
+        # --- VERIFIER: Telegram admin-log (ground truth) vs DB count for today ---
+        o["verify"] = None
+        try:
+            o["verify"] = asyncio.run(self._verify_today())
+        except Exception as e:
+            o["verify"] = {"error": f"{type(e).__name__}: {str(e)[:60]}"}
         # in active hours?
         h = datetime.now(IST).hour
         o["active_hours"] = 8 <= h < 23
@@ -255,6 +295,17 @@ class Analyst:
             manual_safe = (gov or {}).get("manual_safe", False)
             if not trouble and not manual_safe and downgraded_at and NOW - downgraded_at > 24 * 3600 and o["floods_24h"] == 0 and not newly_limited:
                 add("pace_upgrade", "INFO", "Pace governor: 24h clean → SAFE → FAST", "", "auto", auto="pace_fast")
+
+        # --- VERIFIER result ---
+        v = o.get("verify") or {}
+        if v and "error" not in v and v.get("db", 0) >= 5:
+            ratio = v["db_only"] / max(1, v["db"])
+            if ratio > 0.15:
+                add("count_mismatch", "CRIT" if ratio > 0.3 else "WARN",
+                    f"DB adds {v['db']} vs Telegram verified {v['verified']} — {v['db_only']} counted but NOT actually added ({int(ratio*100)}%)",
+                    "InviteToChannel silently failing (privacy/premium) — engine v5.5+ checks missing_invitees", "deploy latest / check attempt_add", auto=None)
+        elif v and "error" in v:
+            add("verify_error", "INFO", f"Verifier could not read admin log: {v['error']}", "", "", auto=None)
 
         # --- queue ---
         if o["pending"] < 200:
@@ -480,6 +531,7 @@ class Reporter:
         L = [f"{icon} AGENTS REPORT {o['ist_now']} IST — {lvl}",
              f"engine {o.get('live_version', '?')} | agents v{AGENTS_VERSION} | {'🕐 active hrs' if o['active_hours'] else '🌙 off hrs'}",
              f"adds 24h {o['adds_24h']} (+{o['adds_since_last_run']} last 30m) | total {o['adds_total']} | pending {o['pending']}",
+             (lambda v: f"✔ verified today (Telegram log): {v['verified']}/{v['db']}" + (f" ⚠ {v['db_only']} unverified" if v['db_only'] else "") if v and 'error' not in v else "verify: n/a")(o.get("verify")),
              f"states: " + " ".join(f"{k}:{v}" for k, v in sorted(o.get("states", {}).items())),
              f"pace {o['config']['pace']} | breaker {'OPEN' if o['config']['breaker_until'] > NOW else 'off'} | errors 24h {o['errors_24h']}"]
         def svc_line(s):
