@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.6.0-self-regulating"
+VERSION = "5.6.1-self-regulating"
 
 
 class Config:
@@ -584,14 +584,18 @@ async def advocate_tick(client: TelegramClient, account: dict, verdict: str) -> 
     if attempts >= Config.ADVOCATE_MAX_ATTEMPTS:
         return
     last = float(adv.get("last_at") or 0)
-    since = float(account.get("state_since") or now_ts())
+    # v5.6.1: anchor = jab account PEHLI baar flagged/limited hua (advocate.flagged_at), state_since nahi —
+    # state_since har health re-check pe refresh hota tha → first_due aage khiskta rehta tha, complaint kabhi due nahi hoti thi (Satyam 16-17 Sep).
+    anchor = float(adv.get("flagged_at") or 0)
+    if not anchor:
+        anchor = float(account.get("state_since") or now_ts())
+        await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"advocate.flagged_at": anchor}})
     if attempts == 0:
-        # first complaint: wait a random 3-20h after the flag (persisted so it's stable across sweeps)
+        # first complaint: random 3-20h after the flag, but ADVOCATE_HOURS ke andar; persisted so it's stable across sweeps
         due = adv.get("first_due")
         if not due:
-            due = since + random.uniform(*Config.ADVOCATE_MIN_DELAY_H) * 3600
+            due = anchor + random.uniform(*Config.ADVOCATE_MIN_DELAY_H) * 3600
             await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"advocate.first_due": due}})
-            return
         if now_ts() < float(due):
             return
     else:
@@ -647,6 +651,7 @@ async def apply_verdict(account_id: str, info: dict, context: str) -> str:
             await set_state(account_id, STATE_PROBATION, f"cleared after {prev}", tier=1, limited_until=0,
                             probation_until=now_ts() + Config.PROBATION_DAYS * 86400, clean_since=now_ts(),
                             rest_until=0, daily_adds=0, **base)
+            await db.accounts_pool.update_one({"account_id": account_id}, {"$unset": {"advocate.flagged_at": "", "advocate.first_due": ""}})
             await notify_admin(f"✅ `{account_id}` clear ho gaya ({prev} → probation, 2 adds/din for {Config.PROBATION_DAYS} din)")
             return STATE_PROBATION
         if context.startswith("flood"):
@@ -758,6 +763,11 @@ async def health_sweep():
         {"state": STATE_FLAGGED, "flagged_recheck_at": {"$lte": now}},
         {"spambot_checked_at": {"$exists": False}},
         {"spambot_checked_at": {"$lt": now - Config.HEALTH_CHECK_HOURS * 3600}},
+        # v5.6.1: ADVOCATE due → visit now (warna 12h wait); sirf jab complaint window khuli ho aur last visit 1h+ purana
+        {"state": {"$in": [STATE_LIMITED, STATE_FLAGGED]}, "advocate.first_due": {"$lte": now}, "advocate.attempts": {"$in": [None, 0]},
+         "spambot_checked_at": {"$lt": now - 3600}},
+        {"state": {"$in": [STATE_LIMITED, STATE_FLAGGED]}, "advocate.attempts": {"$gte": 1, "$lt": Config.ADVOCATE_MAX_ATTEMPTS},
+         "advocate.last_at": {"$lte": now - Config.ADVOCATE_RETRY_DAYS * 86400}, "spambot_checked_at": {"$lt": now - 3600}},
     ]}
     async for a in db.accounts_pool.find(q):
         acc = a["account_id"]
