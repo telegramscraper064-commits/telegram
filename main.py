@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.6.1-self-regulating"
+VERSION = "5.6.2-self-regulating"
 
 
 class Config:
@@ -545,21 +545,27 @@ async def advocate_complain(client: TelegramClient, account: dict, attempt: int)
         if "no limits" in low or "free as a bird" in low:
             return False, "already clean"
         if not await _adv_click(client, m, "complaint"):
-            # limited-until variant: button text is "This is a mistake"
-            if not await _adv_click(client, m, "mistake"):
-                return False, f"no complaint button: {(m.message or '')[:80]}"
+            # limited-until variants: "This is a mistake" (older) / "I was wrong, please release me now" (Sep 2026, moderator-confirmed)
+            clicked = await _adv_click(client, m, "mistake") or await _adv_click(client, m, "release me") or await _adv_click(client, m, "i was wrong")
+            if not clicked:
+                return False, f"no complaint button: {[[b.text for b in r] for r in (m.buttons or [])]}"
             await asyncio.sleep(random.uniform(4, 7))
             m = (await client.get_messages("SpamBot", limit=1))[0]
-            if not await _adv_click(client, m, "yes"):
-                return False, "no 'yes' button after mistake"
+            low2 = (m.message or "").lower()
+            if "submitted" in low2 or "thank" in low2 or "reviewed" in low2:
+                return True, (m.message or "")[:120]   # some flows accept immediately
+            if not (await _adv_click(client, m, "yes") or await _adv_click(client, m, "never") or await _adv_click(client, m, "no,")):
+                return False, f"no follow-up button: {[[b.text for b in r] for r in (m.buttons or [])]} | {(m.message or '')[:60]}"
         await asyncio.sleep(random.uniform(4, 8))
         m = (await client.get_messages("SpamBot", limit=1))[0]
-        if not await _adv_click(client, m, "never"):
-            return False, f"no 'never' button: {(m.message or '')[:80]}"
+        low3 = (m.message or "").lower()
+        if "details" not in low3 and "write" not in low3:
+            if not (await _adv_click(client, m, "never") or await _adv_click(client, m, "no,")):
+                return False, f"no 'never' button: {[[b.text for b in r] for r in (m.buttons or [])]} | {(m.message or '')[:60]}"
         await asyncio.sleep(random.uniform(5, 10))   # reading "write me some details"
         m = (await client.get_messages("SpamBot", limit=1))[0]
         if "details" not in (m.message or "").lower() and "write" not in (m.message or "").lower():
-            return False, f"unexpected prompt: {(m.message or '')[:80]}"
+            return False, f"unexpected prompt: {(m.message or '')[:80]} | buttons {[[b.text for b in r] for r in (m.buttons or [])]}"
         text = _advocate_text(account, attempt)
         await _adv_type(client, text)
         await client.send_message("SpamBot", text)
