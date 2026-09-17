@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.5.0-self-regulating"
+VERSION = "5.5.1-self-regulating"
 
 
 class Config:
@@ -664,8 +664,13 @@ async def apply_verdict(account_id: str, info: dict, context: str) -> str:
     return a.get("state", STATE_ACTIVE)
 
 
-async def handle_flood(client: TelegramClient, account_id: str, code: str):
+async def handle_flood(client: TelegramClient, account_id: str, code: str, repeat_target: bool = False):
     info = await ask_spambot(client)
+    if repeat_target and info["verdict"] == "ok":
+        # target khud flood-magnet hai (doosre account ne bhi isi pe flood khaya), account clean → chhota rest, breaker me nahi ginte
+        await set_state(account_id, STATE_RESTING, "flood on known magnet (SpamBot: clean)", rest_until=now_ts() + 45 * 60)
+        await log_event("flood", account_id, code=code, verdict=info["verdict"], new_state=STATE_RESTING, magnet=True)
+        return STATE_RESTING
     st = await apply_verdict(account_id, info, f"flood:{code}")
     await log_event("flood", account_id, code=code, verdict=info["verdict"], new_state=st)
     await record_flood_for_breaker(account_id, info["verdict"])
@@ -1127,8 +1132,22 @@ async def inject_session(client: TelegramClient, acc: str, account: dict) -> tup
             continue
         logger.warning(f"❌ [{acc}] {uid}: {code}")
         if code.startswith("flood"):
-            await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "pending"}, "$unset": {"processing_at": "", "processing_by": ""}})
-            await handle_flood(client, acc, code)
+            # FLOOD-MAGNET FIX (v5.5.1): same target ne 17 Sep ko 3 accounts × 2 rounds flood karaya aur breaker 2 baar trip kiya,
+            # kyunki re-pend hone par wo queue me phir pehla hi uthta tha. Ab: pehli flood → queue ke END me (flood_count=1),
+            # doosri flood → invalid (flood_magnet). Breaker me bhi ye repeat target nahi ginte.
+            fc = int(doc.get("flood_count", 0)) + 1
+            if fc >= 2:
+                await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "invalid", "reason": f"flood_magnet:{code}"},
+                                                                    "$unset": {"processing_at": "", "processing_by": ""}})
+                logger.warning(f"🧲 {uid} flood-magnet (2 accounts flooded on it) → invalid")
+            else:
+                # requeue at the END: delete + reinsert (new _id) so ASC order picks it last
+                nd = {k: v for k, v in doc.items() if k != "_id"}
+                nd.update({"status": "pending", "flood_count": fc, "last_flood_at": now_ts()})
+                nd.pop("processing_at", None); nd.pop("processing_by", None)
+                await db.scraped_queue.delete_one({"_id": doc["_id"]})
+                await db.scraped_queue.insert_one(nd)
+            await handle_flood(client, acc, code, repeat_target=fc >= 2)
             return done, "flood"
         if code.startswith("admin_required"):
             await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "pending"}, "$unset": {"processing_at": "", "processing_by": ""}})
