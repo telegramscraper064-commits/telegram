@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.5.1-self-regulating"
+VERSION = "5.6.0-self-regulating"
 
 
 class Config:
@@ -230,6 +230,7 @@ class Database:
         self.system_config = self.db["system_config"]
         self.harvest_state = self.db["harvest_state"]
         self.events = self.db["events"]              # audit log (adds, floods, state changes)
+        self.blocked_users = self.db["blocked_users"]  # DO-NOT-TOUCH list: jis target pe flood/spam aaya, koi account dobara touch nahi karega
         self.errors = self.db["errors"]
         self.agent_state = self.db["agent_state"]
         await self.client.admin.command("ping")
@@ -259,6 +260,7 @@ class Database:
         await idx(self.scraped_queue, [("status", ASCENDING), ("_id", ASCENDING)])
         await idx(self.master_blacklist, [("user_id", ASCENDING)], unique=True)
         await idx(self.master_blacklist, [("added_at", ASCENDING)])
+        await idx(self.blocked_users, [("user_id", ASCENDING)], unique=True)
         await idx(self.harvest_state, [("channel", ASCENDING)], unique=True)
         await idx(self.events, [("t", ASCENDING)], expireAfterSeconds=30 * 86400)
         await idx(self.errors, [("t", ASCENDING)], expireAfterSeconds=7 * 86400)
@@ -664,6 +666,22 @@ async def apply_verdict(account_id: str, info: dict, context: str) -> str:
     return a.get("state", STATE_ACTIVE)
 
 
+async def block_user(uid: int, doc: dict, account_id: str, code: str):
+    """Target ko permanent DO-NOT-TOUCH list me daalo (blocked_users) + queue se hatao. Koi bhi account isse dobara touch nahi karega."""
+    try:
+        await db.blocked_users.update_one(
+            {"user_id": uid},
+            {"$setOnInsert": {"user_id": uid, "username": doc.get("username"), "name": doc.get("name"),
+                              "source_channel": doc.get("source_channel"), "blocked_at": now_ts(), "blocked_by": account_id, "reason": code[:80]},
+             "$inc": {"hits": 1}}, upsert=True)
+    except Exception:
+        pass
+    await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "blocked", "reason": code[:80], "blocked_at": now_ts()},
+                                                            "$unset": {"processing_at": "", "processing_by": ""}})
+    await log_event("block_user", account_id, user_id=uid, code=code)
+    logger.warning(f"🚫 {uid} (@{doc.get('username')}) BLOCKED — {code} on {account_id}; no account will touch it again")
+
+
 async def handle_flood(client: TelegramClient, account_id: str, code: str, repeat_target: bool = False):
     info = await ask_spambot(client)
     if repeat_target and info["verdict"] == "ok":
@@ -965,6 +983,8 @@ async def harvest_channel(client: TelegramClient, account_id: str, channel: str)
             known.add(d["user_id"])
         async for d in db.scraped_queue.find({"user_id": {"$in": ids}}, {"user_id": 1}):
             known.add(d["user_id"])
+        async for d in db.blocked_users.find({"user_id": {"$in": ids}}, {"user_id": 1}):
+            known.add(d["user_id"])   # DO-NOT-TOUCH list
         docs = [{"user_id": uid, "access_hash": getattr(u, "access_hash", None), "username": getattr(u, "username", None),
                  "name": f"{u.first_name or ''} {u.last_name or ''}".strip(), "source_channel": channel,
                  "scraped_by": account_id, "scraped_at": datetime.now(pytz.utc), "status": "pending"}
@@ -1104,6 +1124,9 @@ async def inject_session(client: TelegramClient, acc: str, account: dict) -> tup
         if await db.master_blacklist.find_one({"user_id": uid}):
             await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "added"}})
             continue
+        if await db.blocked_users.find_one({"user_id": uid}, {"_id": 1}):
+            await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "blocked", "reason": "in_block_list"}})
+            continue
         # human: thoda "dekhna" pehle
         await asyncio.sleep(random.uniform(3, 9))
         user = await resolve_entity(client, doc)
@@ -1132,22 +1155,11 @@ async def inject_session(client: TelegramClient, acc: str, account: dict) -> tup
             continue
         logger.warning(f"❌ [{acc}] {uid}: {code}")
         if code.startswith("flood"):
-            # FLOOD-MAGNET FIX (v5.5.1): same target ne 17 Sep ko 3 accounts × 2 rounds flood karaya aur breaker 2 baar trip kiya,
-            # kyunki re-pend hone par wo queue me phir pehla hi uthta tha. Ab: pehli flood → queue ke END me (flood_count=1),
-            # doosri flood → invalid (flood_magnet). Breaker me bhi ye repeat target nahi ginte.
-            fc = int(doc.get("flood_count", 0)) + 1
-            if fc >= 2:
-                await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "invalid", "reason": f"flood_magnet:{code}"},
-                                                                    "$unset": {"processing_at": "", "processing_by": ""}})
-                logger.warning(f"🧲 {uid} flood-magnet (2 accounts flooded on it) → invalid")
-            else:
-                # requeue at the END: delete + reinsert (new _id) so ASC order picks it last
-                nd = {k: v for k, v in doc.items() if k != "_id"}
-                nd.update({"status": "pending", "flood_count": fc, "last_flood_at": now_ts()})
-                nd.pop("processing_at", None); nd.pop("processing_by", None)
-                await db.scraped_queue.delete_one({"_id": doc["_id"]})
-                await db.scraped_queue.insert_one(nd)
-            await handle_flood(client, acc, code, repeat_target=fc >= 2)
+            # v5.6 (user rule): jis target pe flood/spam aaya, use turant BLOCK list me daalo — koi account dobara touch nahi karega.
+            # (17 Sep: ek hi target ne 6 floods + 2 breaker trips karaye kyunki re-pend hokar phir pehla uthta tha.)
+            already = await db.blocked_users.find_one({"user_id": uid}, {"_id": 1})
+            await block_user(uid, doc, acc, code)
+            await handle_flood(client, acc, code, repeat_target=bool(already))
             return done, "flood"
         if code.startswith("admin_required"):
             await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "pending"}, "$unset": {"processing_at": "", "processing_by": ""}})
@@ -1269,7 +1281,7 @@ async def build_status() -> str:
     pending = await db.scraped_queue.count_documents({"status": "pending"})
     lines = [f"📊 **Engine {VERSION}**",
              f"⏸ {'PAUSED' if await is_paused() else 'running'} | 🔌 breaker {ist(br) if br > now_ts() else 'off'} | 🕐 {'active hrs' if in_active_hours() else 'night'}",
-             f"⚙️ pace {Config.PACE} | 📈 adds 24h: {today}/{Config.GLOBAL_MAX_ADDS_PER_DAY} | 📥 pending {pending} | ✅ total {await db.master_blacklist.count_documents({})}",
+             f"⚙️ pace {Config.PACE} | 📈 adds 24h: {today}/{Config.GLOBAL_MAX_ADDS_PER_DAY} | 📥 pending {pending} | ✅ total {await db.master_blacklist.count_documents({})} | 🚫 blocked {await db.blocked_users.count_documents({})}",
              " ".join(f"{STATE_ICON.get(k, '•')}{k}:{v}" for k, v in sorted(counts.items())), ""]
     async for a in db.accounts_pool.find({}, {"session_string": 0}).sort("account_id", 1):
         st = a.get("state", "?")
@@ -1383,10 +1395,33 @@ if admin_client:
             elif act == "reset":
                 await db.harvest_state.update_one({"channel": key}, {"$set": {"last_msg_id": 0, "disabled": False, "fail_count": 0}})
             await event.reply(f"✅ channel {act} {key}")
+        elif c in ("blocked", "blocklist"):
+            n = await db.blocked_users.count_documents({})
+            rows = []
+            async for b in db.blocked_users.find().sort("blocked_at", -1).limit(15):
+                rows.append(f"🚫 `{b['user_id']}` @{b.get('username') or '-'} | {b.get('reason', '')} | by {b.get('blocked_by', '')} | {ist(b.get('blocked_at', 0))}")
+            await event.reply(f"🚫 *DO-NOT-TOUCH list: {n} users*\n" + ("\n".join(rows) if rows else "_khaali_"))
+        elif c.startswith("block "):
+            try:
+                uid = int(c.split()[1])
+                await db.blocked_users.update_one({"user_id": uid}, {"$setOnInsert": {"user_id": uid, "blocked_at": now_ts(), "blocked_by": "admin", "reason": "manual"}, "$inc": {"hits": 1}}, upsert=True)
+                await db.scraped_queue.update_one({"user_id": uid}, {"$set": {"status": "blocked", "reason": "manual"}})
+                await event.reply(f"🚫 `{uid}` blocked — koi account touch nahi karega")
+            except Exception:
+                await event.reply("usage: `block <user_id>`")
+        elif c.startswith("unblock "):
+            try:
+                uid = int(c.split()[1])
+                r = await db.blocked_users.delete_one({"user_id": uid})
+                await db.scraped_queue.update_one({"user_id": uid, "status": "blocked"}, {"$set": {"status": "pending"}, "$unset": {"reason": ""}})
+                await event.reply(f"✅ `{uid}` unblocked ({r.deleted_count})")
+            except Exception:
+                await event.reply("usage: `unblock <user_id>`")
         elif c in ("help", "/start"):
             await event.reply("`status` `spamcheck` `events [n]` `pause` `resume` `breaker reset`\n"
                               "`revive <id>` `tier <id> <1-4>` `cap <n>` `pace safe|fast` `complain <id>` `delete <id>` `unlock`\n"
-                              "`harvest` `harvest now` `channel add|remove|enable|reset <name>`")
+                              "`harvest` `harvest now` `channel add|remove|enable|reset <name>`\n"
+                              "`blocked` `block <uid>` `unblock <uid>`  (DO-NOT-TOUCH list)")
 
 
 # ==========================================================
