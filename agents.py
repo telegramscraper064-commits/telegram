@@ -30,7 +30,7 @@ import traceback
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-AGENTS_VERSION = "1.5.0"
+AGENTS_VERSION = "1.5.1"
 IST = timezone(timedelta(hours=5, minutes=30))
 NOW = time.time()
 
@@ -115,10 +115,27 @@ class Watcher:
                 max_id = r.events[-1].id
                 if r.events[-1].date.astimezone(IST) < day0:
                     break
+            dbu = {x["user_id"] for x in self.db.master_blacklist.find({"added_at": {"$gt": day0.timestamp()}}, {"user_id": 1})}
+            # admin log kabhi entries chhod deta hai (18 Sep: 8/41 asli adds log me nahi the) → DB-only ko membership se confirm karo
+            from telethon.tl.functions.channels import GetParticipantRequest
+            confirmed, not_in = 0, 0
+            for uid in list(dbu - targets)[:40]:
+                q = self.db.scraped_queue.find_one({"user_id": uid}, {"username": 1, "access_hash": 1}) or {}
+                try:
+                    if q.get("username"):
+                        ent_u = await c.get_entity(q["username"])
+                    else:
+                        from telethon.tl.types import InputPeerUser
+                        ent_u = InputPeerUser(uid, q.get("access_hash") or 0)
+                    await c(GetParticipantRequest(ent, ent_u))
+                    confirmed += 1
+                except Exception:
+                    not_in += 1
+                await asyncio.sleep(0.4)
         finally:
             await c.disconnect()
-        dbu = {x["user_id"] for x in self.db.master_blacklist.find({"added_at": {"$gt": day0.timestamp()}}, {"user_id": 1})}
-        return {"tg": len(targets), "db": len(dbu), "verified": len(dbu & targets), "db_only": len(dbu - targets), "tg_only": len(targets - dbu)}
+        return {"tg": len(targets), "db": len(dbu), "verified": len(dbu & targets) + confirmed,
+                "db_only": not_in, "log_missed": confirmed, "tg_only": len(targets - dbu)}
 
     def run(self, b: Board):
         o = b.obs
