@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.6.2-self-regulating"
+VERSION = "5.6.3-self-regulating"
 
 
 class Config:
@@ -554,6 +554,9 @@ async def advocate_complain(client: TelegramClient, account: dict, attempt: int)
             low2 = (m.message or "").lower()
             if "submitted" in low2 or "thank" in low2 or "reviewed" in low2:
                 return True, (m.message or "")[:120]   # some flows accept immediately
+            if "isn't possible" in low2 or "isn’t possible" in low2 or "will be lifted" in low2:
+                # moderator-confirmed limit: Telegram koi complaint accept nahi karta → auto-release ka wait; dobara try = bot jaisa
+                return False, "NOT_APPEALABLE: " + (m.message or "")[:100]
             if not (await _adv_click(client, m, "yes") or await _adv_click(client, m, "never") or await _adv_click(client, m, "no,")):
                 return False, f"no follow-up button: {[[b.text for b in r] for r in (m.buttons or [])]} | {(m.message or '')[:60]}"
         await asyncio.sleep(random.uniform(4, 8))
@@ -589,6 +592,8 @@ async def advocate_tick(client: TelegramClient, account: dict, verdict: str) -> 
     attempts = int(adv.get("attempts", 0))
     if attempts >= Config.ADVOCATE_MAX_ATTEMPTS:
         return
+    if float(adv.get("not_appealable_until") or 0) > now_ts():
+        return   # moderator-confirmed limit: complaint possible hi nahi, wait for auto-release
     last = float(adv.get("last_at") or 0)
     # v5.6.1: anchor = jab account PEHLI baar flagged/limited hua (advocate.flagged_at), state_since nahi —
     # state_since har health re-check pe refresh hota tha → first_due aage khiskta rehta tha, complaint kabhi due nahi hoti thi (Satyam 16-17 Sep).
@@ -596,6 +601,8 @@ async def advocate_tick(client: TelegramClient, account: dict, verdict: str) -> 
     if not anchor:
         anchor = float(account.get("state_since") or now_ts())
         await db.accounts_pool.update_one({"account_id": acc}, {"$set": {"advocate.flagged_at": anchor}})
+    if last and now_ts() - last < 6 * 3600 and not adv.get("last_ok"):
+        return   # pichhla try fail hua → 6h backoff (har 30 min /start bhejna bot jaisa hai)
     if attempts == 0:
         # first complaint: random 3-20h after the flag, but ADVOCATE_HOURS ke andar; persisted so it's stable across sweeps
         due = adv.get("first_due")
@@ -617,10 +624,15 @@ async def advocate_tick(client: TelegramClient, account: dict, verdict: str) -> 
     except Exception:
         pass
     ok, note = await advocate_complain(client, account, attempts + 1)
-    await db.accounts_pool.update_one({"account_id": acc}, {"$set": {
-        "advocate.last_at": now_ts(), "advocate.attempts": attempts + (1 if ok else 0),
-        "advocate.last_result": note[:120], "advocate.last_ok": ok}})
+    upd = {"advocate.last_at": now_ts(), "advocate.attempts": attempts + (1 if ok else 0),
+           "advocate.last_result": note[:120], "advocate.last_ok": ok}
+    if note.startswith("NOT_APPEALABLE"):
+        # is limit-episode me dobara try mat karo (clear hone pe apply_verdict advocate.* reset karta hai)
+        upd["advocate.not_appealable_until"] = float(account.get("limited_until") or 0) or now_ts() + 3 * 86400
+    await db.accounts_pool.update_one({"account_id": acc}, {"$set": upd})
     await log_event("advocate", acc, ok=ok, attempt=attempts + 1, note=note[:120])
+    if note.startswith("NOT_APPEALABLE") and not (account.get("advocate") or {}).get("not_appealable_until"):
+        await notify_admin(f"🧑‍⚖️ ADVOCATE: `{acc}` ({account.get('first_name', '')}) ki limit moderator-confirmed hai — SpamBot complaint accept nahi karta. Auto-release {ist(float(account.get('limited_until') or 0))} IST. Dobara try nahi karunga.")
     if ok:
         logger.info(f"🧑‍⚖️ {acc}: complaint #{attempts + 1} submitted")
         await notify_admin(f"🧑‍⚖️ ADVOCATE: `{acc}` ({account.get('first_name', '')}) ke liye SpamBot complaint #{attempts + 1} submit ki.\n_{note[:100]}_")
@@ -657,7 +669,7 @@ async def apply_verdict(account_id: str, info: dict, context: str) -> str:
             await set_state(account_id, STATE_PROBATION, f"cleared after {prev}", tier=1, limited_until=0,
                             probation_until=now_ts() + Config.PROBATION_DAYS * 86400, clean_since=now_ts(),
                             rest_until=0, daily_adds=0, **base)
-            await db.accounts_pool.update_one({"account_id": account_id}, {"$unset": {"advocate.flagged_at": "", "advocate.first_due": ""}})
+            await db.accounts_pool.update_one({"account_id": account_id}, {"$unset": {"advocate.flagged_at": "", "advocate.first_due": "", "advocate.not_appealable_until": ""}})
             await notify_admin(f"✅ `{account_id}` clear ho gaya ({prev} → probation, 2 adds/din for {Config.PROBATION_DAYS} din)")
             return STATE_PROBATION
         if context.startswith("flood"):
@@ -771,6 +783,7 @@ async def health_sweep():
         {"spambot_checked_at": {"$lt": now - Config.HEALTH_CHECK_HOURS * 3600}},
         # v5.6.1: ADVOCATE due → visit now (warna 12h wait); sirf jab complaint window khuli ho aur last visit 1h+ purana
         {"state": {"$in": [STATE_LIMITED, STATE_FLAGGED]}, "advocate.first_due": {"$lte": now}, "advocate.attempts": {"$in": [None, 0]},
+         "advocate.not_appealable_until": {"$not": {"$gt": now}}, "advocate.last_at": {"$not": {"$gt": now - 6 * 3600}},
          "spambot_checked_at": {"$lt": now - 3600}},
         {"state": {"$in": [STATE_LIMITED, STATE_FLAGGED]}, "advocate.attempts": {"$gte": 1, "$lt": Config.ADVOCATE_MAX_ATTEMPTS},
          "advocate.last_at": {"$lte": now - Config.ADVOCATE_RETRY_DAYS * 86400}, "spambot_checked_at": {"$lt": now - 3600}},
