@@ -77,7 +77,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.6.3-self-regulating"
+VERSION = "5.7.0-self-regulating"
 
 
 class Config:
@@ -101,23 +101,27 @@ class Config:
     # ---- pacing profiles (bot: `pace safe|fast`, DB system_config.pace) ----
     # safe : 2 adds/session, 150-200s gap, 45 min same-account gap, T1-4 = 2/4/6/8 per day
     # fast : 3 adds/session, 3 sessions/day (=9/ID), 120-180s gap, 3h same-account gap, T1-4 = 3/6/9/9
+    # v5.7 — GROUP-LIMIT REALITY: 14-21 Sep ke 60+ floods me se ~90% kisi account ke 6th add-of-the-day pe aaye
+    # (SpamBot clean = group ki per-inviter limit ≈ 5/din). T3/T4 cap 9 = roz deewar se takrana → breaker 3×/din,
+    # aur 20 Sep Shi REAL limited. Ab har tier max 5/din, session 2 adds, din me 3 sessions (2+2+1) spread.
     PACE_PROFILES = {
-        "safe": dict(ADDS_PER_SESSION=2, IN_SESSION_GAP=(150, 200), SAME_ACCOUNT_MIN_GAP=45 * 60,
-                     TIER_DAILY={1: 2, 2: 4, 3: 6, 4: 8}, TIER_BATCH={1: 1, 2: 2, 3: 2, 4: 2}, GLOBAL_CAP=40),
-        "fast": dict(ADDS_PER_SESSION=3, IN_SESSION_GAP=(120, 180), SAME_ACCOUNT_MIN_GAP=2 * 3600,
-                     TIER_DAILY={1: 3, 2: 6, 3: 9, 4: 9}, TIER_BATCH={1: 1, 2: 3, 3: 3, 4: 3}, GLOBAL_CAP=60),
+        "safe": dict(ADDS_PER_SESSION=2, IN_SESSION_GAP=(150, 200), SAME_ACCOUNT_MIN_GAP=90 * 60,
+                     TIER_DAILY={1: 2, 2: 4, 3: 5, 4: 5}, TIER_BATCH={1: 1, 2: 2, 3: 2, 4: 2}, GLOBAL_CAP=45),
+        "fast": dict(ADDS_PER_SESSION=2, IN_SESSION_GAP=(120, 180), SAME_ACCOUNT_MIN_GAP=150 * 60,
+                     TIER_DAILY={1: 3, 2: 5, 3: 5, 4: 5}, TIER_BATCH={1: 1, 2: 2, 3: 2, 4: 2}, GLOBAL_CAP=60),
     }
+    GROUP_PER_INVITER_DAILY = 5             # hard ceiling per account per IST day, tier/pace se upar nahi ja sakta
     PACE = os.getenv("PACE", "safe").strip().lower()
     ADDS_PER_SESSION = 2                    # ek baar connect me max N adds (profile se overwrite)
     IN_SESSION_GAP = (150, 200)             # do adds ke beech
-    BETWEEN_ACCOUNTS_GAP = (180, 240)       # account switch gap 3-4 min
+    BETWEEN_ACCOUNTS_GAP = (240, 420)       # account switch gap 4-7 min (v5.7: rounds din bhar spread hon)
     SAME_ACCOUNT_MIN_GAP = 45 * 60          # ek account itne time se pehle dobara nahi
     IDLE_TURN_PROB = 0.15                   # 15% turns "kuch nahi" (irregularity)
     IDLE_TURN_SLEEP = (300, 600)
     GLOBAL_MAX_ADDS_PER_DAY = int(os.getenv("GLOBAL_MAX_ADDS_PER_DAY", "40"))
 
     # ---- tiers ----
-    TIER_DAILY = {1: 2, 2: 4, 3: 6, 4: 8}
+    TIER_DAILY = {1: 2, 2: 4, 3: 5, 4: 5}
     TIER_BATCH = {1: 1, 2: 2, 3: 2, 4: 2}
 
     @classmethod
@@ -127,7 +131,7 @@ class Config:
         cls.ADDS_PER_SESSION = prof["ADDS_PER_SESSION"]
         cls.IN_SESSION_GAP = prof["IN_SESSION_GAP"]
         cls.SAME_ACCOUNT_MIN_GAP = prof["SAME_ACCOUNT_MIN_GAP"]
-        cls.TIER_DAILY = dict(prof["TIER_DAILY"])
+        cls.TIER_DAILY = {t: min(d, cls.GROUP_PER_INVITER_DAILY) for t, d in prof["TIER_DAILY"].items()}
         cls.TIER_BATCH = dict(prof["TIER_BATCH"])
         cls.GLOBAL_MAX_ADDS_PER_DAY = cap_override if cap_override else prof["GLOBAL_CAP"]
     TIER_UP_DAYS = 7
