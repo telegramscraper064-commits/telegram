@@ -61,7 +61,7 @@ from pymongo.errors import BulkWriteError
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import InputPeerUser, User
-from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
+from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest, GetParticipantRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 from telethon.errors import (
     FloodWaitError, PeerFloodError, UserPrivacyRestrictedError, UserNotMutualContactError,
@@ -69,6 +69,7 @@ from telethon.errors import (
     ChatWriteForbiddenError, ChatAdminRequiredError, InviteHashExpiredError,
     AuthKeyDuplicatedError, AuthKeyUnregisteredError, SessionRevokedError,
     UserDeactivatedError, UserDeactivatedBanError, PhoneNumberBannedError,
+    UserNotParticipantError,
 )
 
 # ==========================================================
@@ -77,7 +78,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.7.0-self-regulating"
+VERSION = "5.7.1-self-regulating"
 
 
 class Config:
@@ -1166,6 +1167,22 @@ async def inject_session(client: TelegramClient, acc: str, account: dict) -> tup
         if not user:
             await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "invalid", "reason": "unresolvable"}})
             continue
+        # v5.7.1: ALREADY-MEMBER CHECK. 22 Sep: 13 me se 12 "adds" aise users the jo pehle se group me the —
+        # Telegram InviteToChannel unpe silently "ok" deta hai (na error, na missing_invitees) → fake count, slot waste.
+        try:
+            await client(GetParticipantRequest(target, user))
+            await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "already_member", "checked_at": now_ts()}})
+            try:
+                await db.master_blacklist.insert_one({"user_id": uid, "added_by": "already_member", "added_at": 0, "seen_at": now_ts()})
+            except Exception:
+                pass
+            logger.info(f"↩️ {uid} already in group — skip (not counted)")
+            await asyncio.sleep(random.uniform(2, 5))
+            continue
+        except UserNotParticipantError:
+            pass
+        except Exception as e:
+            logger.debug(f"participant check {uid}: {type(e).__name__}")
         ok, code = await attempt_add(client, target, user)
         if ok:
             done += 1
