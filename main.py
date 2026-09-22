@@ -78,7 +78,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.7.1-self-regulating"
+VERSION = "5.7.2-self-regulating"
 
 
 class Config:
@@ -1062,7 +1062,9 @@ async def harvester_engine():
             if wait > 0:
                 await asyncio.sleep(min(wait, 600))
                 continue
-            pending = await db.scraped_queue.count_documents({"status": "pending"})
+            # v5.7.2: sirf USABLE stock gino (username wale). Bina-username wale docs doosre accounts se resolve nahi hote
+            # (22 Sep: 2633 pending me 0 username → poora dopahar 'no_adds', harvest nahi chala kyunki pending "bhara" dikh raha tha)
+            pending = await db.scraped_queue.count_documents({"status": "pending", "username": {"$nin": [None, ""]}})
             if pending >= Config.QUEUE_TARGET_PENDING:
                 logger.info(f"🕷️ Queue {pending} ≥ {Config.QUEUE_TARGET_PENDING}. Skip harvest, recheck 30 min")
                 await db.system_config.update_one({"_id": "config"}, {"$set": {"harvest_last_round": now_ts() - Config.HARVEST_INTERVAL_SECONDS + 1800}})
@@ -1149,6 +1151,8 @@ async def inject_session(client: TelegramClient, acc: str, account: dict) -> tup
             {"status": "pending", "username": {"$nin": [None, ""]}},
             {"$set": {"status": "processing", "processing_at": now_ts(), "processing_by": acc}}, sort=[("_id", ASCENDING)])
         if not doc:
+            if attempts > 2:
+                return done, "queue_low"   # username stock khatam; hash-only docs pe attempts mat jalao (harvester refill karega)
             doc = await db.scraped_queue.find_one_and_update(
                 {"status": "pending"}, {"$set": {"status": "processing", "processing_at": now_ts(), "processing_by": acc}},
                 sort=[("_id", ASCENDING)])
@@ -1572,6 +1576,7 @@ async def health():
             counts[a.get("state", "?")] = counts.get(a.get("state", "?"), 0) + 1
         return {"ok": True, "version": VERSION, "states": counts, "adds_24h": await global_adds_today(),
                 "pending": await db.scraped_queue.count_documents({"status": "pending"}),
+                "pending_usable": await db.scraped_queue.count_documents({"status": "pending", "username": {"$nin": [None, ""]}}),
                 "paused": await is_paused(), "breaker": await breaker_active(), "instance": Config.INSTANCE_ID}
     except Exception as e:
         return {"ok": False, "error": str(e)}
