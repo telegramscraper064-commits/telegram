@@ -78,7 +78,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.7.2-self-regulating"
+VERSION = "5.7.3-self-regulating"
 
 
 class Config:
@@ -1035,6 +1035,49 @@ async def harvest_channel(client: TelegramClient, account_id: str, channel: str)
     return inserted
 
 
+async def harvest_members(client: TelegramClient, account_id: str, channel: str, cap: int = 1500) -> int:
+    """v5.7.3 fallback: message-history harvest sookh gaya (source groups me naye msgs kam) → member list se USERNAME wale users lo.
+    Sirf megagroups jinki member list visible hai. Har run max `cap` naye docs."""
+    key = _channel_key(channel)
+    try:
+        ent = await client.get_entity(channel)
+        if not getattr(ent, "megagroup", False):
+            return 0
+    except Exception:
+        return 0
+    seen: dict[int, User] = {}
+    try:
+        async for u in client.iter_participants(ent, aggressive=True):
+            if u.bot or u.deleted or not u.username or u.id in seen:
+                continue
+            seen[u.id] = u
+            if len(seen) >= cap * 3:
+                break
+    except Exception as e:
+        logger.info(f"🕷️ members {key}: {type(e).__name__} (hidden list?)")
+        return 0
+    if not seen:
+        return 0
+    ids = list(seen)
+    known = set()
+    for col in (db.master_blacklist, db.scraped_queue, db.blocked_users):
+        async for d in col.find({"user_id": {"$in": ids}}, {"user_id": 1}):
+            known.add(d["user_id"])
+    docs = [{"user_id": uid, "access_hash": u.access_hash, "username": u.username,
+             "name": f"{u.first_name or ''} {u.last_name or ''}".strip(), "source_channel": channel, "via": "members",
+             "scraped_by": account_id, "scraped_at": datetime.now(pytz.utc), "status": "pending"}
+            for uid, u in seen.items() if uid not in known][:cap]
+    inserted = 0
+    if docs:
+        try:
+            inserted = len((await db.scraped_queue.insert_many(docs, ordered=False)).inserted_ids)
+        except BulkWriteError as e:
+            inserted = int(e.details.get("nInserted", 0)) if getattr(e, "details", None) else 0
+    await db.harvest_state.update_one({"channel": key}, {"$set": {"last_members_run": now_ts()}, "$inc": {"total_users": inserted}}, upsert=True)
+    logger.info(f"🕷️ members {key}: +{inserted} username users")
+    return inserted
+
+
 async def mark_channel_failed(channel: str, err: str):
     key = _channel_key(channel)
     st = await db.harvest_state.find_one_and_update({"channel": key},
@@ -1090,6 +1133,10 @@ async def harvester_engine():
                     try:
                         total += await harvest_channel(client, acc, ch)
                         await asyncio.sleep(random.randint(3, 8))
+                        usable = await db.scraped_queue.count_documents({"status": "pending", "username": {"$nin": [None, ""]}})
+                        if usable < Config.QUEUE_TARGET_PENDING // 2:
+                            total += await harvest_members(client, acc, ch)
+                            await asyncio.sleep(random.randint(5, 12))
                     except FloodWaitError as e:
                         await asyncio.sleep(min(e.seconds, 300))
                         break
