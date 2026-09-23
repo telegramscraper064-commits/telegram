@@ -80,7 +80,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.7.4-self-regulating"
+VERSION = "5.8.0-self-regulating"
 
 
 class Config:
@@ -159,6 +159,7 @@ class Config:
     # ---- harvester (bandwidth-aware) ----
     HARVEST_INITIAL_LIMIT = int(os.getenv("HARVEST_INITIAL_LIMIT", "1000"))
     HARVEST_MAX_NEW_PER_RUN = int(os.getenv("HARVEST_MAX_NEW_PER_RUN", "2000"))
+    HARVEST_DEEP_PER_RUN = int(os.getenv("HARVEST_DEEP_PER_RUN", "3000"))      # v5.8: purane messages per round (active posters)
     HARVEST_INTERVAL_SECONDS = int(os.getenv("HARVEST_INTERVAL_SECONDS", "10800"))
     QUEUE_TARGET_PENDING = int(os.getenv("QUEUE_TARGET_PENDING", "1500"))
     CHANNEL_FAIL_LIMIT = 3
@@ -1005,18 +1006,34 @@ async def harvest_channel(client: TelegramClient, account_id: str, channel: str)
     limit = Config.HARVEST_INITIAL_LIMIT if last_id == 0 else Config.HARVEST_MAX_NEW_PER_RUN
     senders: dict[int, User] = {}
     newest_id, newest_date, n = last_id, st.get("last_msg_date"), 0
+
+    def _take(m):
+        sid = m.sender_id
+        if sid and sid > 0 and sid not in senders:
+            u = m.sender
+            if isinstance(u, User) and not u.bot and not u.deleted:
+                senders[sid] = u
+
+    # (a) naye messages (incremental)
     async for m in client.iter_messages(channel, limit=limit, min_id=last_id):
         n += 1
         if m.id > newest_id:
             newest_id, newest_date = m.id, m.date
-        sid = m.sender_id
-        if not sid or sid < 0 or sid in senders:
-            continue
-        s = m.sender
-        if isinstance(s, User) and not s.bot and not s.deleted:
-            senders[sid] = s
+        _take(m)
         if n % 200 == 0:
             await asyncio.sleep(1)
+    # (b) v5.8 deep-history: har round purane messages ka ek slice bhi (active posters = best add candidates)
+    deep_from = int(st.get("deep_offset_id") or 0) or last_id
+    oldest_seen = None
+    if deep_from:
+        async for m in client.iter_messages(channel, limit=Config.HARVEST_DEEP_PER_RUN, offset_id=deep_from):
+            oldest_seen = m.id
+            _take(m)
+            n += 1
+            if n % 200 == 0:
+                await asyncio.sleep(1)
+        if oldest_seen:
+            await db.harvest_state.update_one({"channel": key}, {"$set": {"deep_offset_id": oldest_seen}}, upsert=True)
     inserted = 0
     if senders:
         ids = list(senders)
@@ -1029,7 +1046,8 @@ async def harvest_channel(client: TelegramClient, account_id: str, channel: str)
             known.add(d["user_id"])   # DO-NOT-TOUCH list
         docs = [{"user_id": uid, "access_hash": getattr(u, "access_hash", None), "username": getattr(u, "username", None),
                  "name": f"{u.first_name or ''} {u.last_name or ''}".strip(), "source_channel": channel,
-                 "scraped_by": account_id, "scraped_at": datetime.now(pytz.utc), "status": "pending"}
+                 "scraped_by": account_id, "scraped_at": datetime.now(pytz.utc),
+                 "status": "pending" if getattr(u, "username", None) else "unusable"}   # v5.8: usable list = username wale
                 for uid, u in senders.items() if uid not in known]
         if docs:
             try:
@@ -1109,23 +1127,24 @@ async def harvester_engine():
             if not channels:
                 await asyncio.sleep(300)
                 continue
-            wait = Config.HARVEST_INTERVAL_SECONDS - (now_ts() - float(cfg.get("harvest_last_round") or 0))
-            if wait > 0:
-                await asyncio.sleep(min(wait, 600))
-                continue
-            # v5.7.2: sirf USABLE stock gino (username wale). Bina-username wale docs doosre accounts se resolve nahi hote
-            # (22 Sep: 2633 pending me 0 username → poora dopahar 'no_adds', harvest nahi chala kyunki pending "bhara" dikh raha tha)
+            # v5.8: HARVESTER ALWAYS-ON. usable (username-wale pending) < target → har 1h round; warna normal interval.
             pending = await db.scraped_queue.count_documents({"status": "pending", "username": {"$nin": [None, ""]}})
-            if pending >= Config.QUEUE_TARGET_PENDING:
-                logger.info(f"🕷️ Queue {pending} ≥ {Config.QUEUE_TARGET_PENDING}. Skip harvest, recheck 30 min")
-                await db.system_config.update_one({"_id": "config"}, {"$set": {"harvest_last_round": now_ts() - Config.HARVEST_INTERVAL_SECONDS + 1800}})
-                await asyncio.sleep(1800)
+            interval = 3600 if pending < Config.QUEUE_TARGET_PENDING else Config.HARVEST_INTERVAL_SECONDS
+            wait = interval - (now_ts() - float(cfg.get("harvest_last_round") or 0))
+            if wait > 0:
+                await asyncio.sleep(min(wait, 300))
                 continue
-            # limited/flagged accounts ko harvest me PREFER karo (unka add band hai, ye kaam de sakte hain)
-            account = await claim_account({"state": {"$in": [STATE_LIMITED, STATE_FLAGGED]}}, "last_harvest_time") \
-                or await claim_account({"state": {"$in": list(HARVEST_CAPABLE)}}, "last_harvest_time")
+            # v5.8: harvest SIRF un accounts se jo abhi add nahi kar rahe — flagged/limited/resting (rest me), ya jinka daily cap
+            # bhar gaya / same-account gap chal raha hai. Add-ready accounts ka time harvest me nahi jaata.
+            now = now_ts()
+            capped = {"$or": [{"rest_until": {"$gt": now}}, {"last_used": {"$gt": now - Config.SAME_ACCOUNT_MIN_GAP}},
+                              {"$expr": {"$gte": ["$daily_adds", {"$switch": {"branches": [{"case": {"$eq": ["$tier", t]}, "then": d} for t, d in Config.TIER_DAILY.items()], "default": 2}}]}}]}
+            account = await claim_account({"state": {"$in": [STATE_FLAGGED, STATE_LIMITED]}}, "last_harvest_time") \
+                or await claim_account({"state": STATE_RESTING, "rest_until": {"$gt": now}}, "last_harvest_time") \
+                or await claim_account({"state": {"$in": [STATE_ACTIVE, STATE_PROBATION]}, **capped}, "last_harvest_time")
             if not account:
-                await asyncio.sleep(300)
+                logger.info("🕷️ koi idle account nahi (sab add-ready) — 10 min baad")
+                await asyncio.sleep(600)
                 continue
             acc = account["account_id"]
             logger.info(f"🕷️ Harvest round via {acc} ({account.get('state')}) | pending={pending}")
@@ -1142,8 +1161,8 @@ async def harvester_engine():
                         total += await harvest_channel(client, acc, ch)
                         await asyncio.sleep(random.randint(3, 8))
                         usable = await db.scraped_queue.count_documents({"status": "pending", "username": {"$nin": [None, ""]}})
-                        if usable < Config.QUEUE_TARGET_PENDING // 2:
-                            total += await harvest_members(client, acc, ch)
+                        if usable < Config.QUEUE_TARGET_PENDING // 2 and not (await db.harvest_state.find_one({"channel": _channel_key(ch)}) or {}).get("last_members_run"):
+                            total += await harvest_members(client, acc, ch)   # members import sirf ek baar per channel (privacy-heavy)
                             await asyncio.sleep(random.randint(5, 12))
                     except FloodWaitError as e:
                         await asyncio.sleep(min(e.seconds, 300))
@@ -1206,13 +1225,7 @@ async def inject_session(client: TelegramClient, acc: str, account: dict) -> tup
             {"status": "pending", "username": {"$nin": [None, ""]}},
             {"$set": {"status": "processing", "processing_at": now_ts(), "processing_by": acc}}, sort=[("_id", ASCENDING)])
         if not doc:
-            if attempts > 2:
-                return done, "queue_low"   # username stock khatam; hash-only docs pe attempts mat jalao (harvester refill karega)
-            doc = await db.scraped_queue.find_one_and_update(
-                {"status": "pending"}, {"$set": {"status": "processing", "processing_at": now_ts(), "processing_by": acc}},
-                sort=[("_id", ASCENDING)])
-        if not doc:
-            return done, "queue_empty"
+            return done, "queue_low"   # v5.8: sirf usable (username) list se add; bina-username docs 'unusable' me rehte hain
         uid = doc["user_id"]
         if await db.master_blacklist.find_one({"user_id": uid}):
             await db.scraped_queue.update_one({"_id": doc["_id"]}, {"$set": {"status": "added"}})
@@ -1632,6 +1645,7 @@ async def health():
         return {"ok": True, "version": VERSION, "states": counts, "adds_24h": await global_adds_today(),
                 "pending": await db.scraped_queue.count_documents({"status": "pending"}),
                 "pending_usable": await db.scraped_queue.count_documents({"status": "pending", "username": {"$nin": [None, ""]}}),
+                "unusable": await db.scraped_queue.count_documents({"status": "unusable"}),
                 "paused": await is_paused(), "breaker": await breaker_active(), "instance": Config.INSTANCE_ID}
     except Exception as e:
         return {"ok": False, "error": str(e)}
