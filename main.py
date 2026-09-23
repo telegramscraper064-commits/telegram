@@ -63,6 +63,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import InputPeerUser, User
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest, GetParticipantRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.tl.functions.contacts import UnblockRequest
 from telethon.errors import (
     FloodWaitError, PeerFloodError, UserPrivacyRestrictedError, UserNotMutualContactError,
     UserAlreadyParticipantError, UserChannelsTooMuchError, UserKickedError, UserBannedInChannelError,
@@ -70,6 +71,7 @@ from telethon.errors import (
     AuthKeyDuplicatedError, AuthKeyUnregisteredError, SessionRevokedError,
     UserDeactivatedError, UserDeactivatedBanError, PhoneNumberBannedError,
     UserNotParticipantError,
+    YouBlockedUserError,
 )
 
 # ==========================================================
@@ -78,7 +80,7 @@ from telethon.errors import (
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("engine")
-VERSION = "5.7.3-self-regulating"
+VERSION = "5.7.4-self-regulating"
 
 
 class Config:
@@ -439,7 +441,13 @@ _LIMITED_RE = re.compile(r"limited until (\d{1,2} \w+ \d{4}), (\d{1,2}:\d{2}) UT
 async def ask_spambot(client: TelegramClient) -> dict:
     """{"verdict": ok|limited|flagged|unknown, "until": ts|None, "text": str}"""
     try:
-        await client.send_message("SpamBot", "/start")
+        try:
+            await client.send_message("SpamBot", "/start")
+        except YouBlockedUserError:
+            # v5.7.4: Paddy 03-23 Sep — account ne SpamBot block kar rakha tha → 20 din tak verdict/recheck/complaint sab atka.
+            await client(UnblockRequest(await client.get_entity("SpamBot")))
+            await asyncio.sleep(random.uniform(2, 4))
+            await client.send_message("SpamBot", "/start")
         await asyncio.sleep(random.uniform(4, 7))
         msgs = await client.get_messages("SpamBot", limit=3)
         text = " ".join((m.message or "") for m in msgs if m and not m.out)
@@ -1382,7 +1390,7 @@ async def build_status() -> str:
     pending = await db.scraped_queue.count_documents({"status": "pending"})
     lines = [f"📊 **Engine {VERSION}**",
              f"⏸ {'PAUSED' if await is_paused() else 'running'} | 🔌 breaker {ist(br) if br > now_ts() else 'off'} | 🕐 {'active hrs' if in_active_hours() else 'night'}",
-             f"⚙️ pace {Config.PACE} | 📈 adds 24h: {today}/{Config.GLOBAL_MAX_ADDS_PER_DAY} | 📥 pending {pending} | ✅ total {await db.master_blacklist.count_documents({})} | 🚫 blocked {await db.blocked_users.count_documents({})}",
+             f"⚙️ pace {Config.PACE} | 📈 adds 24h: {today}/{Config.GLOBAL_MAX_ADDS_PER_DAY} | 📥 usable {await db.scraped_queue.count_documents({'status': 'pending', 'username': {'$nin': [None, '']}})} (pending {pending}) | ✅ total {await db.master_blacklist.count_documents({})} | 🚫 blocked {await db.blocked_users.count_documents({})}",
              " ".join(f"{STATE_ICON.get(k, '•')}{k}:{v}" for k, v in sorted(counts.items())), ""]
     async for a in db.accounts_pool.find({}, {"session_string": 0}).sort("account_id", 1):
         st = a.get("state", "?")
